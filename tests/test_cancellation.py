@@ -13,12 +13,16 @@ which ACP's stopReason: "cancelled" depends on:
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
+import sys
+import tempfile
 import unittest
 from unittest import mock
-from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
+from response_header_fixtures import isolated_response_headers, setUpModule  # noqa: F401 - unittest hook
+from process_lifecycle_fixtures import observe_fixture
 
 from loki_agent import formats, loki
 
@@ -237,63 +241,190 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
         )
 
 
+class SamplingOwnerCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def _held_sampling(self, mode, broker_loss):
+        from loki_agent import authentications, credential_capabilities, model_requests, recoveries, terminal_frontend
+        from loki_agent.acp_worker import Worker
+
+        with isolated_response_headers():
+            async with contextlib.AsyncExitStack() as cleanup:
+                session = loki.current_session()
+                cleanup.push_async_callback(session.close_state)
+                if broker_loss:
+                    server, child = await credential_capabilities.CredentialCapabilityServer.create(
+                        authentications.CredentialBroker())
+                    cleanup.push_async_callback(server.close)
+                    client = await credential_capabilities.CredentialClient.from_fd(child)
+                    cleanup.push_async_callback(client.close)
+                    session.credential_authority = client
+                entered, release = asyncio.Event(), asyncio.Event()
+                events = []
+                transcript = [formats.message_item('user', 'held request')]
+                session.transcript_items = transcript
+                worker = Worker(session, lambda _message: None)
+                user_cancel = worker.cancel_event if mode == 'acp' else asyncio.Event()
+
+                async def completion(_items, *_args, cancel_check, on_text_delta=None, **_kwargs):
+                    if on_text_delta is not None:
+                        on_text_delta('partial')
+                    entered.set()
+                    await release.wait()
+                    self.assertTrue(cancel_check(), 'sampler lost its Session/broker cancellation predicate')
+                    raise recoveries.Cancelled()
+
+                async def run():
+                    if mode == 'terminal':
+                        return await terminal_frontend.run_terminal_turn_async(
+                            transcript, cancel_event=user_cancel, turn_events=events)
+                    if mode == 'acp':
+                        return await worker._run_turn(events.append, model_requests.TurnThinkingSettings())
+                    return await loki.run_tool_loop_async(
+                        transcript, cancel_event=user_cancel, stream_chat=mode == 'streamed',
+                        on_event=events.append)
+
+                with mock.patch.object(loki, 'async_chat_completion', new=completion), \
+                        mock.patch.object(loki, 'current_model', return_value='held-model'), \
+                        mock.patch.object(terminal_frontend, '_redraw_status'), \
+                        mock.patch.object(terminal_frontend, '_terminal_agent_event'):
+                    task = asyncio.create_task(run())
+                    try:
+                        await observe_fixture(entered.wait(), task)
+                        if broker_loss:
+                            await server.close()
+                            await client.wait_closed()
+                        else:
+                            session.begin_close()
+                        self.assertFalse(user_cancel.is_set())
+                        release.set()
+                        self.assertEqual(await task, '')
+                    finally:
+                        release.set()
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                self.assertEqual([item['type'] for item in transcript], ['message'])
+                self.assertEqual(sum(event['type'] == 'response_cancelled' for event in events), 1)
+
+    async def test_owner_loss_reaches_each_frontend_sampler_without_user_cancel(self):
+        for mode in ['buffered', 'streamed', 'terminal', 'acp']:
+            with self.subTest(mode=mode):
+                await self._held_sampling(mode, False)
+
+    async def test_broker_loss_reaches_each_frontend_sampler_without_user_cancel(self):
+        for mode in ['buffered', 'streamed', 'terminal', 'acp']:
+            with self.subTest(mode=mode):
+                await self._held_sampling(mode, True)
+
+    async def test_repeated_task_cancellation_joins_stream_read_retirement(self):
+        from loki_agent import http_client, model_requests
+
+        started = asyncio.Event()
+        retired = []
+
+        class Reader(asyncio.StreamReader):
+            async def read(self, size):
+                started.set()
+                try:
+                    return await super().read(size)
+                finally:
+                    retired.append(True)
+
+        iterator = http_client.HttpBodyStream(
+            Reader(), {}, timeout=20, max_bytes=100).__aiter__()
+        task = asyncio.create_task(model_requests._next_stream_chunk(iterator, lambda: False))
+        try:
+            await observe_fixture(started.wait(), task)
+            task.cancel()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(retired, [True])
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await iterator.aclose()
+
+    async def test_owner_loss_wins_a_simultaneously_ready_stream_chunk(self):
+        from loki_agent import http_client, model_requests
+
+        with isolated_response_headers():
+            session = loki.current_session()
+
+            class Reader(asyncio.StreamReader):
+                async def read(self, size):
+                    session.begin_close()
+                    return await super().read(size)
+
+            reader = Reader()
+            reader.feed_data(b'must not be published')
+            iterator = http_client.HttpBodyStream(
+                reader, {}, timeout=20, max_bytes=100,
+                cancel_check=lambda: not session.active).__aiter__()
+            try:
+                with self.assertRaises(http_client.HttpRequestCancelled):
+                    await model_requests._next_stream_chunk(iterator, lambda: not session.active)
+            finally:
+                await iterator.aclose()
+                await session.close_state()
+
+
 class ForegroundJobCancelTests(unittest.TestCase):
     """Ctrl-C must interrupt the foreground job a turn is awaiting."""
 
-    def test_cancel_event_kills_sleep_quickly(self):
-        import time as _time
-        from loki_agent.jobs import JobManager
+    def test_cancel_event_reaps_a_running_command(self):
+        from job_fixtures import managed_jobs
 
-        async def run():
-            manager = JobManager("/tmp/loki-cancel-test-jobs2")
-            cancel = asyncio.Event()
-            start = _time.monotonic()
+        async def run(root):
+            async with managed_jobs(root) as manager:
+                cancel = asyncio.Event()
+                # No natural completion or timeout may impersonate cancellation.
+                script = "import time\nprint('ready',flush=True)\nwhile True: time.sleep(1)"
+                task = asyncio.create_task(manager.run_foreground(
+                    [sys.executable, '-c', script], 'held command', None,
+                    description='cancel test', shell=False, cwd=root, cancel_event=cancel))
+                try:
+                    while True:
+                        job = next(iter(manager.jobs.values()), None)
+                        if job is not None and job.process is not None:
+                            if 'ready' in manager._spool_tail(job, 'stdout.log'):
+                                break
+                            self.assertIsNone(job.process.returncode,
+                                              manager._spool_tail(job, 'stderr.log'))
+                        self.assertFalse(task.done(), 'command ended before readiness')
+                        await asyncio.sleep(.01)
+                    cancel.set()
+                    job, status, _stdout, _stderr = await task
+                    with open(job.metadata_path, encoding='utf-8') as stream:
+                        return job, status, json.load(stream)
+                finally:
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
 
-            async def scenario():
-                return await manager.run_foreground(
-                    ["sleep", "30"], "sleep 30", 60000,
-                    description="cancel test", shell=False, cwd="/tmp",
-                    cancel_event=cancel)
-
-            task = asyncio.get_running_loop().create_task(scenario())
-            await asyncio.sleep(0.7)  # let the job start
-            cancel.set()
-            job, status, _stdout, _stderr = await task
-            with open(job.metadata_path, encoding="utf-8") as metadata_file:
-                metadata = json.load(metadata_file)
-            return (
-                job,
-                status,
-                metadata,
-                _time.monotonic() - start,
-            )
-
-        job, status, metadata, elapsed = asyncio.run(run())
-        self.assertEqual(status, "cancelled")
-        self.assertEqual(job.status, "cancelled")
-        self.assertEqual(metadata["status"], "cancelled")
+        with tempfile.TemporaryDirectory() as root:
+            job, status, metadata = asyncio.run(run(root))
+        self.assertEqual(status, 'cancelled')
+        self.assertEqual(job.status, 'cancelled')
+        self.assertEqual(metadata['status'], 'cancelled')
         self.assertIsNotNone(job.exit_code)
-        self.assertEqual(metadata["exit_code"], job.exit_code)
-        if os.name == "posix":
-            # POSIX kills a cancelled foreground job with SIGINT; Windows
-            # stops it through CTRL_BREAK/terminate, which carries no signal
-            # number, so only the timing contract is shared.
+        self.assertNotEqual(job.exit_code, 0)
+        self.assertEqual(metadata['exit_code'], job.exit_code)
+        if os.name == 'posix':
             self.assertEqual(job.exit_code, -signal.SIGINT)
             self.assertEqual(job.signal, signal.SIGINT)
-            self.assertEqual(metadata["signal"], signal.SIGINT)
-        self.assertLess(elapsed, 5.0)  # cancellation ends sleep immediately
+            self.assertEqual(metadata['signal'], signal.SIGINT)
 
     def test_no_cancel_event_uses_timeout_path(self):
-        from loki_agent.jobs import JobManager
+        from job_fixtures import managed_jobs
 
-        async def run():
-            manager = JobManager("/tmp/loki-cancel-test-jobs3")
-            return await manager.run_foreground(
-                ["sleep", "5"], "sleep 5", 300,  # 300ms timeout
-                description="timeout test", shell=False, cwd="/tmp")
+        async def run(root):
+            async with managed_jobs(root) as manager:
+                return await manager.run_foreground(
+                    [sys.executable, '-c', 'import threading;threading.Event().wait()'], 'held command', 300,
+                    description='timeout test', shell=False, cwd=root)
 
-        job, status, stdout, stderr = asyncio.run(run())
-        self.assertEqual(status, "timed_out")
+        with tempfile.TemporaryDirectory() as root:
+            job, status, stdout, stderr = asyncio.run(run(root))
+        self.assertEqual(status, 'timed_out')
 
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@ import os
 import sys
 
 from . import handle_reader
+from .lifetimes import finish_cleanup
+from .streams import BufferedReader
 
 
 class TransportError(Exception):
@@ -39,48 +41,28 @@ class AsyncFdLineReader:
     def __init__(self, fd: int, chunk_size: int = 64 * 1024):
         self.fd = fd
         self.chunk_size = chunk_size
-        self._buffer = bytearray()
-        self._eof = False
         self._reading = False
         self._threaded = None
-        self._chunks = None
-
-    def _take_line(self) -> bytes | None:
-        newline = self._buffer.find(b"\n")
-        if newline >= 0:
-            end = newline + 1
-            line = bytes(self._buffer[:end])
-            del self._buffer[:end]
-            return line
-        if self._eof:
-            line = bytes(self._buffer)
-            self._buffer.clear()
-            return line
-        return None
+        # Accepted raw bytes outlive a cancelled wakeup or reader-thread join.
+        # Framing, including partial prefixes and EOF, has one shared owner.
+        self._chunks = asyncio.Queue(maxsize=1)
+        self._reader = BufferedReader(self._receive, limit=None)
 
     async def readline(self) -> bytes:
         if self._reading:
             raise RuntimeError("concurrent reads from one ACP fd")
         self._reading = True
         try:
-            line = self._take_line()
-            if line is not None:
-                return line
+            return await self._reader.readline()
+        finally:
+            self._reading = False
 
-            if sys.platform == "win32":
-                return await self._readline_threaded()
-
+    async def _receive(self):
+        if sys.platform == "win32":
+            return await self._receive_threaded()
+        if self._chunks.empty():
             loop = asyncio.get_running_loop()
             ready = loop.create_future()
-
-            def finish(error=None):
-                loop.remove_reader(self.fd)
-                if ready.done():
-                    return
-                if error is None:
-                    ready.set_result(None)
-                else:
-                    ready.set_exception(error)
 
             def on_readable():
                 if ready.done():
@@ -91,69 +73,58 @@ class AsyncFdLineReader:
                 except BlockingIOError:
                     return
                 except OSError as error:
-                    finish(error)
-                    return
-                if not chunk:
-                    self._eof = True
-                    finish()
-                    return
-                self._buffer.extend(chunk)
-                if b"\n" in chunk:
-                    finish()
+                    chunk = error
+                # Queue before waking: cancellation can discard a Future result
+                # after this read has already consumed bytes from the borrowed fd.
+                self._chunks.put_nowait(chunk)
+                loop.remove_reader(self.fd)
+                ready.set_result(None)
 
             loop.add_reader(self.fd, on_readable)
             try:
                 await ready
             finally:
                 loop.remove_reader(self.fd)
-            line = self._take_line()
-            if line is None:
-                raise RuntimeError("ACP fd became unreadable without a line")
-            return line
-        finally:
-            self._reading = False
+        chunk = self._chunks.get_nowait()
+        if isinstance(chunk, Exception):
+            raise chunk
+        return chunk
 
-    async def _readline_threaded(self) -> bytes:
-        """Windows: a thread reads the handle; the lines are the same code.
+    async def _receive_threaded(self) -> bytes:
+        """The proactor cannot register synchronous pipe/console handles.
 
-        The proactor loop cannot register this fd (``add_reader`` is
-        selector-only) and a pipe or console handle does not support overlapped
-        I/O, so ``handle_reader`` waits on the handle, reads it and posts; the
-        assembly from bytes into lines below is unchanged.
+        Keep the existing HandleReader acquisition and physical join; only byte
+        framing is shared with native IPC and subprocess protocol readers.
         """
         loop = asyncio.get_running_loop()
-        if self._threaded is None:
-            self._chunks = asyncio.Queue()
+        if self._threaded is None and self._chunks.empty():
             self._threaded = handle_reader.HandleReader(
                 self.fd, loop, self._chunks, eof_sentinel=True)
-            self._threaded.start()
-        while True:
-            line = self._take_line()
-            if line is not None:
-                return line
             try:
-                chunk = await self._chunks.get()
+                self._threaded.start()
             except BaseException:
-                # Cancelled or failed.  The thread and its stop-event handle
-                # belong to this reader, and nothing else will release them.
-                self.aclose()
+                await finish_cleanup(self.aclose(), preserve_failure=True)
                 raise
-            if chunk:
-                self._buffer.extend(chunk)
-            else:
-                self._eof = True
+        try:
+            chunk = await self._chunks.get()
+            if isinstance(chunk, Exception):
+                raise chunk
+            return chunk
+        except BaseException:
+            # Cancelled or failed. The thread and stop-event handle remain ours
+            # until their actual join, not merely until their queue is readable.
+            await finish_cleanup(self.aclose(), preserve_failure=True)
+            raise
 
-    def aclose(self) -> None:
-        """Release the reader thread, if one was started.
-
-        Called when the stream ends and when a read is cancelled.  Idempotent:
-        the next ``readline`` starts a fresh thread, so a caller that cancels
-        one read and continues is still correct.
-        """
-        if self._threaded is not None:
-            self._threaded.stop()
-            self._threaded = None
-            self._chunks = None
+    async def aclose(self) -> None:
+        """Join a started reader without discarding bytes it already delivered."""
+        reader = self._threaded
+        if reader is not None:
+            try:
+                await reader.aclose()
+            finally:
+                if reader.closed and self._threaded is reader:
+                    self._threaded = None
 
     def __aiter__(self):
         return self
@@ -161,7 +132,7 @@ class AsyncFdLineReader:
     async def __anext__(self):
         line = await self.readline()
         if not line:
-            self.aclose()
+            await self.aclose()
             raise StopAsyncIteration
         return line
 

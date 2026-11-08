@@ -17,19 +17,24 @@ from loki_agent.sessions import Session
 
 
 @contextlib.contextmanager
-def isolated_response_headers():
+def isolated_response_headers(*, runner=None):
     with tempfile.TemporaryDirectory(prefix="loki-test-status-") as directory:
         path = os.path.join(directory, "response-headers.json")
         with mock.patch.object(response_headers, "snapshot_path", return_value=path):
             session = Session()
-            try:
+            with contextlib.closing(session.response_headers):
+                # Core unit workflows have no frontend caller identity. Select
+                # the real sanctioned test dispatcher; fresh frontend processes
+                # remain unpatched and exercise their own reentry selection.
                 with mock.patch.object(loki, "_DEFAULT_SESSION", session):
-                    yield path
-            finally:
-                session.response_headers.close()
+                    try:
+                        yield path
+                    finally:
+                        # QuestionGuard owns a live Runner and real Bash jobs;
+                        # retire its Session before Store, directory and Runner.
+                        if runner is not None:
+                            runner.run(session.close_state())
 
 
 def setUpModule():
-    fixture = isolated_response_headers()
-    fixture.__enter__()
-    unittest.addModuleCleanup(fixture.__exit__, None, None, None)
+    unittest.enterModuleContext(isolated_response_headers())

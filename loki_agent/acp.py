@@ -75,7 +75,8 @@ RESTORE_METHODS = (
 class WorkerChannel:
     """One request multiplexer around one worker subprocess."""
 
-    def __init__(self, session_id: str, process: asyncio.subprocess.Process,
+    def __init__(self, session_id: str,
+                 process: asyncio.subprocess.Process | streams.Process,
                  forward, credential_delegation=None, reverse_handler=None):
         self.session_id = session_id
         self.process = process
@@ -208,15 +209,20 @@ class WorkerChannel:
                 f"worker channel for {self.session_id} failed: {error}")
         finally:
             self._closed = True
-            if self.credential_delegation is not None:
-                self.credential_delegation.revoke_now()
-                await self.credential_delegation.close()
-                self.credential_delegation = None
-            failure = failure or acps.TransportError(
-                f"worker for {self.session_id} closed")
-            for future in list(self._pending.values()):
-                if not future.done():
-                    future.set_exception(failure)
+            try:
+                if self.credential_delegation is not None:
+                    try:
+                        self.credential_delegation.revoke_now()
+                    finally:
+                        await self.credential_delegation.close()
+                    self.credential_delegation = None
+            finally:
+                # A failed capability close is not permission to strand replies.
+                failure = failure or acps.TransportError(
+                    f"worker for {self.session_id} closed")
+                for future in list(self._pending.values()):
+                    if not future.done():
+                        future.set_exception(failure)
 
     async def close(self):
         self._closed = True
@@ -251,7 +257,13 @@ class WorkerChannel:
                         await self._reader_task
             self.credential_delegation = None
 
-        await finish_cleanup(retire())
+        try:
+            if delegation is not None:
+                delegation.revoke_now()
+        finally:
+            # SessionOperations already owns the retained front-close task.
+            # Join its retirement here; do not introduce another close owner.
+            await finish_cleanup(retire(), preserve_failure=sys.exc_info()[0] is not None)
 
 
 class SessionOperations:
@@ -314,21 +326,31 @@ class Front:
     async def shutdown(self):
         self._connected = False
         owners = list(self._sessions.values())
-        for owner in owners:
-            self._begin_close(owner)
-        cleanups = {owner.cleanup for owner in owners}
-        tasks = list(self._tasks - cleanups)
-        # _begin_close already cancelled session operations. A second cancel
-        # could interrupt their acquisition-failure cleanup while it unwinds.
-        for task in tasks:
-            if not task.cancelling():
-                task.cancel()
-        for future in self._client_requests.values():
-            future.cancel()
-        self._client_requests.clear()
-        # Cleanup tasks own worker/delegation release. Cancelling them alongside
-        # requests could abandon an unpublished worker or its credential pipe.
-        await asyncio.gather(*tasks, *cleanups, return_exceptions=True)
+        try:
+            with contextlib.ExitStack() as cleanup:
+                for owner in reversed(owners):
+                    cleanup.callback(self._begin_close, owner)
+        finally:
+            cleanups = {owner.cleanup for owner in owners if owner.cleanup is not None}
+            tasks = list(self._tasks - cleanups)
+            # _begin_close already cancelled session operations. A second cancel
+            # could interrupt their acquisition-failure cleanup while it unwinds.
+            for task in tasks:
+                if not task.cancelling():
+                    task.cancel()
+            for future in self._client_requests.values():
+                future.cancel()
+            self._client_requests.clear()
+            # A revoke/close failure must not skip any other session or abandon
+            # the existing cleanup owners through another caller cancellation.
+            outcomes = await finish_cleanup(
+                asyncio.gather(*tasks, *cleanups, return_exceptions=True),
+                preserve_failure=sys.exc_info()[0] is not None)
+            failures = [error for error in outcomes if isinstance(error, Exception)]
+            if len(failures) == 1:
+                raise failures[0]
+            if failures:
+                raise ExceptionGroup('Could not close all sessions', failures)
 
     def _start_task(self, coroutine, *, name: str, owner=None):
         task = asyncio.create_task(coroutine, name=name)
@@ -491,31 +513,35 @@ class Front:
         # Invalidation is synchronous: an already-buffered acceptance must not
         # publish a worker or write a pin after this close wins admission.
         owner.state = "closing"
-        if owner.delegation is not None:
-            owner.delegation.revoke_now()
-        for request_id in owner.client_requests:
-            future = self._client_requests.pop(request_id, None)
-            if future is not None:
-                future.cancel()
-        tasks = list(owner.tasks)
-        for task in tasks:
-            if not task.cancelling():
-                task.cancel()
-        owner.cleanup = self._start_task(
-            self._finish_close(owner, tasks),
-            name=f"acp-session-close-{owner.session_id}")
+        try:
+            if owner.delegation is not None:
+                owner.delegation.revoke_now()
+        finally:
+            # A checked native close can fail during revocation. Publication of
+            # the existing cleanup owner is mandatory on that path as well.
+            for request_id in owner.client_requests:
+                future = self._client_requests.pop(request_id, None)
+                if future is not None:
+                    future.cancel()
+            tasks = list(owner.tasks)
+            for task in tasks:
+                if not task.cancelling():
+                    task.cancel()
+            owner.cleanup = self._start_task(
+                self._finish_close(owner, tasks),
+                name=f"acp-session-close-{owner.session_id}")
         return owner.cleanup
 
     async def _finish_close(self, owner, tasks):
-        try:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            if owner.channel is not None:
-                await owner.channel.close()
-            elif owner.delegation is not None:
-                await owner.delegation.close()
-        finally:
-            if self._sessions.get(owner.session_id) is owner:
-                del self._sessions[owner.session_id]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if owner.channel is not None:
+            await owner.channel.close()
+        elif owner.delegation is not None:
+            await owner.delegation.close()
+        # Failure is not retirement. Keep the existing closing owner and its
+        # control resources reachable rather than silently permitting ID reuse.
+        if self._sessions.get(owner.session_id) is owner:
+            del self._sessions[owner.session_id]
 
     def _worker_finished(self, owner, task):
         # A dead worker must also release a caller awaiting the *client*, not
@@ -987,12 +1013,12 @@ class Front:
         session_id = owner.session_id
         self._check_owner(owner)
         channel = None
+        process = None
         try:
             delegation = await self.credential_supervisor.delegate()
             # Close may arrive during spawn, before a WorkerChannel exists.
             # The provisional owner must already be able to revoke authority.
             owner.delegation = delegation
-            process = None
             try:
                 # The platform seam spawns the worker contained where the
                 # platform has a container (Windows AppContainer) and piped
@@ -1002,6 +1028,14 @@ class Front:
                     cwd, self.environment, delegation,
                     credential_directory=(storage.directory_handle
                                           if storage is not None else None))
+                # Adopt the process before releasing child copies: their
+                # checked native close may fail after the worker already exists.
+                channel = WorkerChannel(
+                    session_id, process, self.write, delegation,
+                    reverse_handler=lambda message: self._worker_request(owner, message))
+                owner.channel = channel
+                channel._reader_task.add_done_callback(
+                    lambda task: self._worker_finished(owner, task))
             except RuntimeIsolationError as error:
                 raise acps.TransportError(
                     f"could not start worker: {error}",
@@ -1010,15 +1044,9 @@ class Front:
             finally:
                 if process is None:
                     await delegation.close()
-                else:
+                    owner.delegation = None
+                elif channel is not None:
                     delegation.child_spawned()
-            channel = WorkerChannel(
-                session_id, process, self.write, delegation,
-                reverse_handler=lambda message: self._worker_request(
-                    owner, message))
-            owner.channel = channel
-            channel._reader_task.add_done_callback(
-                lambda task: self._worker_finished(owner, task))
             self._check_owner(owner)
             prepared = await channel.request(
                 "session/prepare_open",
@@ -1054,13 +1082,25 @@ class Front:
             return session_id, reply or {}
         except BaseException:
             owner.state = "closing"
-            try:
-                if channel is not None:
-                    await channel.close()
-            finally:
-                if (owner.cleanup is None
-                        and self._sessions.get(session_id) is owner):
-                    del self._sessions[session_id]
+            if channel is not None:
+                await channel.close()
+            elif process is not None:
+                async def retire_unadopted():
+                    try:
+                        delegation.revoke_now()
+                    finally:
+                        try:
+                            await process.aclose()
+                        finally:
+                            await delegation.close()
+                await finish_cleanup(retire_unadopted(), preserve_failure=True)
+            elif owner.delegation is not None:
+                # Acquisition cleanup itself failed; that existing owner must
+                # remain reachable, not be mistaken for an unused reserved ID.
+                raise
+            if (owner.cleanup is None
+                    and self._sessions.get(session_id) is owner):
+                del self._sessions[session_id]
             raise
 
     async def new_session(self, params: dict, owner=None) -> dict:

@@ -406,7 +406,7 @@ class PresentationTests(unittest.TestCase):
             [formats.message_item("assistant", "Done")], last_metadata)
         displays = []
         with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
-                mock.patch.object(terminal_frontend, "async_chat_completion",
+                mock.patch.object(loki, "async_chat_completion",
                                   new=mock.AsyncMock(side_effect=[first, last])), \
                 mock.patch.object(terminal_frontend, "_terminal_agent_event"), \
                 mock.patch.object(terminal_frontend.terminals, "redraw_status_bar",
@@ -448,7 +448,7 @@ class PresentationTests(unittest.TestCase):
                 mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline), \
                 mock.patch.object(terminal_frontend, "_terminal_activity",
                                   terminal_frontend.TerminalActivityStatus(turn_running=True)), \
-                mock.patch.object(terminal_frontend, "async_chat_completion", new=chat), \
+                mock.patch.object(loki, "async_chat_completion", new=chat), \
                 mock.patch.object(terminal_frontend, "_terminal_agent_event"), \
                 mock.patch.object(terminal_frontend.terminals, "redraw_status_bar",
                                   side_effect=lambda: displays.append(terminal_frontend.status_text())):
@@ -467,7 +467,7 @@ class PresentationTests(unittest.TestCase):
         # DecodedTurn uses provider_id/provider_name before to_event().
         turn.metadata["provider_id"] = event.get("provider")
         with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
-                mock.patch.object(terminal_frontend, "async_chat_completion",
+                mock.patch.object(loki, "async_chat_completion",
                                   new=mock.AsyncMock(return_value=turn)), \
                 mock.patch.object(terminal_frontend, "_terminal_agent_event"), \
                 mock.patch.object(terminal_frontend.terminals,

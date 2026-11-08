@@ -12,6 +12,7 @@ import sys
 
 from .credentials import CredentialStore, capture_process_credentials
 from .diagnostics import configure_logging
+from .lifetimes import finish_cleanup
 from .process_protections import (
     ProcessProtectionError,
     protect_credential_process,
@@ -24,11 +25,15 @@ async def amain(credentials: CredentialStore) -> int:
     from .credential_storages import JsonCredentialStorage
 
     saved_stdout = os.dup(1)
-    acps.quarantine_stdout()
-    write = acps.make_writer(saved_stdout)
+    try:
+        acps.quarantine_stdout()
+        write = acps.make_writer(saved_stdout)
+    finally:
+        os.close(saved_stdout)
+    reader = acps.AsyncFdLineReader(0)
 
     async def read():
-        async for raw_line in acps.AsyncFdLineReader(0):
+        async for raw_line in reader:
             line = raw_line.strip()
             if not line:
                 continue
@@ -53,7 +58,10 @@ async def amain(credentials: CredentialStore) -> int:
         await front.run()
         return 0
     finally:
-        storage.close()
+        try:
+            await finish_cleanup(reader.aclose(), preserve_failure=sys.exc_info()[0] is not None)
+        finally:
+            storage.close()
 
 
 def main() -> int:

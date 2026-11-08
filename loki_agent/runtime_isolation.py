@@ -1,16 +1,15 @@
-"""Per-runtime isolation, chosen once per platform.
+"""Runtime launch and containment for win32 and POSIX.
 
 The entrypoints need three things before the agent core is imported or a
-runtime is started: isolate *this* process, gate a launch on the recorded
-workspace, and start the runtime process.  Each is a different mechanism per
-platform -- Linux user/mount namespaces and ``create_subprocess_exec``, Windows
-AppContainer and its launch API -- so the choice is made here, once.  The
-entrypoints contain no platform branch; this module contains no policy about
-what to isolate, only how the platform does it.
+runtime is started: apply the native containment checks, gate a launch on the
+recorded workspace where required, and start the runtime process. Windows
+uses AppContainer checks and native launch APIs. POSIX uses asyncio
+subprocesses; Linux additionally installs a user/mount namespace credential
+cover. Other POSIX systems do not install that Linux-specific cover.
 
-The seams are deliberately small: a function per capability, each a thin
-delegation to the platform module.  Shared invocation grammar stays in arguments; this seam adds platform-specific
-launch checks without pushing platform branches into callers.
+The platform choice is made here, not in the entrypoints. Each capability is
+a thin delegation to its platform implementation; shared invocation grammar
+stays in arguments. This keeps platform launch checks out of the callers.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ import logging
 import os
 import sys
 
-from . import host_ipc, streams
+from . import host_ipc, host_process, streams
 
 logger = logging.getLogger(__name__)
 
@@ -139,13 +138,6 @@ if sys.platform == "win32":
                                *host_ipc.handles(delegation.credential_child)],
             current_directory=os.getcwd())
 
-    def close_runtime_process(process) -> None:
-        # Terminal runtimes hand native ownership to the supervisor. ACP
-        # workers instead hand it to their transport; the front must not close
-        # those handles underneath the transport's exit observer.
-        if isinstance(process, windows_runtime.ContainedProcess) or isinstance(process, streams.Process):
-            process.close()
-
 else:
     from . import runtime_isolations
     from .runtime_isolations import RuntimeIsolationError
@@ -154,8 +146,8 @@ else:
         runtime_isolations.isolate_credential_directory(credential_directory)
 
     def verify_contained_runtime() -> None:
-        # A subagent inherits the runtime's covered mount; re-unsharing would
-        # add a namespace level for no security gain.
+        # On Linux, a subagent inherits the runtime's credential cover;
+        # re-unsharing would add a namespace level for no security gain.
         return None
 
     def prepare_runtime_scratch() -> None:
@@ -171,38 +163,13 @@ else:
 
         return argument_preflight(arguments)
 
-    async def _create_posix_process(delegation, *command, **options):
-        """Join unpublished creation even when the caller is cancelled again."""
-        import asyncio
-
-        creation = asyncio.create_task(asyncio.create_subprocess_exec(*command, **options))
-        try:
-            return await asyncio.shield(creation)
-        except asyncio.CancelledError:
-            delegation.revoke_now()
-            creation.cancel()
-
-            async def retire():
-                try:
-                    process = await creation
-                except asyncio.CancelledError:
-                    return
-                except Exception:
-                    return  # Creation failed without publishing a process.
-                # Creation may have finished immediately before cancellation.
-                # Closing its transport retires the child and pipes, including
-                # output ends another descendant might otherwise keep open.
-                process._transport.close()
-                await process.wait()
-
-            cleanup = asyncio.create_task(retire())
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
-            cleanup.result()
-            raise
+    async def _create_posix_process(delegation, *command, stdin=None, stdout=None,
+                                    stderr=None, **options):
+        # Delegation owns revocation; the shared creator owns unpublished
+        # process/transport retirement, including late creation results.
+        return await host_process.create_posix_process(
+            *command, on_cancel=delegation.revoke_now,
+            stdin=stdin, stdout=stdout, stderr=stderr, **options)
 
     async def start_runtime(executable, arguments, workspace, environment,
                             delegation, *, credential_directory=None):
@@ -228,8 +195,8 @@ else:
         """The ACP worker on POSIX: piped stdio, delegated descriptors.
 
         ``cwd`` is unused here -- the worker learns the session directory
-        over the protocol, and POSIX confinement is namespaces established in
-        the child, not a per-directory launch gate.
+        over the protocol. POSIX has no per-directory launch gate; on Linux,
+        the child additionally establishes the credential-cover namespaces.
         """
         import asyncio
 
@@ -256,6 +223,13 @@ else:
         finally:
             os.close(directory_fd)
 
-    def close_runtime_process(process) -> None:
-        # An asyncio subprocess owns its transport; waiting has closed it.
-        return None
+
+def close_runtime_process(process) -> None:
+    # Call only after actual leader exit and reader retirement. Our process
+    # surface can close descendant-held pipes without private stdlib access;
+    # its Windows transport retains the native observer until exit. Raw native
+    # terminal launches instead hand those handles directly to the supervisor.
+    # Fixture-supplied stdlib processes retain their own stream owner.
+    if (isinstance(process, streams.Process)
+            or (sys.platform == 'win32' and isinstance(process, windows_runtime.ContainedProcess))):
+        process.close()

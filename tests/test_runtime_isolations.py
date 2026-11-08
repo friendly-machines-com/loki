@@ -13,6 +13,7 @@ import time
 import types
 import unittest
 from unittest import mock
+from process_lifecycle_fixtures import observe_fixture
 
 from loki_agent import acp
 from loki_agent import authentications
@@ -122,16 +123,16 @@ class UnshareSelectionTests(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"),
-                     "the POSIX enforcement seam (unshare, /proc); the "
-                     "Windows side is test_runtime_gate")
+                     "requires Linux user/mount namespaces and /proc")
 class LinuxIsolationTests(unittest.TestCase):
-    """The POSIX enforcement seam of the isolation property.
+    """The Linux credential-cover enforcement seam.
 
     The property is the same on Windows -- the contained runtime cannot read
     the credential tree, and its ambient cwd is not that tree -- but the seam
-    is not.  POSIX hides the tree from a same-UID process by unsharing user and
+    is not.  Linux hides the tree from a same-UID process by unsharing user and
     mount namespaces inside the runtime itself, which is the production call
-    these tests exercise.  Windows enforces the same property at
+    these tests exercise, not a mechanism shared by all POSIX systems.
+    Windows enforces the same property at
     ``CreateProcess`` with an AppContainer token, and the runtime only verifies
     its token; that side is
     ``test_windows_appcontainers.AppContainerTests.test_runtime_gate`` and, for
@@ -338,7 +339,6 @@ tool = subprocess.run(
         secret,
         control,
     ],
-    timeout=5,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
     text=True,
@@ -368,7 +368,7 @@ print(json.dumps({
                     process = subprocess.run(
                         [sys.executable, "-c", code, credentials,
                          workspace, starting_cwd],
-                        cwd=ROOT, capture_output=True, text=True, timeout=10,
+                        cwd=ROOT, capture_output=True, text=True,
                     )
                     self.assertEqual(process.returncode, 0, process.stderr)
                     result = json.loads(process.stdout)
@@ -609,7 +609,7 @@ print('matched startup-reference controls passed')
 def launch_patches(spawn):
     """Replace whatever starts the runtime, so the supervisor can be observed.
 
-    On POSIX the seam is the thin ``create_subprocess_exec`` delegation, so
+    On POSIX the seam is the thin ``loop.subprocess_exec`` delegation, so
     replacing that one call runs the real seam around the stub.  On Windows the
     runtime is a real AppContainer process -- it needs a configured workspace,
     a profile and ACLs -- and the delegation channel is not ported yet, so the
@@ -621,8 +621,7 @@ def launch_patches(spawn):
     """
     if os.name != "nt":
         return [mock.patch.object(
-            credential_supervisors.asyncio, "create_subprocess_exec",
-            new=spawn)]
+            asyncio.get_running_loop(), "subprocess_exec", new=spawn)]
     return [
         mock.patch.object(runtime_isolation, "configured_workspace",
                           return_value=None),
@@ -633,10 +632,68 @@ def launch_patches(spawn):
 
 
 class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_exit_wait_does_not_release_native_runtime_control(self):
+        from loki_agent import windows_runtime
+
+        supervisor = credential_supervisors.CredentialSupervisor(CredentialStore({}))
+        server = mock.Mock(close=mock.AsyncMock())
+        delegation = credential_supervisors.RuntimeDelegation(server, None, None, None)
+        native = windows_runtime.ContainedProcess(
+            windows_api.ProcessInformation(71, 72, 42, 0), job=44)
+        closed = []
+        with mock.patch.object(supervisor, 'delegate', new=mock.AsyncMock(return_value=delegation)), \
+                mock.patch.object(runtime_isolation, 'configured_workspace', return_value=None), \
+                mock.patch.object(runtime_isolation, 'start_runtime', new=mock.AsyncMock(return_value=native)), \
+                mock.patch.object(runtime_isolation, 'sys', types.SimpleNamespace(platform='win32')), \
+                mock.patch.object(runtime_isolation, 'windows_runtime', windows_runtime, create=True), \
+                mock.patch.object(windows_api, 'wait_for_single_object', return_value=0xffffffff), \
+                mock.patch.object(windows_api, 'close_handle', side_effect=closed.append):
+            try:
+                with self.assertRaisesRegex(windows_api.WindowsApiError, 'WaitForSingleObject'):
+                    await supervisor.run_terminal_runtime('chosen-image', [])
+                server.close.assert_awaited_once_with()
+                self.assertIsNone(native.returncode)
+                self.assertEqual(native.job, 44)
+                self.assertEqual(native.information.hProcess, 71)
+                self.assertEqual(native.information.hThread, 72)
+                self.assertEqual(closed, [])
+            finally:
+                native.close()  # Explicit backstop for substituted records only.
+
+    async def test_child_copy_close_failure_still_retires_every_channel(self):
+        from loki_agent import host_ipc
+
+        server = mock.Mock(close=mock.AsyncMock())
+        delegation = credential_supervisors.RuntimeDelegation(
+            credential_server=server, owner_child=host_ipc.PipeEndpoint(read=101),
+            owner_parent=host_ipc.PipeEndpoint(write=104),
+            credential_child=host_ipc.PipeEndpoint(read=102, write=103))
+        failure = windows_api.WindowsApiError('CloseHandle failed', status=6)
+        attempted = []
+
+        def close(handle):
+            attempted.append(handle)
+            if handle == 101:
+                raise failure
+
+        with mock.patch.object(windows_api, 'close_handle', side_effect=close):
+            with self.assertRaises(windows_api.WindowsApiError) as caught:
+                await delegation.close()
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(attempted, [104, 101, 102, 103])
+            server.close_now.assert_called_once_with()
+            server.close.assert_awaited_once_with()
+            self.assertIsNone(delegation.owner_parent)
+            self.assertIsNone(delegation.owner_child)
+            self.assertIsNone(delegation.credential_child)
+            await delegation.close()
+        self.assertEqual(attempted, [104, 101, 102, 103])
+
     async def test_shared_subscription_lease_rotate_reopen_and_logout(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as resources:
             directory = os.path.join(temporary, "credentials")
             storage = credential_storages.JsonCredentialStorage(directory)
+            resources.callback(storage.close)
             now = time.time()
             tokens = authentications.OpenAITokenSet(
                 access_token="access-secret", refresh_token="refresh-secret",
@@ -645,7 +702,8 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
             await storage.store_openai_login(tokens)
             self.assertEqual(
-                credential_storages.JsonCredentialStorage(directory)
+                resources.enter_context(contextlib.closing(
+                    credential_storages.JsonCredentialStorage(directory)))
                 .load_openai_subscription().tokens, tokens)
             calls = []
 
@@ -653,6 +711,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 calls.append(value)
                 # The attempt must be durable and secret-free before sending.
                 pending = credential_storages.JsonCredentialStorage(directory)
+                resources.callback(pending.close)
                 record = pending.load_openai_subscription()
                 self.assertEqual(record.state, "refreshing")
                 self.assertIsNone(record.tokens)
@@ -707,6 +766,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 fedramp=True, last_refresh=now,
             )
             reopened = credential_storages.JsonCredentialStorage(directory)
+            resources.callback(reopened.close)
             self.assertEqual(reopened.load_openai_subscription().tokens,
                              expected)
             fresh_terminal = credential_supervisors.CredentialSupervisor(
@@ -741,11 +801,13 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
             await reopened.remove_openai_subscription()
             self.assertIsNone(
-                credential_storages.JsonCredentialStorage(directory)
+                resources.enter_context(contextlib.closing(
+                    credential_storages.JsonCredentialStorage(directory)))
                 .load_openai_subscription())
             logged_out = credential_supervisors.CredentialSupervisor(
                 CredentialStore({}),
-                credential_storages.JsonCredentialStorage(directory))
+                resources.enter_context(contextlib.closing(
+                    credential_storages.JsonCredentialStorage(directory))))
             self.assertFalse(logged_out.inventory.has_ref(credential))
             with self.assertRaises(authentications.CredentialUnavailable):
                 await logged_out.broker.lease(credential, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL)
@@ -808,9 +870,9 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             await outer.close()
 
     async def test_incomplete_refresh_is_not_installed(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            storage = credential_storages.JsonCredentialStorage(
-                os.path.join(temporary, "credentials"))
+        with tempfile.TemporaryDirectory() as temporary, \
+                contextlib.closing(credential_storages.JsonCredentialStorage(
+                    os.path.join(temporary, "credentials"))) as storage:
             tokens = authentications.OpenAITokenSet(
                 access_token="access-secret",
                 refresh_token="refresh-secret",
@@ -879,6 +941,24 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
         supervisor = credential_supervisors.CredentialSupervisor(store, storage)
         spawned = {}
 
+        class Transport:
+            # Model public exit/close notifications; Process.wait no longer
+            # delegates to a transport's private _wait method.
+            def __init__(self, protocol):
+                self.protocol = protocol
+
+            def get_pid(self):
+                return 0
+
+            def get_returncode(self):
+                return 7
+
+            def get_pipe_transport(self, _fd):
+                return None
+
+            def close(self):
+                self.protocol.connection_lost(None)
+
         class Process:
             returncode = 0
 
@@ -886,16 +966,22 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 return 7
 
         async def spawn(*args, **kwargs):
-            spawned["args"] = args
+            # On POSIX args[0] is the protocol factory; the command follows.
+            spawned["args"] = args if os.name == "nt" else args[1:]
             spawned["kwargs"] = kwargs
             if os.name == 'posix':
-                directory_fd = int(args[args.index('--credential-directory-fd') + 1])
+                directory_fd = int(spawned["args"][spawned["args"].index('--credential-directory-fd') + 1])
                 spawned['directory_fd'] = directory_fd
                 self.assertGreaterEqual(directory_fd, 3)
                 self.assertNotEqual(directory_fd, storage.directory_handle)
                 self.assertTrue(os.path.samestat(
                     os.fstat(directory_fd), os.fstat(storage.directory_handle)))
                 self.assertFalse(os.get_inheritable(directory_fd))
+                protocol = args[0]()
+                transport = Transport(protocol)
+                protocol.connection_made(transport)
+                protocol.process_exited()
+                return transport, protocol
             return Process()
 
         with contextlib.ExitStack() as stack:
@@ -922,6 +1008,9 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 os.fstat(spawned['directory_fd'])
             self.assertIsNone(storage.load_openai_subscription())
             self.assertTrue(spawned["kwargs"]["close_fds"])
+            # The low-level loop API defaults to pipes, not inheritance.
+            for stream in ['stdin', 'stdout', 'stderr']:
+                self.assertIsNone(spawned['kwargs'][stream])
             environment = spawned["kwargs"]["env"]
         else:
             # start_runtime(executable, arguments, workspace, environment,
@@ -955,9 +1044,41 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
             def revoke_now(self):
                 revoked.set()
+                if os.name == 'posix':
+                    transport.exit()
 
             async def close(self):
                 closed.set()
+
+        class Transport:
+            # The POSIX seam assembles a real Process over this pair; the
+            # supervisor's wait/terminate/kill reach the transport.
+            def __init__(self):
+                self._code = None
+                self.terminated = False
+                self.killed = False
+
+            def get_pid(self):
+                return 0
+
+            def get_returncode(self):
+                return self._code
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+            def get_pipe_transport(self, _fd):
+                return None
+
+            def exit(self):
+                self._code = 23
+                self.protocol.process_exited()
+
+            def close(self):
+                self.protocol.connection_lost(None)
 
         class Process:
             returncode = None
@@ -977,8 +1098,21 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 self.killed = True
 
         process = Process()
+        transport = Transport()
 
         async def spawn(*args, **kwargs):
+            if os.name == 'posix':
+                protocol = args[0]()
+                transport.protocol = protocol
+                protocol.connection_made(transport)
+                exited = protocol.exited.wait
+
+                async def wait_for_exit():
+                    waiting.set()
+                    await exited()
+
+                protocol.exited.wait = wait_for_exit
+                return transport, protocol
             return process
 
         with contextlib.ExitStack() as stack:
@@ -989,18 +1123,49 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(patch)
             task = asyncio.create_task(
                 supervisor.run_terminal_runtime("/loki", []))
-            await waiting.wait()
+            await observe_fixture(waiting.wait(), task)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
         self.assertTrue(revoked.is_set())
         self.assertTrue(closed.is_set())
-        self.assertFalse(process.terminated)
-        self.assertFalse(process.killed)
+        record = transport if os.name == 'posix' else process
+        self.assertFalse(record.terminated)
+        self.assertFalse(record.killed)
 
 
 class CredentialRuntimeCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_handshake_witness_observes_exit_and_joins_its_waiters(self):
+        from process_lifecycle_fixtures import LifecycleObservations
+
+        for outcome in ['exit', 'error', 'ready']:
+            with self.subTest(outcome=outcome):
+                fixture = LifecycleObservations(None, 'unused workspace', 'unused launcher')
+                joined = asyncio.Event()
+
+                async def wait():
+                    try:
+                        if outcome == 'exit':
+                            return 7
+                        if outcome == 'error':
+                            raise OSError('exit observation failed')
+                        await asyncio.Future()
+                    finally:
+                        joined.set()
+
+                if outcome == 'ready':
+                    fixture.ready.set()
+                    await fixture.wait_until_ready(wait)
+                elif outcome == 'exit':
+                    with self.assertRaisesRegex(AssertionError, 'runtime exited with 7'):
+                        await fixture.wait_until_ready(wait)
+                else:
+                    with self.assertRaisesRegex(OSError, 'exit observation failed'):
+                        await fixture.wait_until_ready(wait)
+                self.assertTrue(joined.is_set())
+                self.assertFalse(asyncio.all_tasks() - fixture.tasks_before)
+
     async def test_supervisor_releases_process_after_success_error_and_cancellation(self):
         from process_lifecycle_fixtures import process_lifecycle
 
@@ -1028,7 +1193,7 @@ class CredentialRuntimeCleanupTests(unittest.IsolatedAsyncioTestCase):
                                 if outcome != 'success':
                                     # Witness a real child past its containment
                                     # gate and talking to the credential broker.
-                                    await fixture.ready.wait()
+                                    await fixture.wait_until_ready(wait)
                                     self.assertIsNone(process.returncode)
                                 entered.set()
                                 if outcome == 'error':
@@ -1049,21 +1214,28 @@ class CredentialRuntimeCleanupTests(unittest.IsolatedAsyncioTestCase):
                                      '--shell-cwd', fixture.workspace]
                         task = asyncio.create_task(fixture.supervisor.run_terminal_runtime(
                             fixture.launcher, arguments))
+                        readiness = asyncio.create_task(entered.wait())
                         try:
-                            await asyncio.wait_for(entered.wait(), 10)
+                            # Observe real startup failure as well as readiness;
+                            # a failed launch cannot ever signal entered.
+                            await asyncio.wait([readiness, task], return_when=asyncio.FIRST_COMPLETED)
+                            if not entered.is_set():
+                                await task
+                                self.fail('runtime exited before reaching its wait')
                             if outcome == 'cancel':
                                 task.cancel()
                                 with self.assertRaises(asyncio.CancelledError):
-                                    await asyncio.wait_for(task, 10)
+                                    await task
                             elif outcome == 'error':
                                 with self.assertRaisesRegex(OSError, 'injected wait failure'):
-                                    await asyncio.wait_for(task, 10)
+                                    await task
                             else:
-                                self.assertEqual(await asyncio.wait_for(task, 10), 0)
+                                self.assertEqual(await task, 0)
                         finally:
-                            if not task.done():
-                                task.cancel()
-                            await asyncio.gather(task, return_exceptions=True)
+                            for pending in [readiness, task]:
+                                if not pending.done():
+                                    pending.cancel()
+                            await asyncio.gather(readiness, task, return_exceptions=True)
                     await fixture.assert_released(self)
 
     async def test_owner_closes_even_when_transport_close_fails(self):
@@ -1090,6 +1262,39 @@ class CredentialRuntimeCleanupTests(unittest.IsolatedAsyncioTestCase):
                      "the POSIX worker spawn shape; Windows launch is covered "
                      "by test_windows_runtime")
 class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_absent_stream_flag_errors_do_not_hide_launch_failures(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        storage = credential_storages.JsonCredentialStorage(directory)
+        self.addCleanup(storage.close)
+        delegation = await credential_supervisors.RuntimeDelegation.create(
+            authentications.CredentialBroker())
+        self.addAsyncCleanup(delegation.close)
+        loop = asyncio.get_running_loop()
+        for failure in [errno.EBADF, errno.EPERM]:
+            with self.subTest(errno=failure), \
+                    mock.patch.object(sys, 'stdout', None), \
+                    mock.patch.object(os, 'set_inheritable',
+                                      side_effect=OSError(failure, 'stream flag failure')), \
+                    mock.patch.object(loop, 'subprocess_exec', new_callable=mock.AsyncMock) as spawn:
+                spawn.return_value = (
+                    types.SimpleNamespace(get_pid=lambda: 0),
+                    types.SimpleNamespace(stdin=None, stdout=None, stderr=None))
+                if failure == errno.EBADF:
+                    await runtime_isolation.start_runtime(
+                        '/selected/loki', [], None, {}, delegation,
+                        credential_directory=storage.directory_handle)
+                    spawn.assert_awaited_once()
+                else:
+                    with self.assertRaises(OSError) as raised:
+                        await runtime_isolation.start_runtime(
+                            '/selected/loki', [], None, {}, delegation,
+                            credential_directory=storage.directory_handle)
+                    self.assertEqual(raised.exception.errno, failure)
+                    spawn.assert_not_awaited()
+            self.assertIsNone(storage.load_openai_subscription())
+            os.fstat(delegation.owner_child)
+            os.fstat(delegation.credential_child)
+
     async def test_worker_spawn_is_piped_delegated_and_sessioned(self):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         storage = credential_storages.JsonCredentialStorage(directory)
@@ -1098,23 +1303,27 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
             authentications.CredentialBroker())
         self.addAsyncCleanup(delegation.close)
         spawned = {}
+        loop = asyncio.get_running_loop()
 
         async def spawn(*args, **kwargs):
-            spawned['args'] = args
+            # args[0] is the protocol factory; the launch command follows it.
+            command = args[1:]
+            spawned['args'] = command
             spawned['kwargs'] = kwargs
-            fd = int(args[args.index('--credential-directory-fd') + 1])
+            fd = int(command[command.index('--credential-directory-fd') + 1])
             spawned['directory_fd'] = fd
             self.assertGreaterEqual(fd, 3)
             self.assertNotEqual(fd, storage.directory_handle)
             self.assertTrue(os.path.samestat(
                 os.fstat(fd), os.fstat(storage.directory_handle)))
             self.assertFalse(os.get_inheritable(fd))
-            return object()
+            return types.SimpleNamespace(get_pid=lambda: 0), types.SimpleNamespace(
+                stdin=None, stdout=None, stderr=None)
 
         with mock.patch.object(
                 runtime_isolation, 'worker_command',
                 return_value=['/installed/bin/loki', '--worker']), \
-                mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn):
+                mock.patch.object(loop, 'subprocess_exec', new=spawn):
             await runtime_isolation.start_worker(
                 '/work', {'SAFE': 'value'}, delegation,
                 credential_directory=storage.directory_handle)
@@ -1147,25 +1356,28 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
         for kind in ['terminal', 'worker']:
             for outcome in ['success', 'failure', 'cancel']:
                 with self.subTest(kind=kind, outcome=outcome), \
-                        tempfile.TemporaryDirectory() as directory:
-                    storage = credential_storages.JsonCredentialStorage(directory)
+                        tempfile.TemporaryDirectory() as directory, \
+                        contextlib.closing(credential_storages.JsonCredentialStorage(directory)) as storage:
+                    # Store cleanup must also cover delegation acquisition/close failures.
                     delegation = await credential_supervisors.RuntimeDelegation.create(
                         authentications.CredentialBroker())
                     entered, release = asyncio.Event(), asyncio.Event()
                     inherited = []
 
                     async def spawn(*args, **kwargs):
-                        fd = int(args[args.index('--credential-directory-fd') + 1])
+                        command = args[1:]
+                        fd = int(command[command.index('--credential-directory-fd') + 1])
                         inherited.append(fd)
                         self.assertIn(fd, kwargs['pass_fds'])
                         entered.set()
                         await release.wait()
                         if outcome == 'failure':
                             raise OSError('creation refused')
-                        return object()
+                        return types.SimpleNamespace(get_pid=lambda: 0), \
+                            types.SimpleNamespace(stdin=None, stdout=None, stderr=None)
 
                     try:
-                        with mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn), \
+                        with mock.patch.object(asyncio.get_running_loop(), 'subprocess_exec', new=spawn), \
                                 mock.patch.object(runtime_isolation, 'worker_command',
                                                   return_value=['/selected/loki-acp', '--worker']):
                             if kind == 'terminal':
@@ -1178,7 +1390,7 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     credential_directory=storage.directory_handle)
                             task = asyncio.create_task(operation)
                             try:
-                                await entered.wait()
+                                await observe_fixture(entered.wait(), task)
                                 self.assertTrue(os.path.samestat(
                                     os.fstat(inherited[0]), os.fstat(storage.directory_handle)))
                                 if outcome == 'cancel':
@@ -1202,7 +1414,6 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIsNone(storage.load_openai_subscription())
                     finally:
                         await delegation.close()
-                        storage.close()
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'real Linux runtime creation')
     async def test_cancelled_native_creation_reaps_unpublished_child_before_releasing_copy(self):
@@ -1249,7 +1460,7 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
                                 cwd=fixture.workspace, open_method='session/new')
                         task = asyncio.create_task(operation)
                         try:
-                            await entered.wait()
+                            await observe_fixture(entered.wait(), task)
                             self.assertEqual(len(copies), 1)
                             self.assertIsNone(transports[0].get_returncode())
                             task.cancel()
@@ -1290,7 +1501,6 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(held), 1)
                     self.assertIsNone(storage.load_openai_subscription())
 
-    @unittest.skipUnless(sys.platform.startswith('linux'), 'real Linux runtime creation')
     async def test_cancelled_completed_creation_retires_the_unpublished_result(self):
         from process_lifecycle_fixtures import process_lifecycle
 
@@ -1305,20 +1515,22 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
                             'LOKI_DUMMY_STREAM_CHUNKS': '["alive", "done"]',
                             'LOKI_DUMMY_STREAM_GATE': os.path.join(fixture.workspace, 'release'),
                         })
-                    create = asyncio.create_subprocess_exec
+                    loop = asyncio.get_running_loop()
+                    subprocess_exec = loop.subprocess_exec
                     created = []
 
                     async def spawn(*args, **kwargs):
-                        process = await create(*args, **kwargs)
-                        created.append(fixture.record_process(process))
-                        self.assertIsNone(process.returncode)
-                        # Creation returns a real Process just as cancellation
-                        # reaches its caller: no result has been published yet.
+                        transport, protocol = await subprocess_exec(*args, **kwargs)
+                        created.append(fixture.record_process(
+                            asyncio.subprocess.Process(transport, protocol, loop)))
+                        self.assertIsNone(transport.get_returncode())
+                        # Creation returns its result just as cancellation
+                        # reaches the caller: nothing has been published yet.
                         task.cancel()
-                        return process
+                        return transport, protocol
 
                     front = None
-                    with mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn):
+                    with mock.patch.object(loop, 'subprocess_exec', new=spawn):
                         if kind == 'terminal':
                             operation = fixture.supervisor.run_terminal_runtime(
                                 fixture.launcher, ['--headless', '--prompt', 'creation check'])
@@ -1350,7 +1562,7 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
         for kind in ['terminal', 'worker']:
             with self.subTest(kind=kind), mock.patch.object(
                     host_ipc, 'duplicate_for_child', side_effect=OSError('copy refused')), \
-                    mock.patch.object(asyncio, 'create_subprocess_exec') as spawn:
+                    mock.patch.object(asyncio.get_running_loop(), 'subprocess_exec') as spawn:
                 with self.assertRaisesRegex(OSError, 'copy refused'):
                     if kind == 'terminal':
                         await runtime_isolation.start_runtime(

@@ -9,7 +9,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-from . import connections, model_requests, paths, skills, tool_contracts
+from . import connections, model_requests, paths, tool_contracts
 from . import (
     acp_commands,
     acps,
@@ -22,6 +22,7 @@ from . import (
 )
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
 from .sessions import Session
+from .lifetimes import finish_cleanup
 
 
 _DISCONNECTED = object()
@@ -102,24 +103,29 @@ class Worker:
         await self._answer(message)
 
     async def close(self):
+        # The prompt task already owns hooks and creation through its final
+        # response. Join that owner; Session.close_state later retires manager
+        # and Store once, rather than creating another retained close lifecycle.
+        task = self._prompt_task
         try:
+            self.session.begin_close()
+        finally:
             self.cancel_event.set()
             for future in list(self._reverse_requests.values()):
                 if not future.done():
                     future.set_exception(acps.TransportError(
                         "the session closed while a question was open"))
-            task = self._prompt_task
-            if task is not None and not task.done():
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(task), timeout=3)
-                except asyncio.TimeoutError:
+            if task is not None:
+                if not task.done() and not task.cancelling():
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-        finally:
-            manager = self.session.job_manager
-            if manager is not None:
-                await manager.close_session_owned()
+
+                async def join_prompt():
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+                await finish_cleanup(join_prompt(), preserve_failure=sys.exc_info()[0] is not None)
 
     async def _answer(
             self, message: dict,
@@ -148,6 +154,9 @@ class Worker:
     async def dispatch(
             self, method: str, params: dict,
             thinking: model_requests.TurnThinkingSettings | None = None):
+        if not self.session.active:
+            raise acps.TransportError(
+                "This conversation has closed", code=acps.INVALID_PARAMS)
         if method == "session/prompt":
             return await self.prompt(
                 params,
@@ -836,6 +845,9 @@ class Worker:
         # no message boundary, so monitor output could splice into the
         # streaming agent message. An ACP bypass needs its own out-of-band
         # output channel first.
+        if not self.session.active:
+            raise acps.TransportError(
+                "This conversation has closed", code=acps.INVALID_PARAMS)
         if self._prompt_task is not None and not self._prompt_task.done():
             raise acps.TransportError(
                 "a prompt is already running for this session",
@@ -966,25 +978,7 @@ class Worker:
                 "content": detail,
             })
             return
-        cancel_check = self.cancel_event.is_set
         recovery = loki.make_turn_recovery(self.cancel_event)
-        advertised, withheld = self._ask_advertised_tools()
-        advertised = skills.tools_for_model(advertised, loki.LOKI_CONFIG_DIR)
-
-        async def chat_fn(
-                items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
-            kwargs = {
-                "on_text_delta": on_text_delta,
-                "cancel_check": cancel_check,
-                "codex_turn_state": codex_turn_state,
-                "thinking": thinking,
-            }
-            if on_reasoning_delta is not None:
-                kwargs["on_reasoning_delta"] = on_reasoning_delta
-            if recovery is not None:
-                kwargs["recovery"] = recovery
-            return await loki.async_chat_completion(
-                items, advertised, True, False, **kwargs)
 
         def on_response(turn, event):
             loki.mark_chat_log_dirty()
@@ -995,16 +989,13 @@ class Worker:
         # _answer writes the sole reply; recovery adds no separate lifecycle.
         return await loki.run_tool_loop_async(
             self.session.transcript_items,
-            chat_fn=chat_fn,
             on_event=on_event,
-            cancel_check=cancel_check,
             cancel_event=self.cancel_event,
             recovery=recovery,
             stream_chat=True,
             on_response=on_response,
             thinking=thinking,
-            ask_user=(
-                None if withheld is not None else self._ask_user),
+            ask_user=self._ask_user if self.can_ask_user else None,
         )
 
     @staticmethod

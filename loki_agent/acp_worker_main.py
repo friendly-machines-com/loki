@@ -20,6 +20,7 @@ from .process_protections import (
     protect_credential_process,
 )
 from .runtime_isolation import RuntimeIsolationError
+from .lifetimes import finish_cleanup
 
 
 async def amain(owner_fd: int, capability_fd: int, write) -> int:
@@ -72,8 +73,9 @@ async def _serve_connected_runtime(runtime, write):
             return 2
 
         import json
+        reader = acps.AsyncFdLineReader(0)
         try:
-            async for raw_line in acps.AsyncFdLineReader(0):
+            async for raw_line in reader:
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -104,7 +106,11 @@ async def _serve_connected_runtime(runtime, write):
                     continue
                 await worker.handle(message, concurrent=True)
         finally:
-            await worker.close()
+            try:
+                # Handler/write failure happens outside readline's own cleanup.
+                await finish_cleanup(reader.aclose(), preserve_failure=sys.exc_info()[0] is not None)
+            finally:
+                await worker.close()
         return 0
 
     session = Session(shell_cwd=os.getcwd())

@@ -9,6 +9,7 @@ subagent is launched through ``loki.py`` and an ACP-owned subagent through
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack
 import getopt
 import sys
 import uuid
@@ -194,15 +195,12 @@ async def run_cli_async(
 
 
 def _close_descriptors(options: SubagentOptions) -> None:
-    for end in [
-            options.session_owner_fd,
-            options.credential_capability_fd]:
-        if end is not None:
-            try:
-                # POSIX passes a descriptor; Windows a pipe endpoint.
-                host_ipc.close_end(end)
-            except OSError:
-                pass
+    # Only the pre-adoption help/refusal path calls this consuming cleanup.
+    # Every inherited end needs its attempt even if another release fails.
+    with ExitStack() as cleanup:
+        for end in [options.credential_capability_fd, options.session_owner_fd]:
+            if end is not None:
+                cleanup.callback(host_ipc.close_end, end)
 
 
 async def async_main(args) -> int:

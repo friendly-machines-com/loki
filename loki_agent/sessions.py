@@ -9,11 +9,13 @@ modes use exactly one for the life of the process.
 from __future__ import annotations
 
 import os
+import sys
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from .response_headers import Store
+from .lifetimes import finish_cleanup
 from .usages import ContextTracker
 
 
@@ -101,6 +103,10 @@ class Session:
 
     # JobManager, created on first use.
     job_manager: Any = None
+    # Runtime shutdown is not a turn cancellation or a closed Store: cleanup
+    # still needs both while new tools/hooks must already be inadmissible.
+    # A worker EOF also ends this Session before its credential client closes.
+    _closing: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
         if not self.shell_cwd:
@@ -108,16 +114,41 @@ class Session:
         if not self.previous_shell_cwd:
             self.previous_shell_cwd = self.shell_cwd
 
+    @property
+    def active(self):
+        if self._closing:
+            return False
+        from .credential_capabilities import CredentialClient
+        authority = self.credential_authority
+        return not isinstance(authority, CredentialClient) or not authority.closed
+
+    def begin_close(self):
+        self._closing = True
+        if self.job_manager is not None:
+            self.job_manager.begin_close()
+
+    def require_active(self):
+        if not self.active:
+            raise RuntimeError('This conversation has closed')
+
     async def close_state(self):
-        """Finish runtime-owned work before releasing its retained directories."""
-        try:
-            if self.job_manager is not None:
-                await self.job_manager.aclose()
-        finally:
+        """Retire resources after the operation owner joined prompts and launches."""
+        async def retire():
             try:
-                await self.response_headers.save_on_exit()
+                if self.job_manager is not None:
+                    await self.job_manager.aclose()
             finally:
-                self.response_headers.close()
+                try:
+                    await self.response_headers.save_on_exit()
+                finally:
+                    self.response_headers.close()
+
+        try:
+            self.begin_close()
+        finally:
+            # Final manager/Store retirement has one owner and must survive
+            # further cancellation, including when synchronous revocation failed.
+            await finish_cleanup(retire(), preserve_failure=sys.exc_info()[0] is not None)
 
     @property
     def root_conversation_id(self) -> str:

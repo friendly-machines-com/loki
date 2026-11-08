@@ -6,6 +6,7 @@ over pipes with the dummy provider (no network): initialize, session/new
 """
 
 import asyncio
+import errno
 import json
 import os
 import shlex
@@ -13,11 +14,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from unittest import mock
-from loki_entrypoints import configure_container, loki_acp_command
+from loki_entrypoints import child_environment, configure_container, loki_acp_command
+from directory_fixtures import directory_alias
 from response_header_fixtures import setUpModule as set_up_response_headers
 from config_fixtures import setUpModule as set_up_config
+from process_lifecycle_fixtures import close_fixture_connection, observe_fixture, observe_process_exit
 
 from loki_agent import (
     __version__,
@@ -26,6 +29,8 @@ from loki_agent import (
     acps,
     authentications,
     models,
+    protocols,
+    streams,
 )
 from loki_agent.credentials import CredentialStore, is_credential_name
 from loki_agent import connections, paths as app_paths
@@ -87,11 +92,16 @@ class _FrontInput:
             future = asyncio.get_running_loop().create_future()
             self.messages.put_nowait((message, future))
             routed.append(future)
-        await asyncio.wait_for(asyncio.gather(*routed), 3)
+        for future in routed:
+            await asyncio.wait([future, self.task], return_when=asyncio.FIRST_COMPLETED)
+            if not future.done():
+                await self.task
+                raise AssertionError('front exited before acknowledging message routing')
+            future.result()
 
     async def finish(self):
         await self.send(None)
-        await asyncio.wait_for(self.task, 5)
+        await self.task
 
     async def close(self):
         if not self.task.done():
@@ -99,82 +109,360 @@ class _FrontInput:
         await asyncio.gather(self.task, return_exceptions=True)
 
 
-class FramingTests(unittest.TestCase):
-    def test_response_and_notification_shapes(self):
-        self.assertEqual(
-            acps.response(7, result={"a": 1}),
-            {"jsonrpc": "2.0", "id": 7, "result": {"a": 1}})
-        self.assertEqual(
-            acps.response(7, error={"code": -32601, "message": "x"})["error"],
-            {"code": -32601, "message": "x"})
-        self.assertNotIn("result", acps.response(
-            7, error={"code": -1, "message": "x"}))
-        note = acps.notification("session/update", {"sessionId": "s"})
-        self.assertNotIn("id", note)
-        self.assertEqual(note["method"], "session/update")
+class FrontInputFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_protocol_write_failure_retires_reader_and_saved_output_copy(self):
+        from loki_agent import credential_storages
+
+        reader = acps.AsyncFdLineReader(0)
+        source = mock.Mock(closed=False)
+        source.aclose = mock.AsyncMock(side_effect=lambda: setattr(source, 'closed', True))
+        reader._threaded = source
+        reader._chunks.put_nowait(b'{\n')
+        storage = mock.Mock()
+        storage.load_openai_subscription.return_value = None
+        failure = BrokenPipeError('client closed protocol output')
+        copies = []
+        duplicate = os.dup
+
+        def dup(fd):
+            result = duplicate(fd)
+            copies.append(result)
+            return result
+
+        try:
+            with mock.patch.object(acps, 'sys', mock.Mock(platform='win32')), \
+                    mock.patch.object(acps, 'AsyncFdLineReader', return_value=reader), \
+                    mock.patch.object(acps, 'quarantine_stdout'), \
+                    mock.patch.object(acps, 'make_writer', return_value=mock.Mock(side_effect=failure)), \
+                    mock.patch.object(credential_storages, 'JsonCredentialStorage', return_value=storage), \
+                    mock.patch.object(acp_main.os, 'dup', side_effect=dup):
+                with self.assertRaises(BrokenPipeError) as caught:
+                    await acp_main.amain(CredentialStore({}))
+            self.assertIs(caught.exception, failure)
+            source.aclose.assert_awaited_once_with()
+            self.assertTrue(source.closed)
+            storage.close.assert_called_once_with()
+            self.assertEqual(len(copies), 1)
+            with self.assertRaises(OSError) as closed:
+                os.fstat(copies[0])
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+        finally:
+            await reader.aclose()
+            for fd in copies:
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    if error.errno != errno.EBADF:
+                        raise
+
+    async def test_routing_observes_front_failure_without_a_watchdog(self):
+        failure = OSError('front failed before routing')
+        front = mock.Mock(run=mock.AsyncMock(side_effect=failure))
+        source = _FrontInput(front)
+        try:
+            with self.assertRaises(OSError) as caught:
+                await source.send({'id': 1, 'method': 'initialize'})
+            self.assertIs(caught.exception, failure)
+        finally:
+            await source.close()
+
+    async def test_event_wait_observes_front_exit(self):
+        source = _FrontInput(mock.Mock(run=mock.AsyncMock()))
+        before = asyncio.all_tasks()
+        try:
+            with self.assertRaisesRegex(AssertionError, 'operation ended before expected fixture event'):
+                await observe_fixture(asyncio.Event().wait(), source.task)
+            self.assertFalse(asyncio.all_tasks() - before)
+        finally:
+            await source.close()
+
+    async def test_event_wait_propagates_front_failure(self):
+        failure = OSError('front failed while awaiting an event')
+        source = _FrontInput(mock.Mock(run=mock.AsyncMock(side_effect=failure)))
+        before = asyncio.all_tasks()
+        try:
+            with self.assertRaises(OSError) as caught:
+                await observe_fixture(asyncio.Event().wait(), source.task)
+            self.assertIs(caught.exception, failure)
+            self.assertFalse(asyncio.all_tasks() - before)
+        finally:
+            await source.close()
+
+    async def test_event_wait_joins_its_observer_without_cancelling_owners(self):
+        source = _FrontInput(mock.Mock(run=asyncio.Event().wait))
+        operation = asyncio.get_running_loop().create_future()
+        event = asyncio.Event()
+        before = asyncio.all_tasks()
+        try:
+            event.set()
+            self.assertTrue(await observe_fixture(event.wait(), source.task, operation))
+            self.assertFalse(operation.done())
+            self.assertFalse(source.task.done())
+            self.assertFalse(asyncio.all_tasks() - before)
+        finally:
+            await source.close()
+
+    async def test_cancelled_event_wait_joins_only_its_observer(self):
+        source = _FrontInput(mock.Mock(run=asyncio.Event().wait))
+        operation = asyncio.get_running_loop().create_future()
+        before = asyncio.all_tasks()
+        waiting = asyncio.create_task(observe_fixture(asyncio.Event().wait(), source.task, operation))
+        try:
+            await asyncio.sleep(0)
+            waiting.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiting
+            self.assertFalse(operation.done())
+            self.assertFalse(source.task.done())
+            self.assertFalse(asyncio.all_tasks() - before)
+        finally:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+            await source.close()
+
+    async def test_event_wait_rejects_reply_before_event(self):
+        source = _FrontInput(mock.Mock(run=asyncio.Event().wait))
+        operation = asyncio.get_running_loop().create_future()
+        before = asyncio.all_tasks()
+        try:
+            operation.set_result('reply before event')
+            with self.assertRaisesRegex(AssertionError, 'reply before event'):
+                await observe_fixture(asyncio.Event().wait(), source.task, operation)
+            self.assertEqual(operation.result(), 'reply before event')
+            self.assertFalse(source.task.done())
+            self.assertFalse(asyncio.all_tasks() - before)
+        finally:
+            await source.close()
 
 
-class AsyncFdLineReaderTests(unittest.TestCase):
-    def test_reads_buffered_lines_and_eof_without_changing_fd_flags(self):
+class AsyncFdLineReaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_threaded_native_error_closes_its_reader_and_propagates(self):
+        reader = acps.AsyncFdLineReader(7)
+        source = mock.Mock(closed=False)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def close():
+            entered.set()
+            await release.wait()
+            source.closed = True
+
+        source.aclose = mock.AsyncMock(side_effect=close)
+        reader._threaded = source
+        error = OSError('native input failed')
+        reader._chunks.put_nowait(error)
+        with mock.patch.object(acps.sys, 'platform', 'win32'):
+            task = asyncio.create_task(reader.readline())
+            try:
+                await entered.wait()
+                self.assertIs(reader._threaded, source)
+                task.cancel()  # Another cancellation must not abandon the close.
+                release.set()
+                with self.assertRaises(OSError) as caught:
+                    await task
+                self.assertIs(caught.exception, error)
+                source.aclose.assert_awaited_once_with()
+                self.assertIsNone(reader._threaded)
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_threaded_cancelled_wakeup_retains_bytes_accepted_before_stop(self):
+        reader = acps.AsyncFdLineReader(7)
+        source = mock.Mock(closed=False)
+        source.aclose = mock.AsyncMock(side_effect=lambda: setattr(source, 'closed', True))
+        with mock.patch.object(acps.sys, 'platform', 'win32'), \
+                mock.patch.object(acps.handle_reader, 'HandleReader',
+                                  side_effect=[source, AssertionError('accepted bytes restarted the reader')]):
+            pending = asyncio.create_task(reader.readline())
+            try:
+                await asyncio.sleep(0)
+                reader._chunks.put_nowait(b'accepted before stop\n')
+                pending.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await pending
+                source.aclose.assert_awaited_once_with()
+                self.assertTrue(source.closed)
+                self.assertEqual(await reader.readline(), b'accepted before stop\n')
+            finally:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_threaded_startup_failure_joins_the_published_reader(self):
+        error = OSError('reader startup failed')
+        source = mock.Mock(closed=False, start=mock.Mock(side_effect=error))
+        source.aclose = mock.AsyncMock(side_effect=lambda: setattr(source, 'closed', True))
+        reader = acps.AsyncFdLineReader(7)
+        with mock.patch.object(acps.sys, 'platform', 'win32'), \
+                mock.patch.object(acps.handle_reader, 'HandleReader', return_value=source):
+            with self.assertRaises(OSError) as caught:
+                await reader.readline()
+        self.assertIs(caught.exception, error)
+        source.aclose.assert_awaited_once_with()
+        self.assertIsNone(reader._threaded)
+
+    async def test_reads_buffered_lines_and_eof_without_changing_fd_flags(self):
         read_fd, write_fd = os.pipe()
+        reader = acps.AsyncFdLineReader(read_fd, chunk_size=7)
         blocking_before = os.get_blocking(read_fd)
         try:
             os.write(write_fd, b"first\nsecond\npartial")
             os.close(write_fd)
             write_fd = None
-
-            async def scenario():
-                reader = acps.AsyncFdLineReader(read_fd, chunk_size=7)
-                return [line async for line in reader]
-
-            lines = asyncio.run(scenario())
-            self.assertEqual(lines, [b"first\n", b"second\n", b"partial"])
+            self.assertEqual([line async for line in reader], [b"first\n", b"second\n", b"partial"])
             self.assertEqual(os.get_blocking(read_fd), blocking_before)
         finally:
-            os.close(read_fd)
-            if write_fd is not None:
+            try:
+                await reader.aclose()
+            finally:
+                os.close(read_fd)
+                if write_fd is not None:
+                    os.close(write_fd)
+
+    async def test_cancelled_read_unregisters_cleanly(self):
+        read_fd, write_fd = os.pipe()
+        reader = acps.AsyncFdLineReader(read_fd)
+        try:
+            pending = asyncio.create_task(reader.readline())
+            await asyncio.sleep(0)
+            pending.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await pending
+            os.write(write_fd, b"after cancellation\n")
+            self.assertEqual(await reader.readline(), b"after cancellation\n")
+        finally:
+            try:
+                await reader.aclose()
+            finally:
+                os.close(read_fd)
                 os.close(write_fd)
 
-    def test_cancelled_read_unregisters_cleanly(self):
-        read_fd, write_fd = os.pipe()
-        try:
-            async def scenario():
-                reader = acps.AsyncFdLineReader(read_fd)
+    @contextmanager
+    def _readable(self, chunks):
+        callbacks = []
+        loop = asyncio.get_running_loop()
+        with mock.patch.object(acps, 'sys', mock.Mock(platform='linux')), \
+                mock.patch.object(loop, 'add_reader', side_effect=lambda fd, callback: callbacks.append(callback)), \
+                mock.patch.object(loop, 'remove_reader'), \
+                mock.patch.object(acps.os, 'read', side_effect=iter(chunks)):
+            yield callbacks
+
+    async def test_cancelled_wakeup_retains_large_line_and_eof_tail(self):
+        line, tail = b'x' * 65537 + b'\n', b'y' * 65537
+        reader = acps.AsyncFdLineReader(7, chunk_size=len(line) + len(tail))
+        with self._readable([line + tail, b'']) as callbacks:
+            pending = asyncio.create_task(reader.readline())
+            try:
+                await asyncio.sleep(0)
+                callbacks[-1]()
+                pending.cancel()  # Bytes were consumed, but the waiter has not resumed.
+                with self.assertRaises(asyncio.CancelledError):
+                    await pending
+                self.assertEqual(await reader.readline(), line)
+                self.assertEqual(len(callbacks), 1, 'buffered bytes registered another fd read')
                 pending = asyncio.create_task(reader.readline())
                 await asyncio.sleep(0)
+                callbacks[-1]()
+                self.assertEqual(await pending, tail)
+                self.assertEqual(await reader.readline(), b'')
+            finally:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_fragmented_read_keeps_admission_and_prefix_through_cancellation(self):
+        reader = acps.AsyncFdLineReader(7)
+        with self._readable([b'prefix', b'suffix\n']) as callbacks:
+            pending = asyncio.create_task(reader.readline())
+            try:
+                await asyncio.sleep(0)
+                callbacks[-1]()
+                await asyncio.sleep(0)
+                with self.assertRaisesRegex(RuntimeError, 'concurrent reads'):
+                    await reader.readline()
                 pending.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await pending
-                os.write(write_fd, b"after cancellation\n")
-                return await asyncio.wait_for(reader.readline(), timeout=1)
+                pending = asyncio.create_task(reader.readline())
+                await asyncio.sleep(0)
+                callbacks[-1]()
+                self.assertEqual(await pending, b'prefixsuffix\n')
+            finally:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
 
-            self.assertEqual(
-                asyncio.run(scenario()), b"after cancellation\n")
-        finally:
-            os.close(read_fd)
-            os.close(write_fd)
-
-    def test_reads_through_event_loop_readiness_without_an_executor(self):
+    async def test_reads_through_event_loop_readiness_without_an_executor(self):
         read_fd, write_fd = os.pipe()
+        reader = acps.AsyncFdLineReader(read_fd)
         try:
             os.write(write_fd, b"message\n")
-
-            async def scenario():
-                reader = acps.AsyncFdLineReader(read_fd)
-                with mock.patch.object(
-                        asyncio.BaseEventLoop,
-                        "run_in_executor",
-                        side_effect=AssertionError(
-                            "ACP stdin used an executor")):
-                    return await reader.readline()
-
-            self.assertEqual(asyncio.run(scenario()), b"message\n")
+            with mock.patch.object(asyncio.BaseEventLoop, "run_in_executor",
+                                   side_effect=AssertionError("ACP stdin used an executor")):
+                self.assertEqual(await reader.readline(), b"message\n")
         finally:
-            os.close(read_fd)
-            os.close(write_fd)
+            try:
+                await reader.aclose()
+            finally:
+                os.close(read_fd)
+                os.close(write_fd)
 
 
 class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_channel_close_joins_the_owned_process_transport(self):
+        entered = asyncio.Event()
+        pipe = mock.Mock()
+        pipe.is_closing.return_value = False
+        transport = mock.Mock()
+        transport.get_pipe_transport.side_effect = lambda fd: pipe if fd == 1 else None
+        transport.get_returncode.return_value = 0
+        transport.close.side_effect = entered.set
+        protocol = streams.ProcessProtocol()
+        protocol.connection_made(transport)
+        protocol.exited.set()
+        process = streams.Process(transport, protocol)
+        channel = acp.WorkerChannel('session', process, mock.Mock())
+        closing = asyncio.create_task(channel.close())
+        try:
+            await observe_fixture(entered.wait(), closing)
+            self.assertFalse(closing.done())
+            protocol.connection_lost(None)
+            await closing
+            self.assertTrue(channel._reader_task.done())
+        finally:
+            protocol.connection_lost(None)
+            await asyncio.gather(closing, return_exceptions=True)
+
+    async def test_revoke_failure_still_closes_and_joins_every_session(self):
+        from loki_agent import windows_api
+
+        front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
+        first = front._reserve_session('first')
+        second = front._reserve_session('second')
+        failure = windows_api.WindowsApiError('CloseHandle failed', status=6)
+        first.delegation = mock.Mock(revoke_now=mock.Mock(side_effect=failure), close=mock.AsyncMock())
+        second.delegation = mock.Mock(close=mock.AsyncMock())
+        with self.assertRaises(windows_api.WindowsApiError) as caught:
+            await front.shutdown()
+        self.assertIs(caught.exception, failure)
+        first.delegation.close.assert_awaited_once_with()
+        second.delegation.close.assert_awaited_once_with()
+        self.assertTrue(first.cleanup.done())
+        self.assertTrue(second.cleanup.done())
+        self.assertFalse(front._sessions)
+
+    async def test_failed_retirement_keeps_its_closing_owner_and_reports_failure(self):
+        from loki_agent import windows_api
+
+        front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
+        owner = front._reserve_session('session')
+        failure = windows_api.WindowsApiError('CloseHandle failed', status=6)
+        owner.channel = mock.Mock(close=mock.AsyncMock(side_effect=failure))
+        with self.assertRaises(windows_api.WindowsApiError) as caught:
+            await front.shutdown()
+        self.assertIs(caught.exception, failure)
+        self.assertTrue(owner.cleanup.done())
+        self.assertIs(front._sessions['session'], owner)
+        self.assertEqual(owner.state, 'closing')
+        owner.channel.close.assert_awaited_once_with()
+
     async def test_worker_exit_awaits_credential_capability_cleanup(self):
         class Output:
             async def readline(self):
@@ -200,7 +488,7 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         delegation.close.assert_awaited_once_with()
         self.assertIsNone(channel.credential_delegation)
 
-    async def test_close_releases_the_platform_process(self):
+    async def _assert_platform_retirement(self, ending):
         from process_lifecycle_fixtures import process_lifecycle
 
         async with process_lifecycle('loki-acp') as fixture:
@@ -213,19 +501,38 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
             try:
                 # A reply proves that the real worker passed its startup gate
                 # and established its delegated runtime, not just that it spawned.
-                self.assertEqual(await asyncio.wait_for(
-                    channel.request('session/cancel', {}), 10), {})
+                self.assertEqual(await channel.request('session/cancel', {}), {})
+                if ending == 'input':
+                    process.stdin.close()
+                    await process.stdin.wait_closed()
+                    self.assertEqual(await process.wait(), 0)
+                elif ending == 'revocation':
+                    # Keep stdin open: only real authority loss can end this
+                    # otherwise-idle worker, before channel.close helps it.
+                    delegation.revoke_now()
+                    self.assertEqual(await process.wait(), 1)
             finally:
-                await asyncio.wait_for(channel.close(), 10)
-            self.assertEqual(process.returncode, 0)
+                await channel.close()
+            # close joins exit; it does not promise which independently watched
+            # EOF won. The ordered controls above assert exact success/failure.
+            self.assertIsNotNone(process.returncode)
             self.assertTrue(channel._reader_task.done())
             self.assertTrue(process.stdout.at_eof())
             self.assertTrue(process.stdin.is_closing())
             self.assertIsNone(channel.credential_delegation)
             await fixture.assert_released(self)
             # Repeated caller cleanup must not compete with transport ownership.
-            await asyncio.wait_for(channel.close(), 10)
+            await channel.close()
             await fixture.assert_released(self)
+
+    async def test_close_releases_the_platform_process(self):
+        await self._assert_platform_retirement('channel')
+
+    async def test_input_eof_completes_the_platform_worker_successfully(self):
+        await self._assert_platform_retirement('input')
+
+    async def test_revocation_interrupts_the_platform_worker(self):
+        await self._assert_platform_retirement('revocation')
 
     async def test_a_dead_worker_fails_the_pending_request(self):
         # A worker that exits without answering must fail the request that
@@ -237,12 +544,37 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         channel = acp.WorkerChannel("dying", process, lambda message: None)
         try:
             with self.assertRaises(acps.TransportError):
-                await asyncio.wait_for(channel.request("session/new", {}), 10)
+                await channel.request("session/new", {})
         finally:
             await channel.close()
 
 
 class WorkerSpawnGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_child_copy_release_failure_retires_the_created_worker(self):
+        from loki_agent import windows_api
+
+        front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
+        failure = windows_api.WindowsApiError('CloseHandle failed', status=6)
+        delegation = mock.Mock(child_spawned=mock.Mock(side_effect=failure), close=mock.AsyncMock())
+        process = mock.Mock(stdin=None, stdout=asyncio.StreamReader(), returncode=None)
+
+        async def wait():
+            process.returncode = 0
+            process.stdout.feed_eof()
+            return 0
+
+        process.wait = mock.AsyncMock(side_effect=wait)
+        with mock.patch.object(front.credential_supervisor, 'delegate', new=mock.AsyncMock(return_value=delegation)), \
+                mock.patch.object(acp.runtime_isolation, 'start_worker', new=mock.AsyncMock(return_value=process)):
+            with self.assertRaises(windows_api.WindowsApiError) as caught:
+                await front._open_worker(cwd='workspace-operand', open_method='session/new')
+            await asyncio.gather(*list(front._tasks), return_exceptions=True)
+        self.assertIs(caught.exception, failure)
+        process.wait.assert_awaited()
+        delegation.close.assert_awaited()
+        self.assertEqual(process.returncode, 0)
+        self.assertFalse(front._sessions)
+
     async def test_denied_workspace_fails_closed_and_releases_delegation(self):
         # A session whose workspace has no configured container must not get
         # an unprotected worker: the spawn seam's refusal surfaces as a
@@ -275,13 +607,7 @@ class WorkerSpawnGateTests(unittest.IsolatedAsyncioTestCase):
 class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
     async def test_buffered_restore_close_settles_unstarted_request(self):
         responses = []
-        changed = asyncio.Event()
-
-        def write(message):
-            responses.append(message)
-            changed.set()
-
-        front = acp.Front(lambda: None, write, CredentialStore({}))
+        front = acp.Front(lambda: None, responses.append, CredentialStore({}))
         source = _FrontInput(front)
         self.addAsyncCleanup(source.close)
         with mock.patch.object(front.credential_supervisor, 'delegate',
@@ -289,10 +615,9 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
             await source.send_many(
                 acps.request(1, 'session/resume', {'sessionId': 'saved', 'cwd': ROOT}),
                 acps.request(2, 'session/close', {'sessionId': 'saved'}))
-            async with asyncio.timeout(3):
-                while len(responses) < 2:
-                    changed.clear()
-                    await changed.wait()
+            # The restore is intentionally cancelled before entry; join it and
+            # the close/reply owners before checking their observable responses.
+            await asyncio.gather(*front._tasks, return_exceptions=True)
             by_id = {message['id']: message for message in responses}
             self.assertEqual(by_id[1]['error']['message'], 'session operation was closed')
             self.assertEqual(by_id[2], acps.response(2, result={}))
@@ -364,21 +689,19 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
             },
         })
 
-        await asyncio.wait_for(entered.wait(), 3)
+        operations = list(owner.tasks)
+        self.assertTrue(operations)
+        await observe_fixture(entered.wait(), source.task, *operations)
         # Even a worker-pipe forwarding wait belongs outside the sole reader.
         await source.send(acps.request(3, 'unknown-method', {}))
-        async with asyncio.timeout(3):
-            while not any(message.get('id') == 3 for message in responses):
-                changed.clear()
-                await changed.wait()
+        await asyncio.gather(*(front._tasks - owner.tasks))
         self.assertEqual(order, ['session/prompt'])
         self.assertEqual(next(m for m in responses if m.get('id') == 3)['error']['code'],
                          acps.METHOD_NOT_FOUND)
         forwarding.set()
-        async with asyncio.timeout(3):
-            while len(order) < 3:
-                changed.clear()
-                await changed.wait()
+        while len(order) < 3:
+            changed.clear()
+            await observe_fixture(changed.wait(), source.task, *operations)
         self.assertEqual(order, [
             "session/prompt",
             "session/describe_config_selection",
@@ -602,6 +925,7 @@ class QuarantineTests(unittest.TestCase):
 
 
 class EntrypointTests(unittest.TestCase):
+
     def test_subagent_uses_inherited_worker_authority(self):
         with mock.patch.object(
                 acp_main,
@@ -631,15 +955,208 @@ class EntrypointTests(unittest.TestCase):
         ])
 
 
+class WorkerStartupCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_protocol_write_failure_retires_the_input_reader(self):
+        from loki_agent import acp_worker_main, loki, settings
+
+        reader = acps.AsyncFdLineReader(0)
+        source = mock.Mock(closed=False)
+        source.aclose = mock.AsyncMock(side_effect=lambda: setattr(source, 'closed', True))
+        reader._threaded = source
+        reader._chunks.put_nowait(b'{"id":1,"method":"unsupported"}\n')
+        failure = BrokenPipeError('front closed worker output')
+
+        async def run(operation):
+            return True, await operation
+
+        runtime = mock.Mock(install=mock.Mock(return_value=loki.CREDENTIALS), run=run)
+        try:
+            with mock.patch.object(acps, 'sys', mock.Mock(platform='win32')), \
+                    mock.patch.object(acps, 'AsyncFdLineReader', return_value=reader), \
+                    mock.patch.object(loki, '_DEFAULT_SESSION', loki._DEFAULT_SESSION), \
+                    mock.patch.object(loki, 'apply_runtime_config'), \
+                    mock.patch.object(loki, 'configure_tool_hook_pipeline'), \
+                    mock.patch.object(settings, 'load_settings', new=mock.AsyncMock()):
+                with self.assertRaises(BrokenPipeError) as caught:
+                    await acp_worker_main._serve_connected_runtime(
+                        runtime, mock.Mock(side_effect=failure))
+            self.assertIs(caught.exception, failure)
+            source.aclose.assert_awaited_once_with()
+            self.assertTrue(source.closed)
+        finally:
+            await reader.aclose()
+
+    async def test_failed_session_construction_closes_adopted_authority(self):
+        """Construction failure must retire real adopted channels on both platforms."""
+        from loki_agent import acp_worker_main, credential_supervisors, windows_api
+
+        delegation = await credential_supervisors.RuntimeDelegation.create(
+            authentications.CredentialBroker())
+        # This is an adoption test, not an exec test: transfer the child-owned
+        # ends directly rather than leaving supervisor copies that mask EOF.
+        owner, delegation.owner_child = delegation.owner_child, None
+        capability, delegation.credential_child = delegation.credential_child, None
+        try:
+            with mock.patch('loki_agent.sessions.Session', side_effect=(
+                    OSError('session construction failed'))):
+                with self.assertRaisesRegex(OSError, 'session construction failed'):
+                    await acp_worker_main.amain(owner, capability, lambda _message: None)
+            # The still-owned parent writer must see no reader, not an invalid
+            # parent handle. This checks release without querying a closed ID.
+            if os.name == 'posix':
+                with self.assertRaises(BrokenPipeError) as closed:
+                    os.write(delegation.owner_parent, b'probe')
+                self.assertEqual(closed.exception.errno, errno.EPIPE)
+            else:
+                with self.assertRaises(windows_api.WindowsApiError) as closed:
+                    windows_api.write_file(delegation.owner_parent.write, b'probe')
+                # A closed anonymous-pipe reader can produce either broken
+                # pipe or pipe-closing (NO_DATA), not access/invalid-handle errors.
+                self.assertIn(closed.exception.status,
+                              [windows_api.ERROR_BROKEN_PIPE, windows_api.ERROR_NO_DATA])
+            await delegation.credential_server._reader_task
+        finally:
+            await delegation.close()
+
+
 class _ACPFrontFixture:
-    async def _front(self, env, workspace, *, closed_stderr=False, on_diagnostics=None):
+    async def _provider(self, respond, *, protocol=protocols.OPENAI_CHAT):
+        """Script inference only; front, worker, delegation and tools stay real."""
+        requests = []
+        authorizations = []
+        cleanup = AsyncExitStack()
+
+        async def serve(reader, writer):
+            try:
+                header = await reader.readuntil(b'\r\n\r\n')
+                fields = {}
+                for line in header.split(b'\r\n')[1:]:
+                    name, separator, value = line.partition(b':')
+                    if separator:
+                        fields[name.lower()] = value.strip()
+                body = await reader.readexactly(int(fields.get(b'content-length', b'0')))
+                if header.startswith(b'GET '):
+                    reply = {'data': [{'id': 'workflow-model'}]}
+                else:
+                    request = json.loads(body)
+                    requests.append(request)
+                    authorizations.append(fields.get(b'authorization', b'').decode())
+                    message = await respond(request)
+                    if protocol == protocols.ANTHROPIC_MESSAGES:
+                        reply = {'type': 'message', 'role': 'assistant', 'model': request['model'],
+                                 'content': message, 'stop_reason':
+                                 'tool_use' if any(block['type'] == 'tool_use' for block in message) else 'end_turn'}
+                    else:
+                        reply = {'choices': [{'message': message, 'finish_reason':
+                                              'tool_calls' if message.get('tool_calls') else 'stop'}]}
+                encoded = json.dumps(reply).encode()
+                writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'
+                             b'Connection: close\r\nX-Workflow: observed\r\nContent-Length: '
+                             + str(len(encoded)).encode() + b'\r\n\r\n' + encoded)
+                await writer.drain()
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except ConnectionError:
+                    pass
+
+        def accept(reader, writer):
+            # Register before the coroutine can start or fail; the same exit
+            # stack owns completed outcomes and never-started writers too.
+            task = asyncio.create_task(serve(reader, writer))
+            cleanup.push_async_callback(close_fixture_connection, task, writer)
+            return task
+
+        # A VM's native AppContainer cannot be assumed to reach host-local
+        # loopback services. An explicit external fixture address/forwarded port
+        # lets the SAME journey use a normal remote inference origin, without a
+        # loopback exemption or any change to the product's network permissions.
+        host = os.environ.get('LOKI_TEST_HTTP_HOST', '127.0.0.1')
+        requested_port = int(os.environ.get('LOKI_TEST_HTTP_PORT', '0'))
+        server = await asyncio.start_server(accept, '127.0.0.1', requested_port, start_serving=False)
+
+        async def close():
+            server.close()
+            try:
+                await cleanup.aclose()
+            finally:
+                await server.wait_closed()
+
+        self.addAsyncCleanup(close)
+        await server.start_serving()
+        port = server.sockets[0].getsockname()[1]
+        if host != '127.0.0.1':
+            # Establish that the external fixture route works before the
+            # contained frontend uses it. Failed routing is not a denial.
+            reader, writer = await asyncio.open_connection(host, port)
+            try:
+                writer.write(b'GET /v1/models HTTP/1.1\r\nHost: fixture\r\n\r\n')
+                await writer.drain()
+                self.assertTrue((await reader.read()).startswith(b'HTTP/1.1 200 OK'))
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        route = 'messages' if protocol == protocols.ANTHROPIC_MESSAGES else 'chat/completions'
+        return f'http://{host}:{port}/v1/{route}', requests, authorizations
+
+    async def _search_file(self, workspace, name, owner, *, nonce=None):
+        # Initial records need complete JSON; replies must additionally match
+        # this request's nonce. In both cases an actual owner is mandatory.
+        path = os.path.join(workspace, name)
+
+        async def published():
+            while True:
+                try:
+                    with open(path, encoding='utf-8') as stream:
+                        record = json.load(stream)
+                    if nonce is None or record['nonce'] == nonce:
+                        return record
+                except (FileNotFoundError, json.JSONDecodeError):
+                    pass
+                await asyncio.sleep(0.01)
+
+        return await observe_fixture(published(), owner)
+
+    _observe_process_exit = observe_process_exit
+
+    async def _front(self, env, workspace, *, cleanup, closed_stderr=False, lifetime_boundary=False, on_diagnostics=None):
         command = loki_acp_command()
+        if lifetime_boundary and sys.platform.startswith('linux'):
+            # Trusted outer-fixture setup, before the actual sanctioned front.
+            # Reuse the deployment fixture's mount operations, never install
+            # protection in a hook/tool payload or change the host's mounts.
+            prepare = '''import ctypes, json, os, sys
+sys.path[:0] = [sys.argv[1], os.path.join(sys.argv[1], 'tests')]
+from loki_agent import runtime_isolations as isolation
+from test_state_isolations import mount_call, retained_mount_flags, MS_BIND, MS_REMOUNT
+options = json.loads(sys.argv[2])
+libc = ctypes.CDLL(None, use_errno=True)
+uid, gid = os.getuid(), os.getgid()
+isolation._unshare_user_and_mount_namespaces(libc)
+isolation._map_current_identity(uid, gid)
+mount_call(libc, None, '/', isolation._MS_REC | isolation._MS_PRIVATE)
+if options['lifetime']:
+    # POSIX ordinary jobs intentionally outlive worker close. The fixture's
+    # outer init supplies root retirement, not a new per-command kill policy.
+    if libc.unshare(0x20000000) != 0:
+        raise OSError(ctypes.get_errno(), 'outer fixture PID namespace failed')
+    child = os.fork()
+    if child:
+        isolation._drop_namespace_capabilities(libc)
+        _pid, status = os.waitpid(child, 0)
+        raise SystemExit(os.waitstatus_to_exitcode(status))
+isolation._drop_namespace_capabilities(libc)
+os.execv(sys.argv[3], sys.argv[3:])
+'''
+            options = {'lifetime': lifetime_boundary}
+            command = [sys.executable, '-c', prepare, ROOT, json.dumps(options), *command]
         if closed_stderr:
             command = [sys.executable, '-c',
                        'import os,sys; os.close(2); os.execv(sys.argv[1], sys.argv[1:])',
                        *command]
         process = await asyncio.create_subprocess_exec(
-            *command, env=env, cwd=workspace,
+            *command, env=env, cwd=workspace, limit=64 * 1024,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
 
@@ -656,13 +1173,21 @@ class _ACPFrontFixture:
 
         diagnostics = asyncio.create_task(read_diagnostics())
 
-        async def cleanup():
-            if process.returncode is None:
-                process.kill()
-            await process.wait()
-            await diagnostics
-        self.addAsyncCleanup(cleanup)
+        cleanup(self._close_front, process, diagnostics)
         return process, diagnostics
+
+    async def _close_front(self, process, diagnostics):
+        # EOF already makes the real front cancel operations and join every
+        # worker/delegation. Killing only the front can leave a worker's cwd
+        # held while the fixture is removing its workspace on Windows.
+        if process.returncode is None:
+            process.stdin.close()
+        # A failed assertion may leave protocol messages unread. Discard them
+        # while shutting down so pipe backpressure cannot prevent the join.
+        while await process.stdout.read(65536):
+            pass
+        await process.wait()
+        await diagnostics
 
     async def _response(self, front, request_id):
         preceding = []
@@ -703,6 +1228,53 @@ class _ACPFrontFixture:
         stderr = await diagnostics
         self.assertEqual(front.returncode, 0, stderr.decode(errors="replace"))
         self.assertEqual(await front.stdout.read(), b"")
+
+
+class ProviderFixtureOwnershipTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
+    async def _exercise_cleanup(self, complete):
+        server = mock.Mock(start_serving=mock.AsyncMock(), wait_closed=mock.AsyncMock())
+        server.sockets = [mock.Mock()]
+        server.sockets[0].getsockname.return_value = ('127.0.0.1', 4321)
+        reader = mock.Mock(
+            readuntil=mock.AsyncMock(return_value=b'POST /chat HTTP/1.1\r\nContent-Length: 2\r\n\r\n'),
+            readexactly=mock.AsyncMock(return_value=b'{}'))
+        failure = RuntimeError('provider close failed')
+        writer = mock.Mock(drain=mock.AsyncMock(), wait_closed=mock.AsyncMock(
+            side_effect=failure if complete else None))
+        cleanups = []
+        with mock.patch.dict(os.environ, {'LOKI_TEST_HTTP_HOST': '127.0.0.1', 'LOKI_TEST_HTTP_PORT': '0'}), \
+                mock.patch.object(asyncio, 'start_server', new=mock.AsyncMock(return_value=server)) as start, \
+                mock.patch.object(self, 'addAsyncCleanup', side_effect=cleanups.append):
+            try:
+                await self._provider(mock.AsyncMock(return_value={'role': 'assistant', 'content': 'ok'}))
+                operation = start.await_args.args[0](reader, writer)
+                # Model start_server's documented scheduling of coroutine callbacks
+                # too, so this regression also exposes the former async callback.
+                task = asyncio.create_task(operation) if asyncio.iscoroutine(operation) else operation
+                if complete:
+                    await asyncio.gather(task, return_exceptions=True)
+                close = cleanups.pop()
+                if complete:
+                    with self.assertRaises(RuntimeError) as caught:
+                        await close()
+                    self.assertIs(caught.exception, failure)
+                else:
+                    await close()
+                    self.assertTrue(task.cancelled())
+                    reader.readuntil.assert_not_awaited()
+            finally:
+                for close in reversed(cleanups):
+                    await close()
+        writer.close.assert_called()
+        writer.wait_closed.assert_awaited()
+        server.close.assert_called_once()
+        server.wait_closed.assert_awaited_once()
+
+    async def test_completed_handler_close_failure_is_not_lost(self):
+        await self._exercise_cleanup(complete=True)
+
+    async def test_never_started_handler_still_closes_its_writer(self):
+        await self._exercise_cleanup(complete=False)
 
 
 class FrontWorkerTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
@@ -748,7 +1320,7 @@ args=(%r + str(__import__('os').getpid()), 'a')
             env = self._front_env(directory)
             workspace = _configured_workspace(directory)
             env["LOKI_LOG_CONFIG"] = os.path.relpath(config, workspace)
-            front, diagnostics = await self._front(env, workspace)
+            front, diagnostics = await self._front(env, workspace, cleanup=self.addAsyncCleanup)
             await self._request(front, 1, "initialize", {"protocolVersion": 1})
             opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
             session_id = opened["sessionId"]
@@ -1146,12 +1718,12 @@ class EventMapperTests(unittest.TestCase):
                 acp_events.map_event("s", {"type": kind}, {}), [])
 
 
-class CancelEndToEndTests(unittest.TestCase):
+class CancelEndToEndTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
     """session/cancel mid-turn must yield stopReason "cancelled"."""
 
-    def test_cancel_during_streaming_turn(self):
-        import time as _time
-        with tempfile.TemporaryDirectory() as tmpdir:
+    async def test_cancel_during_streaming_turn(self):
+        async with AsyncExitStack() as cleanup:
+            tmpdir = cleanup.enter_context(tempfile.TemporaryDirectory())
             gate = os.path.join(tmpdir, "release")
             env = dict(os.environ)
             env.update({
@@ -1171,75 +1743,50 @@ class CancelEndToEndTests(unittest.TestCase):
             workspace = os.path.join(tmpdir, "workspace")
             os.makedirs(workspace, exist_ok=True)
             configure_container(env, workspace)
-            front = subprocess.Popen(
-                loki_acp_command(),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
-            self.addCleanup(_close_process_streams, front)
-            try:
-                def send(message):
-                    front.stdin.write(json.dumps(message) + "\n")
-                    front.stdin.flush()
+            front, _diagnostics = await self._front(
+                env, workspace, cleanup=cleanup.push_async_callback)
 
-                def recv():
-                    line = front.stdout.readline()
-                    self.assertTrue(line, "front produced no message")
-                    return json.loads(line)
+            async def send(message):
+                front.stdin.write((json.dumps(message) + "\n").encode())
+                await front.stdin.drain()
 
-                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                      "params": {"protocolVersion": 1}})
-                while recv().get("id") != 1:
-                    pass
-                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": workspace}})
-                while True:
-                    reply = recv()
-                    if reply.get("id") == 2:
-                        break
-                session_id = reply["result"]["sessionId"]
+            async def recv():
+                line = await front.stdout.readline()
+                self.assertTrue(line, "front produced no message")
+                return json.loads(line)
 
-                send({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
-                      "params": {"sessionId": session_id,
-                                 "prompt": [{"type": "text",
-                                             "text": "hello"}]}})
-                # Wait for the first delta to stream: the turn is now
-                # in flight and blocked on the gate.
-                deadline = _time.monotonic() + 5
-                saw_first_chunk = False
-                while _time.monotonic() < deadline:
-                    message = recv()
-                    if (message.get("method") == "session/update"
-                            and message["params"]["update"].get(
-                                "sessionUpdate") == "agent_message_chunk"):
-                        saw_first_chunk = True
-                        break
-                self.assertTrue(saw_first_chunk, "no delta streamed")
+            await self._request(front, 1, "initialize", {"protocolVersion": 1})
+            opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
+            session_id = opened["sessionId"]
+            await send({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                        "params": {"sessionId": session_id,
+                                   "prompt": [{"type": "text", "text": "hello"}]}})
+            # These mid-stream reads cannot use the success-only response helper.
+            # The first delta must precede completion while the gate is held.
+            while True:
+                message = await recv()
+                self.assertNotEqual(message.get('id'), 3,
+                                    f'prompt finished before its first delta: {message!r}')
+                if (message.get("method") == "session/update"
+                        and message["params"]["update"].get(
+                            "sessionUpdate") == "agent_message_chunk"):
+                    break
 
-                send({"jsonrpc": "2.0", "method": "session/cancel",
-                      "params": {"sessionId": session_id}})
-
-                after_cancel = []
-                while True:
-                    reply = recv()
-                    if reply.get("id") == 3:
-                        break
-                    after_cancel.append(reply)
-                self.assertEqual(reply["result"]["stopReason"],
-                                 "cancelled")
-                self.assertTrue(all(
-                    message.get("id") is None
-                    for message in after_cancel
-                ), after_cancel)
-                # The gate was never released: the cancel, not the gate,
-                # ended the turn.
-                self.assertFalse(os.path.exists(gate))
-            finally:
-                front.stdin.close()
-                try:
-                    front.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    front.kill()
-                    front.wait()
+            await send({"jsonrpc": "2.0", "method": "session/cancel",
+                        "params": {"sessionId": session_id}})
+            after_cancel = []
+            while True:
+                reply = await recv()
+                if reply.get("id") == 3:
+                    break
+                after_cancel.append(reply)
+            self.assertEqual(reply["result"]["stopReason"], "cancelled")
+            self.assertTrue(all(
+                message.get("id") is None
+                for message in after_cancel
+            ), after_cancel)
+            # The gate was never released: the cancel, not the gate, ended it.
+            self.assertFalse(os.path.exists(gate))
 
 
 def _conversation_pairs(blob):
@@ -1279,48 +1826,146 @@ def _historical_chunks(messages, session_id):
 
 
 class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
-    async def test_saved_session_list_load_resume_durable_journey(self):
+    async def test_failed_request_cleanup_joins_workers_before_removing_workspace(self):
+        with self.assertRaisesRegex(AssertionError, 'fixture body failed'):
+            async with AsyncExitStack() as cleanup:
+                root = cleanup.enter_context(tempfile.TemporaryDirectory())
+                workspace = _configured_workspace(root)
+                os.mkdir(workspace)
+                env = child_environment(
+                    HOME=root, PATH=os.environ.get('PATH', ''), TERM='dumb',
+                    XDG_CONFIG_HOME=os.path.join(root, 'config'),
+                    XDG_STATE_HOME=os.path.join(root, 'state'),
+                    LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1',
+                    LOKI_MODEL='dummy-model')
+                configure_container(env, workspace)
+                front, diagnostics = await self._front(env, workspace, cleanup=cleanup.push_async_callback)
+                await self._request(front, 1, 'initialize', {'protocolVersion': 1})
+                await self._request(front, 2, 'session/new', {'cwd': workspace})
+                # The worker is still open when protocol assertions unwind.
+                with self.assertRaisesRegex(AssertionError, 'unknown session'):
+                    await self._request(front, 3, 'session/prompt', {
+                        'sessionId': 'not-open', 'prompt': [{'type': 'text', 'text': 'unused'}]})
+                # Leave a response larger than the pipe buffers unread. Scope
+                # cleanup must drain it while EOF retires the real worker.
+                front.stdin.write((json.dumps(acps.request(4, 'unknown-' + 'x' * 262144, {})) + '\n').encode())
+                await front.stdin.drain()
+                await front.stdout.readexactly(32)
+                raise AssertionError('fixture body failed')
+        self.assertEqual(front.returncode, 0, (await diagnostics).decode(errors='replace'))
+        self.assertFalse(os.path.exists(root))
+
+    async def test_saved_sessions_and_todo_plans_survive_load_resume_and_continuation(self):
         import datetime
         from loki_agent import formats
 
-        with tempfile.TemporaryDirectory() as root:
-            workspace = _configured_workspace(root)
-            os.mkdir(workspace)
-            env = {key: value for key, value in os.environ.items()
-                   if not key.startswith("LOKI_")
-                   and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
-            env.update({
-                "HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
-                "XDG_STATE_HOME": os.path.join(root, "state"), "TERM": "dumb",
-                "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
-                "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "first answer",
-            })
-            configure_container(env, workspace)
-            front, diagnostics = await self._front(env, workspace)
-            await self._request(front, 1, "initialize", {"protocolVersion": 1})
-            opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
-            session_id = opened["sessionId"]
-            result, _ = await self._request(front, 3, "session/prompt", {
-                "sessionId": session_id, "prompt": [{"type": "text", "text": "first prompt"}]})
-            self.assertEqual(result["stopReason"], "end_turn")
-            await self._finish(front, diagnostics, session_id)
-            path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
+        tasks = [
+            {"content": "Inspect", "status": "completed", "priority": "high"},
+            {"content": "Implement", "status": "in_progress", "priority": "medium"},
+        ]
+        # These observations share the same new/load/resume lifecycle. Keep the
+        # second live worker and fresh fronts: neither isolation nor restoration
+        # is proved by rereading state in the worker which created it.
+        # Register the directory first so every front joins before its removal.
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        workspace = _configured_workspace(root)
+        os.mkdir(workspace)
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("LOKI_")
+               and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
+        env.update({
+            "HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
+            "XDG_STATE_HOME": os.path.join(root, "state"), "TERM": "dumb",
+            "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
+            "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "first answer",
+            "LOKI_DUMMY_TOOL_CALL": json.dumps({"name": "TodoWrite", "arguments": {"todos": tasks}}),
+        })
+        configure_container(env, workspace)
 
-            def read_saved(turns):
-                with open(path, encoding="utf-8") as stream:
-                    blob = json.load(stream)
-                formats.validate_events(blob["events"])
-                self.assertEqual(_conversation_pairs(blob), _expected_pairs(*turns))
-                self.assertEqual(blob["session_state"]["shell_cwd"], workspace)
-                return blob
+        async def opened_plan(front, session_id):
+            # Read after the reply; _request must not hide premature snapshots.
+            for kind in ["available_commands_update", "plan"]:
+                raw = await front.stdout.readline()
+                self.assertTrue(raw, 'front exited before its plan snapshot')
+                message = json.loads(raw)
+                self.assertEqual(message["method"], "session/update")
+                self.assertEqual(message["params"]["sessionId"], session_id)
+                self.assertEqual(message["params"]["update"]["sessionUpdate"], kind)
+            return message["params"]["update"]["entries"]
 
-            turns = [("first prompt", "first answer")]
-            read_saved(turns)
-            for method, extension, prompt, answer in (
-                    ("session/load", False, "loaded prompt", "loaded answer"),
-                    ("session/resume", True, "resumed prompt", "resumed answer")):
+        async def assert_catalogue(front, session_ids):
+            for params in [{}, {"cwd": workspace}]:
+                listed, _ = await self._request(front, 6, "session/list", params)
+                self.assertCountEqual([entry["sessionId"] for entry in listed["sessions"]], session_ids)
+                for entry in listed["sessions"]:
+                    self.assertEqual(entry["cwd"], workspace)
+                    # Independent filesystem observation, not the catalogue's
+                    # timestamp helper or a reconstructed pathname operand.
+                    with os.scandir(app_paths.chat_log_dir_for(workspace)) as saved:
+                        modified = next(item.stat().st_mtime for item in saved
+                                        if item.name == f'chat-{entry["sessionId"]}.json')
+                    self.assertEqual(datetime.datetime.fromisoformat(entry["updatedAt"]),
+                                     datetime.datetime.fromtimestamp(modified, datetime.timezone.utc))
+
+        front, diagnostics = await self._front(env, workspace, cleanup=self.addAsyncCleanup)
+        await self._request(front, 1, "initialize", {"protocolVersion": 1})
+        opened, preceding = await self._request(front, 2, "session/new", {"cwd": workspace})
+        session_id = opened["sessionId"]
+        self.assertNotIn("lokiUpdates", opened)
+        self.assertEqual(preceding, [])
+        self.assertEqual(await opened_plan(front, session_id), [])
+        result, updates = await self._request(front, 3, "session/prompt", {
+            "sessionId": session_id, "prompt": [{"type": "text", "text": "first prompt"}]})
+        self.assertEqual(result, {"stopReason": "end_turn"})
+        plans = [message["params"] for message in updates
+                 if message.get("method") == "session/update"
+                 and message["params"]["update"]["sessionUpdate"] == "plan"]
+        self.assertEqual(plans, [{
+            "sessionId": session_id, "update": {"sessionUpdate": "plan", "entries": tasks}}])
+        await assert_catalogue(front, [session_id])
+        second, _ = await self._request(front, 4, "session/new", {"cwd": workspace})
+        self.assertNotEqual(second["sessionId"], session_id)
+        self.assertEqual(await opened_plan(front, second["sessionId"]), [])
+        # Opening an empty worker does not persist a conversation. Make its
+        # first turn explicit before requiring both IDs in the durable catalogue.
+        await assert_catalogue(front, [session_id])
+        result, _ = await self._request(front, 7, "session/prompt", {
+            "sessionId": second["sessionId"], "prompt": [{"type": "text", "text": "second prompt"}]})
+        self.assertEqual(result, {"stopReason": "end_turn"})
+        saved_ids = [session_id, second["sessionId"]]
+        await assert_catalogue(front, saved_ids)
+        await self._request(front, 5, "session/close", {"sessionId": second["sessionId"]})
+        await self._finish(front, diagnostics, session_id)
+        path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
+        expected_permissions = None
+
+        def permissions():
+            if sys.platform == 'win32':
+                from loki_agent import windows_api
+                return windows_api.dacl_sddl(path)
+            return os.stat(path).st_mode & 0o7777
+
+        def read_saved(turns):
+            with open(path, encoding="utf-8") as stream:
+                blob = json.load(stream)
+            formats.validate_events(blob["events"])
+            self.assertEqual(_conversation_pairs(blob), _expected_pairs(*turns))
+            self.assertEqual(blob["session_state"]["shell_cwd"], workspace)
+            self.assertEqual(blob["session_todos"], tasks)
+            if expected_permissions is not None:
+                self.assertEqual(permissions(), expected_permissions)
+
+        turns = [["first prompt", "first answer"]]
+        read_saved(turns)
+        # Observe permissions independently; fresh workers must preserve them.
+        expected_permissions = permissions()
+        del env["LOKI_DUMMY_TOOL_CALL"]
+        for method, extension, prompt, answer in [
+                ["session/load", False, "loaded prompt", "loaded answer"],
+                ["session/resume", True, "resumed prompt", "resumed answer"]]:
+            with self.subTest(method=method):
                 env["LOKI_DUMMY_REPLY"] = answer
-                front, diagnostics = await self._front(env, workspace)
+                front, diagnostics = await self._front(env, workspace, cleanup=self.addAsyncCleanup)
                 initialized, _ = await self._request(front, 1, "initialize", {
                     "protocolVersion": 1,
                     "clientInfo": {
@@ -1329,111 +1974,41 @@ class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                     },
                 })
                 self.assertEqual(initialized["agentCapabilities"]["sessionCapabilities"]["resume"], {})
-                for params in [{}, {"cwd": workspace}]:
-                    listed, _ = await self._request(front, 2, "session/list", params)
-                    self.assertEqual(len(listed["sessions"]), 1)
-                    entry = listed["sessions"][0]
-                    self.assertEqual(entry["sessionId"], session_id)
-                    self.assertEqual(entry["cwd"], workspace)
-                    self.assertEqual(datetime.datetime.fromisoformat(entry["updatedAt"]),
-                                     datetime.datetime.fromtimestamp(os.path.getmtime(path), datetime.timezone.utc))
-                restored, replay = await self._request(front, 3, method, {
-                    "sessionId": session_id, "cwd": workspace, "mcpServers": [], "replay": extension})
-                self.assertNotIn("sessionId", restored)
-                self.assertIn("configOptions", restored)
-                expected_replay = [
-                    (kind, {"type": "text", "text": text})
-                    for user, assistant in turns
-                    for kind, text in (("user_message_chunk", user), ("agent_message_chunk", assistant))
-                ] if method == "session/load" else []
-                self.assertEqual(_historical_chunks(replay, session_id), expected_replay)
-                if method == "session/resume":
-                    self.assertFalse(any(m.get("method") == "session/update" for m in replay), replay)
-                result, updates = await self._request(front, 4, "session/prompt", {
-                    "sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]})
-                self.assertEqual(result["stopReason"], "end_turn")
-                self.assertEqual(_historical_chunks(updates, session_id), [
-                    ("agent_message_chunk", {"type": "text", "text": answer})])
-                await self._finish(front, diagnostics, session_id)
-                turns.append((prompt, answer))
-                read_saved(turns)
-
-    async def test_todo_plans_stream_and_restore_after_new_load_and_resume_replies(self):
-        tasks = [
-            {"content": "Inspect", "status": "completed", "priority": "high"},
-            {"content": "Implement", "status": "in_progress", "priority": "medium"},
-        ]
-        with tempfile.TemporaryDirectory() as root:
-            workspace = _configured_workspace(root)
-            os.mkdir(workspace)
-            env = {key: value for key, value in os.environ.items()
-                   if not key.startswith("LOKI_")
-                   and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
-            env.update({
-                "HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
-                "XDG_STATE_HOME": os.path.join(root, "state"), "TERM": "dumb",
-                "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
-                "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "Plan recorded.",
-                "LOKI_DUMMY_TOOL_CALL": json.dumps({"name": "TodoWrite", "arguments": {"todos": tasks}}),
-            })
-            configure_container(env, workspace)
-
-            async def opened_plan(front, session_id):
-                # These reads happen after _request returned the session reply.
-                for kind in ["available_commands_update", "plan"]:
-                    message = json.loads(await asyncio.wait_for(front.stdout.readline(), 5))
-                    self.assertEqual(message["method"], "session/update")
-                    self.assertEqual(message["params"]["sessionId"], session_id)
-                    self.assertEqual(message["params"]["update"]["sessionUpdate"], kind)
-                return message["params"]["update"]["entries"]
-
-            front, diagnostics = await self._front(env, workspace)
-            await self._request(front, 1, "initialize", {"protocolVersion": 1})
-            opened, preceding = await self._request(front, 2, "session/new", {"cwd": workspace})
-            session_id = opened["sessionId"]
-            self.assertNotIn("lokiUpdates", opened)
-            self.assertEqual(preceding, [])
-            self.assertEqual(await opened_plan(front, session_id), [])
-            result, updates = await self._request(front, 3, "session/prompt", {
-                "sessionId": session_id, "prompt": [{"type": "text", "text": "Track this work"}]})
-            self.assertEqual(result, {"stopReason": "end_turn"})
-            plans = [message["params"] for message in updates
-                     if message.get("method") == "session/update"
-                     and message["params"]["update"]["sessionUpdate"] == "plan"]
-            self.assertEqual(plans, [{
-                "sessionId": session_id, "update": {"sessionUpdate": "plan", "entries": tasks}}])
-            # A second worker's empty snapshot must not inherit the first plan.
-            second, _ = await self._request(front, 4, "session/new", {"cwd": workspace})
-            self.assertNotEqual(second["sessionId"], session_id)
-            self.assertEqual(await opened_plan(front, second["sessionId"]), [])
-            await self._request(front, 5, "session/close", {"sessionId": second["sessionId"]})
-            await self._finish(front, diagnostics, session_id)
-            path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
-            with open(path, encoding="utf-8") as stream:
-                self.assertEqual(json.load(stream)["session_todos"], tasks)
-            del env["LOKI_DUMMY_TOOL_CALL"]
-
-            for method in ["session/load", "session/resume"]:
-                with self.subTest(method=method):
-                    front, diagnostics = await self._front(env, workspace)
-                    await self._request(front, 1, "initialize", {"protocolVersion": 1})
-                    restored, preceding = await self._request(front, 2, method, {
-                        "sessionId": session_id, "cwd": workspace, "mcpServers": []})
+                await assert_catalogue(front, saved_ids)
+                for continuation in [False, True]:
+                    params = {"sessionId": session_id, "cwd": workspace, "mcpServers": []}
+                    if continuation:
+                        params["replay"] = extension
+                    restored, replay = await self._request(front, 3, method, params)
+                    self.assertNotIn("sessionId", restored)
+                    self.assertIn("configOptions", restored)
                     self.assertNotIn("lokiUpdates", restored)
                     self.assertFalse(any(message.get("method") == "session/update"
                                          and message["params"]["update"]["sessionUpdate"] == "plan"
-                                         for message in preceding))
-                    if method == "session/load":
-                        self.assertEqual(_historical_chunks(preceding, session_id), [
-                            ("user_message_chunk", {"type": "text", "text": "Track this work"}),
-                            ("agent_message_chunk", {"type": "text", "text": "Plan recorded."}),
-                        ])
-                    else:
-                        self.assertEqual(preceding, [])
+                                         for message in replay))
+                    expected_replay = [
+                        (kind, {"type": "text", "text": text})
+                        for user, assistant in turns
+                        for kind, text in [["user_message_chunk", user], ["agent_message_chunk", assistant]]
+                    ] if method == "session/load" else []
+                    self.assertEqual(_historical_chunks(replay, session_id), expected_replay)
+                    if method == "session/resume":
+                        self.assertEqual(replay, [])
                     self.assertEqual(await opened_plan(front, session_id), tasks)
+                    if not continuation:
+                        # Restore-only shutdown must preserve the saved plan;
+                        # another prompt must not conceal a close/save defect.
+                        await self._request(front, 4, "session/close", {"sessionId": session_id})
+                        read_saved(turns)
+                        continue
+                    result, updates = await self._request(front, 4, "session/prompt", {
+                        "sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]})
+                    self.assertEqual(result, {"stopReason": "end_turn"})
+                    self.assertEqual(_historical_chunks(updates, session_id), [
+                        ("agent_message_chunk", {"type": "text", "text": answer})])
                     await self._finish(front, diagnostics, session_id)
-                    with open(path, encoding="utf-8") as stream:
-                        self.assertEqual(json.load(stream)["session_todos"], tasks)
+                    turns.append([prompt, answer])
+                    read_saved(turns)
 
 
 class SavedApprovalStdioTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
@@ -1441,7 +2016,8 @@ class SavedApprovalStdioTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase
         from loki_agent import protocols
         from loki_agent.connections import ConnectionDescriptor
 
-        with tempfile.TemporaryDirectory() as root:
+        async with AsyncExitStack() as cleanup:
+            root = cleanup.enter_context(tempfile.TemporaryDirectory())
             workspace = _configured_workspace(root)
             os.mkdir(workspace)
             env = {key: value for key, value in os.environ.items()
@@ -1452,7 +2028,7 @@ class SavedApprovalStdioTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase
                        LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1',
                        LOKI_MODEL='dummy-model')
             configure_container(env, workspace)
-            front, diagnostics = await self._front(env, workspace)
+            front, diagnostics = await self._front(env, workspace, cleanup=cleanup.push_async_callback)
             await self._request(front, 1, 'initialize', {'protocolVersion': 1})
             opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
             session_id = opened['sessionId']
@@ -1477,30 +2053,30 @@ class SavedApprovalStdioTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase
 
             for decision in ['accept', 'decline', 'close then accept', 'eof']:
                 with self.subTest(decision=decision):
-                    front, diagnostics = await self._front(env, workspace)
+                    front, diagnostics = await self._front(env, workspace, cleanup=cleanup.push_async_callback)
                     await self._request(front, 1, 'initialize', {
                         'protocolVersion': 1,
                         'clientCapabilities': {'elicitation': {'form': {}}}})
                     messages = []
 
                     async def receive(predicate):
-                        async with asyncio.timeout(15):
-                            while True:
-                                raw = await front.stdout.readline()
-                                self.assertTrue(raw, 'front exited before expected response')
-                                message = json.loads(raw)
-                                messages.append(message)
-                                if predicate(message):
-                                    return message
+                        while True:
+                            raw = await front.stdout.readline()
+                            self.assertTrue(raw, 'front exited before expected response')
+                            message = json.loads(raw)
+                            messages.append(message)
+                            if predicate(message):
+                                return message
 
                     async def send(*messages):
                         front.stdin.write(b''.join(
                             (json.dumps(message) + '\n').encode() for message in messages))
-                        await asyncio.wait_for(front.stdin.drain(), 5)
+                        await front.stdin.drain()
 
                     await send(acps.request(3, 'session/resume', {
                         'sessionId': session_id, 'cwd': workspace}))
-                    ask = await receive(lambda m: m.get('method') == 'elicitation/create')
+                    ask = await receive(lambda m: m.get('method') == 'elicitation/create' or m.get('id') == 3)
+                    self.assertEqual(ask.get('method'), 'elicitation/create', ask)
                     self.assertEqual(ask['params']['requestId'], 3)
                     await send(acps.request(4, 'session/prompt', {
                         'sessionId': session_id,
@@ -1524,10 +2100,10 @@ class SavedApprovalStdioTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase
                             self.assertEqual(next(m for m in messages if m.get('id') == 5)['result'], {})
                             self.assertIn('error', next(m for m in messages if m.get('id') == 3))
                         front.stdin.close()
-                        await asyncio.wait_for(front.wait(), 5)
-                        stderr = await asyncio.wait_for(diagnostics, 5)
+                        remaining = await front.stdout.read()
+                        await front.wait()
+                        stderr = await diagnostics
                         self.assertEqual(front.returncode, 0, stderr.decode(errors='replace'))
-                        remaining = await asyncio.wait_for(front.stdout.read(), 5)
                         if decision == 'eof':
                             self.assertNotIn(b'"result"', remaining)
                     with open(path, 'rb') as stream:
@@ -1544,8 +2120,7 @@ def _tool_fixture(root):
     # A wrong cwd cannot accidentally return the same bytes.
     with open(os.path.join(root, "payload.txt"), "wb") as stream:
         stream.write(b"wrong directory")
-    read = "type" if os.name == "nt" else "cat"
-    command = f"{read} payload.txt >> executed.txt && {read} executed.txt"
+    command = "cat payload.txt >> executed.txt && cat executed.txt"
     result = "status: completed\nexit_code: 0\n[stdout]\n" + payload.decode()
     return workspace, payload, command, result
 
@@ -1584,7 +2159,19 @@ def _assistant_chunks(*texts):
 
 
 class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
-    def _saved_tool_turn(self, path, session_id, user, call_id, args, result, answers):
+    async def test_file_witness_propagates_request_failure(self):
+        workspace = self.enterContext(tempfile.TemporaryDirectory())
+        owner = asyncio.get_running_loop().create_future()
+        failure = OSError('search producer failed')
+        owner.set_exception(failure)
+        before = asyncio.all_tasks()
+        with self.assertRaises(OSError) as caught:
+            await self._search_file(workspace, 'not-published', owner)
+        self.assertIs(caught.exception, failure)
+        self.assertFalse(owner.cancelled())
+        self.assertEqual(asyncio.all_tasks(), before)
+
+    def _saved_tool_turn(self, path, user, call_id, args, result, answers):
         from loki_agent import formats
 
         with open(path, encoding="utf-8") as stream:
@@ -1611,7 +2198,6 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
         self.assertEqual(tool_result["name"], "Bash")
         self.assertIs(tool_result["is_error"], False)
         self.assertEqual(tool_result["content"], [{"type": "text", "text": result}])
-        self.assertEqual(os.path.basename(path), f"chat-{session_id}.json")
         return blob
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux credential-directory mount boundary')
@@ -1620,8 +2206,9 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
 
         for relative, closed_stderr in [[False, False], [True, False],
                                         [False, True], [True, True]]:
-            with self.subTest(relative=relative, closed_stderr=closed_stderr), \
-                    tempfile.TemporaryDirectory() as root, ExitStack() as cleanup:
+            async with AsyncExitStack() as cleanup:
+                cleanup.enter_context(self.subTest(relative=relative, closed_stderr=closed_stderr))
+                root = cleanup.enter_context(tempfile.TemporaryDirectory())
                 workspace = os.path.join(root, 'workspace')
                 second_workspace = os.path.join(root, 'second-workspace')
                 os.mkdir(workspace)
@@ -1654,10 +2241,11 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
                     'LOKI_PROVIDER': 'dummy', 'LOKI_API_BASE': 'http://dummy.invalid/v1',
                     'LOKI_MODEL': 'dummy-model', 'LOKI_DUMMY_REPLY': 'Directory view checked.',
                     'LOKI_DUMMY_TOOL_CALL': json.dumps({'name': 'Bash', 'arguments': {
-                        'command': command, 'description': 'Check the configured directory view'}}),
+                        'command': command,
+                        'description': 'Check the configured directory view'}}),
                 })
                 front, diagnostics = await self._front(
-                    environment, workspace, closed_stderr=closed_stderr)
+                    environment, workspace, closed_stderr=closed_stderr, cleanup=cleanup.push_async_callback)
                 await self._request(front, 1, 'initialize', {'protocolVersion': 1})
                 opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
                 first_session = opened['sessionId']
@@ -1692,51 +2280,91 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
                 await self._finish(front, diagnostics, second_session)
 
     async def test_shipped_front_real_tool_updates_save_and_close(self):
-
-        with tempfile.TemporaryDirectory() as root:
-            workspace, payload, command, result = _tool_fixture(root)
-            args = {"command": command, "description": "Read the relative fixture", "timeout": 5000}
-            environment = {key: value for key, value in os.environ.items()
-                           if not key.startswith("LOKI_")
-                           and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
-            environment.update({
-                "HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
-                "XDG_STATE_HOME": os.path.join(root, "state"), "TERM": "dumb",
-                "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
-                "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "Tool complete.",
-                "LOKI_DUMMY_TOOL_CALL": json.dumps({"name": "Bash", "arguments": args}),
-            })
-            configure_container(environment, workspace)
-            front, diagnostics = await self._front(environment, workspace)
-            await self._request(front, 1, "initialize", {"protocolVersion": 1})
-            opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
-            session_id = opened["sessionId"]
-            reply, messages = await self._request(front, 3, "session/prompt", {
-                "sessionId": session_id,
-                "prompt": [{"type": "text", "text": "Run the real file proof"}],
-            })
-            self.assertEqual(reply, {"stopReason": "end_turn"})
-            self.assertEqual(_tool_updates(messages, session_id),
-                             _call_and_result("dummy-tool-call", command, workspace, result)
-                             + _assistant_chunks("Tool complete."))
-            # The append-only witness distinguishes skipped/fabricated dispatch
-            # and duplicate execution; it is read before shutdown/backstops.
-            with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
-                self.assertEqual(stream.read(), payload)
-            await self._finish(front, diagnostics, session_id)
-            path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
-            self._saved_tool_turn(path, session_id, "Run the real file proof",
-                                  "dummy-tool-call", args, result, ["Tool complete."])
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        workspace, payload, command, result = _tool_fixture(root)
+        args = {"command": command, "description": "Read the relative fixture"}
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith("LOKI_")
+                       and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
+        environment.update({
+            "HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
+            "XDG_STATE_HOME": os.path.join(root, "state"), "TERM": "dumb",
+            "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
+            "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "Tool complete.",
+            "LOKI_DUMMY_TOOL_CALL": json.dumps({"name": "Bash", "arguments": args}),
+        })
+        configure_container(environment, workspace)
+        front, diagnostics = await self._front(environment, workspace, cleanup=self.addAsyncCleanup)
+        await self._request(front, 1, "initialize", {"protocolVersion": 1})
+        opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
+        session_id = opened["sessionId"]
+        reply, messages = await self._request(front, 3, "session/prompt", {
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "Run the real file proof"}],
+        })
+        self.assertEqual(reply, {"stopReason": "end_turn"})
+        self.assertEqual(_tool_updates(messages, session_id),
+                         _call_and_result("dummy-tool-call", command, workspace, result)
+                         + _assistant_chunks("Tool complete."))
+        # The append-only witness distinguishes skipped/fabricated dispatch
+        # and duplicate execution; it is read before shutdown/backstops.
+        with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
+            self.assertEqual(stream.read(), payload)
+        await self._finish(front, diagnostics, session_id)
+        path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
+        self._saved_tool_turn(path, "Run the real file proof",
+                              "dummy-tool-call", args, result, ["Tool complete."])
 
     async def test_resource_real_tool_continuation_save_and_fresh_replay(self):
+        await self._resource_tool_continuation()
+
+    async def test_resource_fixture_closes_state_after_configuration_failure(self):
+        await self._resource_fixture_failure('loki_agent.loki.apply_runtime_config')
+
+    async def test_resource_fixture_closes_state_after_prompt_failure(self):
+        await self._resource_fixture_failure('loki_agent.acp_worker.Worker.prompt')
+
+    async def _resource_fixture_failure(self, target):
+        from loki_agent import sessions
+
+        # Reuse the real resource journey and retain its Sessions beyond scope
+        # exit: a destructor cannot supply false evidence of fixture cleanup.
+        # Each failure is independently selectable and happens before Bash runs.
+        original = sessions.Session
+        held = []
+
+        def create(*arguments, **keywords):
+            session = original(*arguments, **keywords)
+            held.append(session)
+            return session
+
+        try:
+            with mock.patch.object(sessions, 'Session', side_effect=create), \
+                    mock.patch(target, side_effect=RuntimeError('resource fixture injected failure')):
+                with self.assertRaisesRegex(RuntimeError, 'resource fixture injected failure'):
+                    await self._resource_tool_continuation()
+            self.assertEqual(len(held), 1, 'failure must occur after Session state acquisition')
+            for session in held:
+                with self.assertRaisesRegex(ValueError, 'response status storage is closed'):
+                    session.response_headers.directory_handle
+        finally:
+            # Release even a failing red control without relying on its GC.
+            for session in held:
+                await session.close_state()
+
+    async def _resource_tool_continuation(self):
         import copy
-        from contextlib import ExitStack
+        from contextlib import AsyncExitStack
         from pathlib import Path
-        from loki_agent import formats, loki, protocols
+        from loki_agent import formats, loki, paths, protocols, response_headers
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
 
-        with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
+        # The fixture, not Worker.close(), owns each Session's retained state.
+        # Register it before setup can fail; this outer stack joins state after
+        # the worker backstop and before removing the workspace it refers to.
+        async with AsyncExitStack() as stack:
+            root = stack.enter_context(tempfile.TemporaryDirectory())
             workspace, payload, command, result = _tool_fixture(root)
             environment = {key: value for key, value in os.environ.items()
                            if not key.startswith("LOKI_")
@@ -1749,16 +2377,19 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
                 "LOKI_MODEL": "tool-model", "LOKI_STREAM": "1",
             })
             stack.enter_context(mock.patch.object(loki, "CREDENTIALS", credentials))
-            session = Session(shell_cwd=workspace)
+            state_root = paths.loki_state_dir(environment)
+            session = Session(shell_cwd=workspace, response_headers=response_headers.Store(
+                os.path.join(state_root, 'response-headers.json')))
+            stack.push_async_callback(session.close_state)
             stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
-            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(root, "jobs")))
+            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(state_root, "jobs")))
             stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
             loki.apply_runtime_config(connections.build_config_from_env(credentials=credentials))
             messages = []
             session_id = "tool-workflow"
             worker = Worker(session, messages.append, session_id)
             workers = [worker]
-            args = {"command": command, "description": "Read the relative fixture", "timeout": 5000}
+            args = {"command": command, "description": "Read the relative fixture"}
             call_id = "provider-call-73"
             resource = {"name": "payload.txt", "uri": Path(workspace, "payload.txt").as_uri(),
                         "title": "Source \u03b1", "description": "A uniquely populated local file",
@@ -1766,7 +2397,8 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
             user = "inspect this\n[ACP resource link]\n" + json.dumps(resource, ensure_ascii=False)
             requests = []
 
-            async def completion(items, _tools, _verbose, _timing, **kwargs):
+            async def completion(items, *, tools, **kwargs):
+                self.assertIsInstance(tools, list)
                 self.assertFalse(kwargs["cancel_check"]())
                 requests.append(copy.deepcopy(items))
                 self.assertLessEqual(len(requests), 2, "unexpected additional provider request")
@@ -1785,15 +2417,15 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
 
             stack.enter_context(mock.patch.object(loki, "async_chat_completion", new=completion))
             try:
-                await asyncio.wait_for(worker.prepare_open({
-                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/new"}), 3)
+                await worker.prepare_open({
+                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/new"})
                 worker.commit_open()
                 messages.clear()
-                reply = await asyncio.wait_for(worker.prompt({
+                reply = await worker.prompt({
                     "sessionId": session_id,
                     "prompt": [{"type": "text", "text": "inspect this"},
                                {"type": "resource_link", **resource, "unadvertised": "must not leak"}],
-                }), 10)
+                })
                 self.assertEqual(reply, {"stopReason": "end_turn"})
                 self.assertEqual(len(requests), 2)
                 for request in requests:
@@ -1833,17 +2465,20 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
                 with open(job.stderr_path, encoding="utf-8") as stream:
                     self.assertEqual(stream.read(), "")
                 path = session.chat_log_path
-                saved = self._saved_tool_turn(path, session_id, user, call_id, args, result,
+                self.assertEqual(path, os.path.join(
+                    app_paths.chat_log_dir_for(workspace), f'chat-{session_id}.json'))
+                saved = self._saved_tool_turn(path, user, call_id, args, result,
                                               ["Inspecting resource.", "Tool complete."])
-                await asyncio.wait_for(worker.close(), 3)
+                await worker.close()
                 restored_session = Session(shell_cwd=workspace)
+                stack.push_async_callback(restored_session.close_state)
                 loki._DEFAULT_SESSION = restored_session
                 restored = Worker(restored_session, messages.append, session_id)
                 workers.append(restored)
                 messages.clear()
-                await asyncio.wait_for(restored.prepare_open({
+                await restored.prepare_open({
                     "sessionId": session_id, "cwd": workspace, "openMethod": "session/load",
-                    "replay": False}), 3)
+                    "replay": False})
                 self.assertEqual(restored_session.transcript_items, saved["events"])
                 self.assertEqual(_tool_updates(messages, session_id), [])
                 restored.commit_open()
@@ -1859,11 +2494,14 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
                 self.assertEqual(len(requests), 2, "load must not perform inference")
                 with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
                     self.assertEqual(stream.read(), payload, "load must not execute historical calls")
-                await asyncio.wait_for(restored.close(), 3)
+                await restored.close()
             finally:
                 # Backstop only: owned job exit/output was asserted above.
                 for owner in workers:
-                    await asyncio.wait_for(owner.close(), 3)
+                    await owner.close()
+        for owner in workers:
+            with self.assertRaisesRegex(ValueError, 'response status storage is closed'):
+                owner.session.response_headers.directory_handle
 
 
 def _command_fixture(root):
@@ -1880,8 +2518,7 @@ def _command_fixture(root):
         "/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
     with open(os.path.join(destination, "shot.png"), "wb") as stream:
         stream.write(png)
-    read = "type" if os.name == "nt" else "cat"
-    command = f"{read} payload.txt >> executed.txt && {read} executed.txt"
+    command = "cat payload.txt >> executed.txt && cat executed.txt"
     output = "status: completed\nexit_code: 0\n[stdout]\n" + payload.decode()
     model_text = f"I ran the local command `{command}`.\nOutput:\n```\n{output}\n```"
     image = {"type": "image", "source": {
@@ -1897,13 +2534,14 @@ def _command_fixture(root):
         "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
         "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "Local command answer.",
     })
-    return workspace, os.path.realpath(destination), payload, png, command, output, model_text, image, environment
+    return workspace, destination, payload, png, command, output, model_text, image, environment
 
 
-async def _command_status(environment):
+async def _command_status(environment, cleanup):
     from loki_agent import paths, response_headers
     path = os.path.join(paths.loki_state_dir(environment), "response-headers.json")
     store = response_headers.Store(path)
+    cleanup(store.close)  # Save/observer/read failures occur before a caller receives the Store.
     store.observer("https://unrelated.example/v1/chat/completions", None, "observed-model")(
         200, {"x-remaining": "7"})
     await store.save()
@@ -1913,6 +2551,30 @@ async def _command_status(environment):
 
 
 class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_command_status_closes_store_when_save_fails(self):
+        from loki_agent import response_headers
+        store_type = response_headers.Store
+        acquired = []
+
+        def acquire(*args, **kwargs):
+            store = store_type(*args, **kwargs)
+            acquired.append(store)
+            return store
+
+        with tempfile.TemporaryDirectory() as root:
+            try:
+                with ExitStack() as resources:
+                    with mock.patch.object(response_headers, 'Store', side_effect=acquire), \
+                            mock.patch.object(store_type, 'save', new=mock.AsyncMock(side_effect=OSError('save failed'))):
+                        with self.assertRaisesRegex(OSError, 'save failed'):
+                            await _command_status({'XDG_STATE_HOME': root}, resources.callback)
+                self.assertEqual(len(acquired), 1)
+                with self.assertRaisesRegex(ValueError, 'response status storage is closed'):
+                    acquired[0].directory_handle
+            finally:
+                for store in acquired:
+                    store.close()
+
     def _advertisement(self, commands):
         names = [command["name"] for command in commands]
         self.assertEqual(set(names), {"status", "account", "pwd", "cd", "image", "thinking", "trace"})
@@ -1955,70 +2617,73 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
 
     async def test_shipped_commands_snapshot_bang_two_turns_and_close(self):
         import socket
-        with tempfile.TemporaryDirectory() as root:
-            workspace, destination, payload, png, command, output, model_text, image, env = _command_fixture(root)
-            _store, status_path, status_bytes = await _command_status(env)
-            configure_container(env, workspace)
-            # The new virtual cwd is also a supported configured workspace on
-            # Windows; no alternative launcher or containment route is invented.
-            configure_container(env, destination)
-            front, diagnostics = await self._front(env, workspace)
-            initialized, _ = await self._request(front, 1, "initialize", {"protocolVersion": 1})
-            self.assertEqual(initialized["protocolVersion"], 1)
-            self.assertEqual(initialized["agentInfo"]["name"], "loki")
-            self.assertEqual(initialized["agentInfo"]["version"], __version__)
-            for capability in ["close", "list", "resume"]:
-                self.assertEqual(initialized["agentCapabilities"]["sessionCapabilities"][capability], {})
-            self.assertIs(initialized["agentCapabilities"]["promptCapabilities"]["image"], False)
-            opened, preceding = await self._request(front, 2, "session/new", {"cwd": workspace})
-            session_id = opened["sessionId"]
-            self.assertTrue(session_id)
-            self.assertFalse(any(message.get("method") == "session/update" for message in preceding))
-            advertised = json.loads(await asyncio.wait_for(front.stdout.readline(), 5))
-            self.assertEqual(advertised["method"], "session/update")
-            self.assertEqual(advertised["params"]["sessionId"], session_id)
-            self.assertEqual(advertised["params"]["update"]["sessionUpdate"], "available_commands_update")
-            self._advertisement(advertised["params"]["update"]["availableCommands"])
-            plan = json.loads(await asyncio.wait_for(front.stdout.readline(), 5))
-            self.assertEqual(plan, acps.notification("session/update", {
-                "sessionId": session_id,
-                "update": {"sessionUpdate": "plan", "entries": []},
-            }))
-            self.assertNotIn("lokiUpdates", opened)
-            path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        workspace, destination, payload, png, command, output, model_text, image, env = _command_fixture(root)
+        store, status_path, status_bytes = await _command_status(env, self.addCleanup)
+        configure_container(env, workspace)
+        # The new virtual cwd is also a supported configured workspace on
+        # Windows; no alternative launcher or containment route is invented.
+        configure_container(env, destination)
+        front, diagnostics = await self._front(env, workspace, cleanup=self.addAsyncCleanup)
+        initialized, _ = await self._request(front, 1, "initialize", {"protocolVersion": 1})
+        self.assertEqual(initialized["protocolVersion"], 1)
+        self.assertEqual(initialized["agentInfo"]["name"], "loki")
+        self.assertEqual(initialized["agentInfo"]["version"], __version__)
+        for capability in ["close", "list", "resume"]:
+            self.assertEqual(initialized["agentCapabilities"]["sessionCapabilities"][capability], {})
+        self.assertIs(initialized["agentCapabilities"]["promptCapabilities"]["image"], False)
+        opened, preceding = await self._request(front, 2, "session/new", {"cwd": workspace})
+        session_id = opened["sessionId"]
+        self.assertTrue(session_id)
+        self.assertFalse(any(message.get("method") == "session/update" for message in preceding))
+        advertised = json.loads(await front.stdout.readline())
+        self.assertEqual(advertised["method"], "session/update")
+        self.assertEqual(advertised["params"]["sessionId"], session_id)
+        self.assertEqual(advertised["params"]["update"]["sessionUpdate"], "available_commands_update")
+        self._advertisement(advertised["params"]["update"]["availableCommands"])
+        plan = json.loads(await front.stdout.readline())
+        self.assertEqual(plan, acps.notification("session/update", {
+            "sessionId": session_id,
+            "update": {"sessionUpdate": "plan", "entries": []},
+        }))
+        self.assertNotIn("lokiUpdates", opened)
+        path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
 
-            async def prompt(request_id, text):
-                reply, messages = await self._request(front, request_id, "session/prompt", {
-                    "sessionId": session_id, "prompt": [{"type": "text", "text": text}],
-                })
-                self.assertEqual(reply, {"stopReason": "end_turn"})
-                return messages
+        async def prompt(request_id, text):
+            reply, messages = await self._request(front, request_id, "session/prompt", {
+                "sessionId": session_id, "prompt": [{"type": "text", "text": text}],
+            })
+            self.assertEqual(reply, {"stopReason": "end_turn"})
+            return messages
 
-            for request_id, text, expected in (
-                    (3, "/pwd", f"cwd: {workspace}"),
-                    (4, f"/cd {destination}", f"cwd: {destination}"),
-                    (5, "/pwd", f"cwd: {destination}"),
-                    (6, "/image shot.png", f"Attached image for next prompt: {os.path.join(destination, 'shot.png')} (image/png, {len(png)} bytes)")):
-                messages = await prompt(request_id, text)
-                self.assertEqual(_tool_updates(messages, session_id), _assistant_chunks(expected))
-            self._status(await prompt(7, "/status all --json"), session_id, status_bytes)
-            self.assertFalse(os.path.exists(path), "local commands must not save a model turn")
-            with open(status_path, "rb") as stream:
-                self.assertEqual(stream.read(), status_bytes)
-            with open(os.path.join(destination, "shot.png"), "wb") as stream:
-                stream.write(b"\xff\xd8\xffreplacement source")
-            messages = await prompt(8, "!" + command)
-            acknowledgement = f"{socket.gethostname()}: [Running local command: {command}]\n{output}"
-            self.assertEqual(_tool_updates(messages, session_id),
-                             _assistant_chunks(acknowledgement, "Local command answer."))
-            self.assertEqual(_tool_updates(await prompt(9, "Second prompt"), session_id),
-                             _assistant_chunks("Local command answer."))
-            with open(os.path.join(destination, "executed.txt"), "rb") as stream:
-                self.assertEqual(stream.read(), payload)
-            self.assertFalse(os.path.exists(os.path.join(workspace, "executed.txt")))
-            await self._finish(front, diagnostics, session_id)
-            self._saved(path, destination, model_text, image,
-                        ("Local command answer.", "Local command answer."))
+        for request_id, text, expected in (
+                (3, "/pwd", f"cwd: {workspace}"),
+                (4, f"/cd {destination}", f"cwd: {destination}"),
+                (5, "/pwd", f"cwd: {destination}"),
+                (6, "/image shot.png", f"Attached image for next prompt: {os.path.join(destination, 'shot.png')} (image/png, {len(png)} bytes)")):
+            messages = await prompt(request_id, text)
+            self.assertEqual(_tool_updates(messages, session_id), _assistant_chunks(expected))
+        self._status(await prompt(7, "/status all --json"), session_id, status_bytes)
+        self.assertFalse(os.path.exists(path), "local commands must not save a model turn")
+        with open(status_path, "rb") as stream:
+            self.assertEqual(stream.read(), status_bytes)
+        with open(os.path.join(destination, "shot.png"), "wb") as stream:
+            stream.write(b"\xff\xd8\xffreplacement source")
+        messages = await prompt(8, "!" + command)
+        acknowledgement = f"{socket.gethostname()}: [Running local command: {command}]\n{output}"
+        self.assertEqual(_tool_updates(messages, session_id),
+                         _assistant_chunks(acknowledgement, "Local command answer."))
+        self.assertEqual(_tool_updates(await prompt(9, "Second prompt"), session_id),
+                         _assistant_chunks("Local command answer."))
+        with open(os.path.join(destination, "executed.txt"), "rb") as stream:
+            self.assertEqual(stream.read(), payload)
+        self.assertFalse(os.path.exists(os.path.join(workspace, "executed.txt")))
+        listed, _ = await self._request(front, 88, 'session/list', {'cwd': workspace})
+        self.assertEqual([entry['sessionId'] for entry in listed['sessions']], [session_id])
+        self.assertEqual(listed['sessions'][0]['cwd'], destination)
+        await self._finish(front, diagnostics, session_id)
+        self._saved(path, destination, model_text, image,
+                    ("Local command answer.", "Local command answer."))
 
     async def test_wire_commands_snapshot_bang_and_durable_two_turns(self):
         import copy
@@ -2026,16 +2691,21 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
         from contextlib import ExitStack
         from loki_agent import formats, loki, paths, protocols
         from loki_agent.sessions import Session
-        with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
+        async with AsyncExitStack() as resources:
+            root = resources.enter_context(tempfile.TemporaryDirectory())
+            stack = resources.enter_context(ExitStack())
             workspace, destination, payload, png, command, output, model_text, image, env = _command_fixture(root)
-            store, status_path, status_bytes = await _command_status(env)
+            store, status_path, status_bytes = await _command_status(env, resources.callback)
+            state_root = paths.loki_state_dir(env)
             stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
             stack.enter_context(mock.patch.object(loki, "CREDENTIALS", CredentialStore(env)))
             stack.enter_context(mock.patch.object(loki, "LOKI_CONFIG_DIR", paths.loki_config_dir(env)))
-            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(root, "jobs")))
+            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(state_root, "jobs")))
             # Start at the wrong cwd. Only the actual prepare wire request may
             # install the conversation's initial workspace.
             session = Session(shell_cwd=root, response_headers=store)
+            # The fake owns Worker/transport retirement; this fixture owns Session state.
+            resources.push_async_callback(session.close_state)
             stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
             stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
             stack.enter_context(mock.patch.object(acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
@@ -2047,7 +2717,8 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
             channel = acp.WorkerChannel(session_id, process, messages.append)
             process_cwd = os.getcwd()
 
-            async def completion(items, _tools, _verbose, _timing, **kwargs):
+            async def completion(items, *, tools, **kwargs):
+                self.assertIsInstance(tools, list)
                 self.assertFalse(kwargs["cancel_check"]())
                 requests.append(copy.deepcopy(items))
                 self.assertLessEqual(len(requests), 2)
@@ -2060,16 +2731,16 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
 
             async def prompt(text):
                 messages.clear()
-                reply = await asyncio.wait_for(channel.request("session/prompt", {
+                reply = await channel.request("session/prompt", {
                     "sessionId": session_id, "prompt": [{"type": "text", "text": text}],
-                }), 10)
+                })
                 self.assertEqual(reply, {"stopReason": "end_turn"})
                 return list(messages)
 
             try:
-                await asyncio.wait_for(channel.request("session/prepare_open", {
-                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/new"}), 3)
-                opened = await asyncio.wait_for(channel.request("session/commit_open", {}), 3)
+                await channel.request("session/prepare_open", {
+                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/new"})
+                opened = await channel.request("session/commit_open", {})
                 self.assertEqual(session.shell_cwd, workspace)
                 self._advertisement(opened["lokiUpdates"][0]["availableCommands"])
                 self.assertEqual(opened["lokiUpdates"][1], {
@@ -2086,7 +2757,9 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
                         initial.append({
                             "type": "message", "role": "system", "content": [{
                                 "type": "text",
-                                "text": f"Current Loki cwd changed to: {destination}. Relative tool paths and Bash commands now run from this directory.",
+                                "text": (
+                                    f"Current Loki cwd changed to: {destination}. "
+                                    "Relative tool paths and Bash commands now run from this directory."),
                             }],
                         })
                     self.assertEqual(session.transcript_items, initial)
@@ -2124,7 +2797,7 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
                         self.assertEqual(stream.read(), expected)
                 self._saved(session.chat_log_path, destination, model_text, image,
                             ("Image accepted.", "Second answer."))
-                await asyncio.wait_for(channel.close(), 3)
+                await channel.close()
                 self.assertEqual(process.returncode, 0)
                 self.assertTrue(process.close_task.done())
                 self.assertIsNone(process.close_task.exception())
@@ -2134,8 +2807,10 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
                             ("Image accepted.", "Second answer."))
             finally:
                 process.close()
-                await asyncio.wait_for(process.wait(), 3)
-                await asyncio.wait_for(channel.close(), 3)
+                await process.wait()
+                await channel.close()
+        with self.assertRaisesRegex(ValueError, 'response status storage is closed'):
+            store.directory_handle
 
 
 class _LocalWorkerProcess:
@@ -2144,10 +2819,11 @@ class _LocalWorkerProcess:
     Worker.handle generates every reply and update. EOF drives Worker.close;
     wait observes that operation, rather than supplying cleanup in assertions.
     """
+
     def __init__(self, session, session_id, before_request):
         from loki_agent.acp_worker import Worker
         self.before_request = before_request
-        self.stdout = asyncio.StreamReader()
+        self.stdout = asyncio.StreamReader(limit=64 * 1024)
         self.stdin = self
         self.returncode = None
         self.buffer = bytearray()
@@ -2176,34 +2852,40 @@ class _LocalWorkerProcess:
             self.close_task = asyncio.create_task(self._finish())
 
     async def _finish(self):
-        await self.worker.close()
-        self.returncode = 0
-        self.stdout.feed_eof()
-        self.finished.set()
+        try:
+            await self.worker.close()
+            self.returncode = 0
+        finally:
+            self.stdout.feed_eof()
+            self.finished.set()
 
     async def wait_closed(self):
         await self.wait()
 
     async def wait(self):
         await self.finished.wait()
+        await asyncio.shield(self.close_task)
         return self.returncode
 
 
 class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
     @asynccontextmanager
     async def _channel(self, root, messages, completion):
-        from loki_agent import formats, loki
+        from loki_agent import formats, loki, response_headers
         from loki_agent.sessions import Session
+        state_root = os.path.join(root, 'state')
         session = Session(
+            response_headers=response_headers.Store(os.path.join(state_root, 'response-headers.json')),
             shell_cwd=root, chat_log_path=os.path.join(root, "chat.json"),
             transcript_items=[formats.instruction_item("system")])
         tasks_before = asyncio.all_tasks()
-        with ExitStack() as stack:
+        async with AsyncExitStack() as stack:
+            stack.push_async_callback(session.close_state)
             stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
             stack.enter_context(mock.patch.object(loki, "CREDENTIALS", CredentialStore({})))
             stack.enter_context(mock.patch.object(loki, "current_model", return_value="model"))
             stack.enter_context(mock.patch.object(loki, "async_chat_completion", new=completion))
-            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(root, "jobs")))
+            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(state_root, "jobs")))
             # The process seam owns byte transport, not an OS process.
             stack.enter_context(mock.patch.object(
                 acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
@@ -2211,7 +2893,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
             channel = acp.WorkerChannel("prompt-owner", process, messages.append)
             try:
                 yield channel
-                await asyncio.wait_for(channel.close(), 5)
+                await channel.close()
                 self.assertEqual(process.returncode, 0)
                 self.assertTrue(process.close_task.done())
                 self.assertIsNone(process.close_task.exception())
@@ -2220,11 +2902,63 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(asyncio.all_tasks() - tasks_before)
             finally:
                 process.close()
-                await asyncio.wait_for(process.wait(), 5)
-                await asyncio.wait_for(channel.close(), 5)
+                await process.wait()
+                await channel.close()
 
     def _params(self, text):
         return {"sessionId": "prompt-owner", "prompt": [{"type": "text", "text": text}]}
+
+    async def test_channel_closes_its_store_on_success(self):
+        with tempfile.TemporaryDirectory() as root:
+            async with self._channel(root, [], mock.AsyncMock()) as channel:
+                storage = channel.process.worker.session.response_headers
+            with self.assertRaisesRegex(ValueError, 'closed'):
+                _ = storage.directory_handle
+
+    async def test_channel_closes_its_store_on_body_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(RuntimeError, 'fixture body failed'):
+                async with self._channel(root, [], mock.AsyncMock()) as channel:
+                    storage = channel.process.worker.session.response_headers
+                    raise RuntimeError('fixture body failed')
+            with self.assertRaisesRegex(ValueError, 'closed'):
+                _ = storage.directory_handle
+
+    async def test_local_worker_wait_observes_cleanup_failure_without_cancelling_it(self):
+        from loki_agent.sessions import Session
+        session = Session()
+        self.addCleanup(session.response_headers.close)
+        process = _LocalWorkerProcess(session, 'failing-cleanup', lambda message: None)
+        entered, release = asyncio.Event(), asyncio.Event()
+        failure = OSError('fixture cleanup failed')
+
+        async def close():
+            entered.set()
+            await release.wait()
+            raise failure
+
+        with mock.patch.object(process.worker, 'close', new=close):
+            waiter = asyncio.create_task(process.wait())
+            process.close()
+            try:
+                await observe_fixture(entered.wait(), process.close_task)
+                waiter.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiter
+                self.assertFalse(process.close_task.done())
+                release.set()
+                with self.assertRaises(OSError) as caught:
+                    await process.wait()
+                self.assertIs(caught.exception, failure)
+                self.assertIsNone(process.returncode)
+                self.assertTrue(process.stdout.at_eof())
+                task = process.close_task
+                process.close()
+                self.assertIs(process.close_task, task)
+            finally:
+                release.set()
+                waiter.cancel()
+                await asyncio.gather(waiter, process.close_task, return_exceptions=True)
 
     async def test_todo_plan_is_visible_before_turn_end_and_survives_cancellation(self):
         from loki_agent import formats, protocols
@@ -2255,7 +2989,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     pending = asyncio.create_task(channel.request(
                         "session/prompt", self._params("Plan the work")))
                     try:
-                        await asyncio.wait_for(continuation.wait(), 3)
+                        await observe_fixture(continuation.wait(), pending)
                         # Also flushes preceding notifications through the byte
                         # channel, without relaxing ACP's active-prompt guard.
                         with self.assertRaisesRegex(acps.TransportError, "a prompt is already running"):
@@ -2272,7 +3006,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         if cancel:
                             await channel.request("session/cancel", {})
                         release.set()
-                        result = await asyncio.wait_for(pending, 3)
+                        result = await pending
                         self.assertEqual(result, {"stopReason": "cancelled" if cancel else "end_turn"})
                         self.assertEqual(worker.session.session_todos, committed)
                         with open(worker.session.chat_log_path, encoding="utf-8") as stream:
@@ -2312,7 +3046,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         pending = asyncio.create_task(channel.request(
                             "session/prompt", self._params("Track the work")))
                         try:
-                            await asyncio.wait_for(started.wait(), 3)
+                            await observe_fixture(started.wait(), pending)
                             with self.assertRaisesRegex(acps.TransportError, "a prompt is already running"):
                                 await channel.request("session/prompt", self._params("/pwd"))
                             plans = [message["params"] for message in messages
@@ -2330,7 +3064,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                                 worker._prompt_task.cancel()
                             else:
                                 release.set()
-                            result = await asyncio.wait_for(pending, 3)
+                            result = await pending
                             self.assertEqual(result, {
                                 "stopReason": "cancelled" if outcome == "cancellation" else "end_turn"})
                             self.assertEqual(worker.session.session_todos, tasks)
@@ -2423,8 +3157,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                             process.before_request = lambda message: None
 
                     process.before_request = before_request
-                    reply = await asyncio.wait_for(
-                        channel.request("session/prompt", self._params(text)), 5)
+                    reply = await channel.request("session/prompt", self._params(text))
                     self.assertEqual(reply, {"stopReason": "cancelled"})
                     self.assertEqual(completion.await_count, 0)
                     self.assertTrue(worker.cancel_event.is_set())
@@ -2436,8 +3169,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(_conversation_pairs(json.load(stream)),
                                          [("user", [{"type": "text", "text": text}])])
                     messages.clear()
-                    reply = await asyncio.wait_for(
-                        channel.request("session/prompt", self._params("next prompt")), 5)
+                    reply = await channel.request("session/prompt", self._params("next prompt"))
                     self.assertEqual(reply, {"stopReason": "end_turn"})
                     self.assertFalse(worker.cancel_event.is_set())
                     self.assertEqual(completion.await_count, 1)
@@ -2461,8 +3193,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 worker.cancel_event.set()
                 for text in ["/status --json", "/pwd"]:
                     messages.clear()
-                    reply = await asyncio.wait_for(
-                        channel.request("session/prompt", self._params(text)), 5)
+                    reply = await channel.request("session/prompt", self._params(text))
                     self.assertEqual(reply, {"stopReason": "end_turn"})
                     self.assertTrue(worker.cancel_event.is_set())
                     self.assertEqual(worker.session.transcript_items, initial)
@@ -2484,8 +3215,8 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
             async with self._channel(root, messages, completion) as channel:
                 worker = channel.process.worker
                 with mock.patch.object(loki, "run_ps") as run_ps:
-                    result = await asyncio.wait_for(channel.request(
-                        "session/prompt", self._params("/ps all")), 3)
+                    result = await channel.request(
+                        "session/prompt", self._params("/ps all"))
                 run_ps.assert_not_called()
                 self.assertEqual(result, {"stopReason": "end_turn"})
                 completion.assert_awaited_once()
@@ -2497,19 +3228,83 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         ("assistant", [{"type": "text", "text": "ordinary text response"}]),
                     ])
 
+    async def test_close_joins_prompt_and_session_owns_final_retirement(self):
+        from loki_agent import loki
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        session = Session()
+        self.addAsyncCleanup(session.close_state)
+        with mock.patch.object(loki, '_DEFAULT_SESSION', session):
+            manager = loki.current_job_manager()
+        worker = Worker(session, lambda message: None)
+        started, entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        finished = []
+
+        async def prompt():
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                entered.set()
+                await release.wait()
+                finished.append(True)
+
+        worker._prompt_task = asyncio.create_task(prompt())
+        first = second = None
+        try:
+            await observe_fixture(started.wait(), worker._prompt_task)
+            with mock.patch.object(manager, 'close_session_owned', wraps=manager.close_session_owned) as retire:
+                first = asyncio.create_task(worker.close())
+                second = asyncio.create_task(worker.close())
+                await observe_fixture(entered.wait(), first, second)
+                self.assertFalse(session.active)
+                self.assertIsNotNone(session.response_headers.directory_handle)
+                retire.assert_not_awaited()
+                with self.assertRaisesRegex(acps.TransportError, 'conversation has closed'):
+                    await worker.prompt(self._params('/pwd'))
+                for _ in range(2):
+                    first.cancel()
+                    await asyncio.sleep(0)
+                self.assertFalse(first.done())
+                self.assertFalse(second.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+                await second
+                self.assertEqual(finished, [True])
+                retire.assert_not_awaited()
+                await session.close_state()
+                retire.assert_awaited_once()
+                with self.assertRaisesRegex(ValueError, 'closed'):
+                    _ = session.response_headers.directory_handle
+        finally:
+            release.set()
+            tasks = [task for task in [first, second, worker._prompt_task] if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_all_prompt_entry_paths_preserve_active_owner_and_updates(self):
         import copy
-        from loki_agent import formats, protocols
+        from loki_agent import formats, loki, protocols
+        from loki_agent.lifetimes import finish_cleanup
         for origin in ["wire", "inline"]:
             with self.subTest(origin=origin), tempfile.TemporaryDirectory() as root:
                 entered = asyncio.Event()
                 release = asyncio.Event()
+                closing = asyncio.Event()
                 messages = []
 
                 async def completion(*args, **kwargs):
                     entered.set()
-                    await worker.cancel_event.wait()
-                    await release.wait()
+                    try:
+                        await worker.cancel_event.wait()
+                        await release.wait()
+                    finally:
+                        closing.set()
+                        await finish_cleanup(release.wait())
                     return formats.DecodedTurn(
                         [formats.message_item("assistant", "must not appear")],
                         {"protocol": protocols.OPENAI_CHAT})
@@ -2519,16 +3314,16 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     active = asyncio.create_task(
                         channel.request("session/prompt", self._params("active"))
                         if origin == "wire" else worker.prompt(self._params("active")))
+                    close = None
                     try:
-                        await asyncio.wait_for(entered.wait(), 3)
+                        await observe_fixture(entered.wait(), active)
                         owner = worker._prompt_task
                         self.assertIsNotNone(owner)
                         initial = copy.deepcopy(worker.session.transcript_items)
-                        await asyncio.wait_for(channel.request("session/cancel", {}), 3)
+                        await channel.request("session/cancel", {})
                         for text in ["/ps", "/ps stop 1", "/status", "second prompt"]:
                             with self.assertRaisesRegex(acps.TransportError, "already running"):
-                                await asyncio.wait_for(
-                                    channel.request("session/prompt", self._params(text)), 3)
+                                await channel.request("session/prompt", self._params(text))
                             with self.assertRaisesRegex(acps.TransportError, "already running"):
                                 await worker.prompt(self._params(text))
                             replies = []
@@ -2550,22 +3345,29 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                             self.assertTrue(worker.cancel_event.is_set())
                             self.assertEqual(worker.session.transcript_items, initial)
                             self.assertEqual(messages, [])
-                        # Close must still wait for the original prompt, not a
-                        # rejected command or a substituted task.
-                        close = asyncio.create_task(worker.close())
-                        await asyncio.sleep(0)
-                        self.assertFalse(close.done())
-                        release.set()
-                        self.assertEqual(await asyncio.wait_for(active, 3),
-                                         {"stopReason": "cancelled"})
-                        await asyncio.wait_for(close, 3)
+                        # Hold the actual prompt's cancellation cleanup, not an
+                        # injected timer. Closing must revoke admission before
+                        # this cleanup and cannot start a replacement end hook.
+                        pipeline = mock.Mock(
+                            turn_end_hooks=[object()], finish_turn=mock.AsyncMock())
+                        with mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', pipeline):
+                            close = asyncio.create_task(worker.close())
+                            await observe_fixture(closing.wait(), close)
+                            self.assertFalse(worker.session.active)
+                            self.assertFalse(close.done())
+                            release.set()
+                            self.assertEqual(await active,
+                                             {"stopReason": "cancelled"})
+                            await close
+                            pipeline.finish_turn.assert_not_awaited()
                         await asyncio.sleep(0)
                         self.assertEqual(_tool_updates(messages, "prompt-owner"),
                                          _assistant_chunks("[turn cancelled by user]"))
                     finally:
                         worker.cancel_event.set()
                         release.set()
-                        await asyncio.wait_for(asyncio.gather(active, return_exceptions=True), 3)
+                        owners = [active] if close is None else [active, close]
+                        await asyncio.gather(*owners, return_exceptions=True)
 
     async def test_bang_cancellation_reaps_command_without_requesting_inference(self):
         import shlex
@@ -2573,9 +3375,8 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
         messages = []
         completion = mock.AsyncMock(side_effect=AssertionError("cancelled bang requested inference"))
         command_parts = [sys.executable, "-c",
-                         "import time; print('bang-ready', flush=True); time.sleep(60)"]
-        command = (subprocess.list2cmdline(command_parts)
-                   if os.name == "nt" else shlex.join(command_parts))
+                         "import threading; print('bang-ready', flush=True); threading.Event().wait()"]
+        command = shlex.join(command_parts)
         with tempfile.TemporaryDirectory() as root:
             async with self._channel(root, messages, completion) as channel:
                 worker = channel.process.worker
@@ -2583,22 +3384,22 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     "session/prompt", self._params("!" + command)))
                 resources = None
                 try:
-                    deadline = asyncio.get_running_loop().time() + 5
-                    while True:
-                        manager = worker.session.job_manager
-                        job = next(iter(manager.jobs.values()), None) if manager is not None else None
-                        if job is not None and job.process is not None:
-                            self.assertIsNone(job.process.returncode)
-                            if "bang-ready" in manager._spool_tail(job, 'stdout.log'):
-                                break
-                        if asyncio.get_running_loop().time() >= deadline:
-                            self.fail("bang command did not become ready")
-                        await asyncio.sleep(.01)
+                    async def ready_job():
+                        while True:
+                            manager = worker.session.job_manager
+                            job = next(iter(manager.jobs.values()), None) if manager is not None else None
+                            if job is not None:
+                                self.assertNotEqual(job.status, 'failed', job.error)
+                                if job.process is not None:
+                                    self.assertIsNone(job.process.returncode)
+                                    if "bang-ready" in manager._spool_tail(job, 'stdout.log'):
+                                        return job
+                            await asyncio.sleep(.01)
+
+                    job = await observe_fixture(ready_job(), active)
                     resources = ProcessResources(job.process)
-                    await asyncio.wait_for(channel.request("session/cancel", {}), 3)
-                    done, _pending = await asyncio.wait({active}, timeout=5)
-                    self.assertTrue(done, "cancellation did not finish the bang command")
-                    self.assertEqual(active.result(), {"stopReason": "cancelled"})
+                    await channel.request("session/cancel", {})
+                    self.assertEqual(await active, {"stopReason": "cancelled"})
                     self.assertEqual(job.status, "cancelled")
                     self.assertIsNotNone(job.process.returncode)
                     with open(job.metadata_path, encoding="utf-8") as stream:
@@ -2615,11 +3416,11 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         if job.process.returncode is None:
                             job_runtime.host_process.signal_group(
                                 job.process, job.pgid, job_runtime.host_process.FORCE)
-                            await asyncio.wait_for(job.process.wait(), 3)
+                            await job.process.wait()
                         await resources.cleanup()
                     if not active.done():
                         active.cancel()
-                    await asyncio.wait_for(asyncio.gather(active, return_exceptions=True), 3)
+                    await asyncio.gather(active, return_exceptions=True)
 
 
 class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
@@ -2631,7 +3432,13 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
 
         for explicit in [False, True]:
             for method in acp.RESTORE_METHODS:
-                with self.subTest(explicit=explicit, method=method), tempfile.TemporaryDirectory() as root, ExitStack() as stack:
+                # The fake owns transport/Worker retirement, not Session state;
+                # own state even when launch fails before entering its backstop.
+                session_stores = []
+                async with AsyncExitStack() as resources:
+                    resources.enter_context(self.subTest(explicit=explicit, method=method))
+                    root = resources.enter_context(tempfile.TemporaryDirectory())
+                    stack = resources.enter_context(ExitStack())
                     workspace = os.path.join(root, 'workspace with spaces')
                     os.mkdir(workspace)
                     environment = {key: value for key, value in os.environ.items()
@@ -2663,7 +3470,10 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
 
                     stack.enter_context(mock.patch.object(
                         http_client.asyncio, "open_connection", new=connect))
-                    stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", Session(shell_cwd=workspace)))
+                    base_session = Session(shell_cwd=workspace)
+                    resources.push_async_callback(base_session.close_state)
+                    session_stores.append(base_session.response_headers)
+                    stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", base_session))
                     startup = {"LOKI_PROVIDER": "openai", "LOKI_API_BASE": "https://saved.example/v1",
                                "LOKI_MODEL": "saved-model", "LOKI_STREAM": "0"}
                     stack.enter_context(mock.patch.object(loki, "CREDENTIALS", CredentialStore(startup)))
@@ -2681,6 +3491,8 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
 
                     async def launch(cwd, environment, delegation, *, credential_directory=None):
                         session = Session(shell_cwd=cwd)
+                        resources.push_async_callback(session.close_state)
+                        session_stores.append(session.response_headers)
                         session.credential_authority = front.credential_broker
                         loki._DEFAULT_SESSION = session
                         # Match the worker entrypoint's explicit startup config;
@@ -2715,24 +3527,36 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                             await source.close()
                         for process in processes:
                             process.close()
-                            await asyncio.wait_for(process.wait(), 1)
+                            await process.wait()
                         for channel in channels:
-                            await asyncio.wait_for(channel.close(), 1)
+                            await channel.close()
                         if front is not None:
                             for task in list(front._tasks):
                                 task.cancel()
                             await asyncio.gather(*front._tasks, return_exceptions=True)
 
                     # Runs before restoring patched globals, including on failure.
+                    async def changed_while_running():
+                        # A preceding request may finish normally while close/open
+                        # still runs. Watch the active group, not any one completed
+                        # request; retiring this aggregate cancels only its shields.
+                        operations = [task for task in front._tasks if not task.done()]
+                        self.assertTrue(operations, 'request ended without its expected update')
+                        finished = asyncio.gather(*[asyncio.shield(task) for task in operations])
+                        try:
+                            await observe_fixture(changed.wait(), source.task, finished)
+                        finally:
+                            finished.cancel()
+                            await asyncio.gather(finished, return_exceptions=True)
+
                     async def response(request_id):
-                        async with asyncio.timeout(3):
-                            while True:
-                                changed.clear()
-                                for message in messages:
-                                    if message.get("id") == request_id:
-                                        self.assertNotIn("error", message, message)
-                                        return message["result"]
-                                await changed.wait()
+                        while True:
+                            changed.clear()
+                            for message in messages:
+                                if message.get("id") == request_id:
+                                    self.assertNotIn("error", message, message)
+                                    return message["result"]
+                            await changed_while_running()
 
                     async def request(request_id, operation, params):
                         await source.send(acps.request(request_id, operation, params))
@@ -2772,10 +3596,11 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                             "sessionId": session_id, "cwd": workspace,
                             "replay": method == "session/resume"}))
                         if not explicit:
-                            async with asyncio.timeout(3):
-                                while not any(m.get("method") == "elicitation/create" for m in messages):
-                                    changed.clear()
-                                    await changed.wait()
+                            while not any(m.get("method") == "elicitation/create" for m in messages):
+                                changed.clear()
+                                self.assertFalse(any(m.get('id') == 73 for m in messages),
+                                                 f'restore replied before authorization: {messages!r}')
+                                await changed_while_running()
                             elicitation = next(m for m in messages if m.get("method") == "elicitation/create")
                             params = elicitation["params"]
                             self.assertEqual(params["requestId"], 73)
@@ -2846,8 +3671,8 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                             self.assertIsNone(delegation.credential_child)
                             server = delegation.credential_server
                             self.assertTrue(server._reader_task.done())
-                            self.assertTrue(server._writer_close_task.done())
-                            self.assertIsNone(server._writer_close_task.exception())
+                            self.assertTrue(server._close_task.done())
+                            self.assertIsNone(server._close_task.exception())
                         self.assertIsNone(channels[-1].credential_delegation)
                         self.assertFalse(channels[-1]._pending)
                         with open(path, encoding="utf-8") as stream:
@@ -2857,14 +3682,18 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                             ("original prompt", "original answer"), ("continued prompt", "continued answer")))
                     finally:
                         await backstop()
+                for store in session_stores:
+                    with self.assertRaisesRegex(ValueError, 'response status storage is closed'):
+                        store.directory_handle
 
 
-class ConfigOptionTests(unittest.TestCase):
-    def test_session_new_returns_model_options(self):
+class ConfigOptionTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_session_new_returns_model_options(self):
         # The dummy env has no usable catalog credentials, so the option
         # list carries only the explicit LOKI_* connection -- which is
         # enough to prove the option plumbing flows and is settable.
-        with tempfile.TemporaryDirectory() as tmpdir:
+        async with AsyncExitStack() as cleanup:
+            tmpdir = cleanup.enter_context(tempfile.TemporaryDirectory())
             env = dict(os.environ)
             env.update({
                 "HOME": tmpdir,
@@ -2879,64 +3708,26 @@ class ConfigOptionTests(unittest.TestCase):
             workspace = os.path.join(tmpdir, "workspace")
             os.makedirs(workspace, exist_ok=True)
             configure_container(env, workspace)
-            front = subprocess.Popen(
-                loki_acp_command(),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
-            self.addCleanup(_close_process_streams, front)
-            try:
-                def send(m):
-                    front.stdin.write(json.dumps(m) + "\n")
-                    front.stdin.flush()
+            front, _diagnostics = await self._front(
+                env, workspace, cleanup=cleanup.push_async_callback)
+            await self._request(front, 1, "initialize", {"protocolVersion": 1})
+            opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
+            session_id = opened["sessionId"]
+            options = opened["configOptions"]
+            self.assertEqual([option["id"] for option in options], ["model", "reasoning_traces"])
+            model_option = options[0]
+            self.assertEqual(model_option["id"], "model")
+            self.assertEqual(model_option["category"], "model")
+            self.assertEqual(model_option["type"], "select")
+            self.assertEqual(model_option["currentValue"], "loki-explicit")
+            values = [o["value"] for o in model_option["options"]]
+            self.assertEqual(values, ["loki-explicit"])
 
-                def recv():
-                    line = front.stdout.readline()
-                    self.assertTrue(line)
-                    return json.loads(line)
-
-                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                      "params": {"protocolVersion": 1}})
-                while recv().get("id") != 1:
-                    pass
-                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": workspace}})
-                while True:
-                    m = recv()
-                    if m.get("id") == 2:
-                        break
-                session_id = m["result"]["sessionId"]
-                options = m["result"]["configOptions"]
-                self.assertEqual([option["id"] for option in options], ["model", "reasoning_traces"])
-                model_option = options[0]
-                self.assertEqual(model_option["id"], "model")
-                self.assertEqual(model_option["category"], "model")
-                self.assertEqual(model_option["type"], "select")
-                self.assertEqual(model_option["currentValue"],
-                                 "loki-explicit")
-                values = [o["value"] for o in model_option["options"]]
-                self.assertEqual(values, ["loki-explicit"])
-
-                # Setting the value round-trips and echoes full state.
-                send({"jsonrpc": "2.0", "id": 3,
-                      "method": "session/set_config_option",
-                      "params": {"sessionId": session_id,
-                                 "configId": "model",
-                                 "value": "loki-explicit"}})
-                while True:
-                    m = recv()
-                    if m.get("id") == 3:
-                        break
-                self.assertIn("configOptions", m["result"])
-                self.assertEqual(
-                    m["result"]["configOptions"][0]["currentValue"],
-                    "loki-explicit")
-            finally:
-                front.stdin.close()
-                try:
-                    front.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    front.kill()
-                    front.wait()
+            # Setting the value round-trips and echoes full state.
+            changed, _ = await self._request(front, 3, "session/set_config_option", {
+                "sessionId": session_id, "configId": "model", "value": "loki-explicit"})
+            self.assertIn("configOptions", changed)
+            self.assertEqual(changed["configOptions"][0]["currentValue"], "loki-explicit")
 
 
 class WorkerReasoningConfigTests(unittest.TestCase):
@@ -2949,15 +3740,14 @@ class WorkerReasoningConfigTests(unittest.TestCase):
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
 
-        old_session = loki._DEFAULT_SESSION
-        old_credentials = loki.CREDENTIALS
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with ExitStack() as cleanup:
                 session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
-                loki._DEFAULT_SESSION = session
-                loki.CREDENTIALS = CredentialStore({
+                cleanup.callback(session.response_headers.close)
+                cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', session))
+                cleanup.enter_context(mock.patch.object(loki, 'CREDENTIALS', CredentialStore({
                     "OPENROUTER_API_KEY": "secret",
-                })
+                })))
                 provider = {
                     "id": "openrouter",
                     "name": "OpenRouter",
@@ -3084,20 +3874,18 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                     restored["configOptions"][1]["currentValue"],
                     "effort:high")
                 self.assertEqual(loki.effective_reasoning_effort(), "high")
-        finally:
-            loki._DEFAULT_SESSION = old_session
-            loki.CREDENTIALS = old_credentials
 
     def test_effort_change_during_prompt_applies_to_next_turn(self):
         from loki_agent import formats, loki, protocols
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             target = os.path.join(directory, 'read.txt')
             with open(target, 'w', encoding='utf-8') as stream:
                 stream.write('real tool continuation')
             session = Session(shell_cwd=directory)
+            cleanup.callback(session.response_headers.close)
             session.chat_log_path = os.path.join(directory, 'chat.json')
             session.runtime_config = connections.make_runtime_config(
                 'https://api.openai.com/v1/responses',
@@ -3144,7 +3932,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
             async def scenario():
                 try:
                     await prompt(1)
-                    await asyncio.wait_for(started.wait(), 2)
+                    await observe_fixture(started.wait(), worker._prompt_task)
                     await worker.handle({
                         'jsonrpc': '2.0', 'id': 2,
                         'method': 'session/set_config_option', 'params': {
@@ -3152,16 +3940,15 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                             'configId': 'reasoning_effort',
                             'value': 'effort:low'}}, concurrent=True)
                     release.set()
-                    await asyncio.wait_for(worker._prompt_task, 2)
+                    await worker._prompt_task
                     self.assertEqual(snapshots, ['high', 'high'])
                     await prompt(3)
-                    await asyncio.wait_for(worker._prompt_task, 2)
+                    await worker._prompt_task
                 finally:
                     release.set()
-                    await asyncio.wait_for(worker.close(), 2)
+                    await worker.close()
 
             with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
-                    mock.patch.object(loki, 'file_state', {}), \
                     mock.patch.object(loki, 'async_chat_completion', completion):
                 asyncio.run(scenario())
             self.assertEqual(snapshots, ['high', 'high', 'low'])
@@ -3198,7 +3985,6 @@ class TtyStdinTests(unittest.TestCase):
         import fcntl
         import pty
         import termios
-        import time as _time
         master, slave = pty.openpty()
 
         def child_setup():
@@ -3230,24 +4016,16 @@ class TtyStdinTests(unittest.TestCase):
                     "jsonrpc": "2.0", "id": 1, "method": "initialize",
                     "params": {"protocolVersion": 1},
                 }) + "\n").encode())
-                reply = None
-                deadline = _time.monotonic() + 8
-                while _time.monotonic() < deadline:
-                    line = proc.stdout.readline()
-                    if line:
-                        reply = json.loads(line)
-                        break
-                self.assertIsNotNone(reply, "no reply to initialize")
+                line = proc.stdout.readline()
+                self.assertTrue(line, 'ACP front exited before its initialize reply')
+                reply = json.loads(line)
                 self.assertEqual(reply["id"], 1)
                 self.assertEqual(
                     reply["result"]["agentInfo"]["name"], "loki")
             finally:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                if proc.poll() is None:
+                    proc.terminate()
+                proc.communicate()
                 os.close(master)
 
 
@@ -3257,10 +4035,10 @@ class WorkerSessionContractTests(unittest.TestCase):
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
 
-        old_session = loki._DEFAULT_SESSION
-        try:
+        with ExitStack() as cleanup:
             session = Session(shell_cwd=ROOT)
-            loki._DEFAULT_SESSION = session
+            cleanup.callback(session.response_headers.close)
+            cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', session))
             worker = Worker(session, lambda _message: None)
             with self.assertRaisesRegex(
                     acps.TransportError,
@@ -3271,8 +4049,6 @@ class WorkerSessionContractTests(unittest.TestCase):
                     "openMethod": "session/unknown",
                 }))
             self.assertIsNone(worker._pending_open)
-        finally:
-            loki._DEFAULT_SESSION = old_session
 
     def test_restore_rejects_a_different_saved_cwd(self):
         from loki_agent import formats, loki
@@ -3280,10 +4056,8 @@ class WorkerSessionContractTests(unittest.TestCase):
         from loki_agent.credentials import CredentialStore
         from loki_agent.sessions import Session
 
-        old_session = loki._DEFAULT_SESSION
-        old_credentials = loki.CREDENTIALS
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with ExitStack() as cleanup:
                 saved_cwd = os.path.join(tmpdir, "saved-cwd")
                 requested_cwd = os.path.join(tmpdir, "requested-cwd")
                 # The saved log lives in the workspace the client names.
@@ -3291,7 +4065,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 os.mkdir(saved_cwd)
                 os.mkdir(requested_cwd)
                 os.makedirs(chat_dir)
-                loki.CREDENTIALS = CredentialStore({})
+                cleanup.enter_context(mock.patch.object(loki, 'CREDENTIALS', CredentialStore({})))
 
                 for stored_cwd in [saved_cwd, "invalid\x00cwd"]:
                     blob = formats.new_log_blob(
@@ -3305,7 +4079,8 @@ class WorkerSessionContractTests(unittest.TestCase):
                         with self.subTest(
                                 method=method, stored_cwd=stored_cwd):
                             session = Session(shell_cwd="/")
-                            loki._DEFAULT_SESSION = session
+                            cleanup.callback(session.response_headers.close)
+                            cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', session))
                             worker = Worker(session, lambda _message: None)
                             with self.assertRaisesRegex(
                                     acps.TransportError,
@@ -3321,9 +4096,6 @@ class WorkerSessionContractTests(unittest.TestCase):
                             self.assertEqual(
                                 caught.exception.code, acps.INVALID_PARAMS)
                             self.assertIsNone(worker._pending_open)
-        finally:
-            loki._DEFAULT_SESSION = old_session
-            loki.CREDENTIALS = old_credentials
 
     def test_subscription_option_and_resume_use_brokered_credential(self):
         from loki_agent import formats, http_client, loki, models
@@ -3396,12 +4168,10 @@ class WorkerSessionContractTests(unittest.TestCase):
                 refresh_token="refresh-secret",
                 expires_at=10**12,
             ))
-        old_session = loki._DEFAULT_SESSION
-        old_credentials = loki.CREDENTIALS
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                loki.CREDENTIALS = CredentialInventory(
-                    {}, {credential})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with ExitStack() as cleanup:
+                cleanup.enter_context(mock.patch.object(loki, 'CREDENTIALS', CredentialInventory(
+                    {}, {credential})))
                 requests = []
 
                 async def request(method, url, **kwargs):
@@ -3415,8 +4185,9 @@ class WorkerSessionContractTests(unittest.TestCase):
 
                 async def scenario():
                     first_session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
+                    cleanup.callback(first_session.response_headers.close)
                     first_session.credential_authority = broker
-                    loki._DEFAULT_SESSION = first_session
+                    cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', first_session))
                     first_worker = Worker(
                         first_session,
                         lambda _message: None,
@@ -3470,8 +4241,9 @@ class WorkerSessionContractTests(unittest.TestCase):
                     await first_worker.close()
 
                     resumed_session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
+                    cleanup.callback(resumed_session.response_headers.close)
                     resumed_session.credential_authority = broker
-                    loki._DEFAULT_SESSION = resumed_session
+                    cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', resumed_session))
                     resumed_worker = Worker(
                         resumed_session,
                         lambda _message: None,
@@ -3576,9 +4348,6 @@ class WorkerSessionContractTests(unittest.TestCase):
                         headers["Authorization"],
                         "Bearer access-secret",
                     )
-        finally:
-            loki._DEFAULT_SESSION = old_session
-            loki.CREDENTIALS = old_credentials
 
     def test_restore_accepts_equivalent_client_cwd(self):
         from unittest import mock
@@ -3588,16 +4357,14 @@ class WorkerSessionContractTests(unittest.TestCase):
         from loki_agent.credentials import CredentialStore
         from loki_agent.sessions import Session
 
-        old_session = loki._DEFAULT_SESSION
-        old_credentials = loki.CREDENTIALS
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with ExitStack() as cleanup:
                 saved_cwd = os.path.join(tmpdir, "saved-cwd")
                 client_cwd = os.path.join(tmpdir, "client-cwd")
                 os.mkdir(saved_cwd)
-                os.symlink(saved_cwd, client_cwd)
-                # The saved log lives in the workspace the client names -- here
-                # a symlink to the saved directory.
+                directory_alias(saved_cwd, client_cwd)
+                # The saved log lives in the workspace spelling the client
+                # names, which identifies the same directory as the saved cwd.
                 chat_dir = app_paths.chat_log_dir_for(client_cwd)
                 os.makedirs(chat_dir)
                 descriptor = ConnectionDescriptor(
@@ -3626,10 +4393,11 @@ class WorkerSessionContractTests(unittest.TestCase):
                     json.dump(blob, stream)
 
                 session = Session(shell_cwd="/")
-                loki._DEFAULT_SESSION = session
-                loki.CREDENTIALS = CredentialStore({
+                cleanup.callback(session.response_headers.close)
+                cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', session))
+                cleanup.enter_context(mock.patch.object(loki, 'CREDENTIALS', CredentialStore({
                     "SAVED_API_KEY": "secret",
-                })
+                })))
                 worker = Worker(session, lambda message: None)
                 with mock.patch(
                         "loki_agent.acp_worker.modelsdev.ensure_index",
@@ -3652,9 +4420,6 @@ class WorkerSessionContractTests(unittest.TestCase):
                     result["configOptions"][0]["currentValue"],
                     "loki-saved",
                 )
-        finally:
-            loki._DEFAULT_SESSION = old_session
-            loki.CREDENTIALS = old_credentials
 
     def test_new_sessions_get_distinct_persistent_logs_with_empty_catalog(self):
         from unittest import mock
@@ -3663,15 +4428,14 @@ class WorkerSessionContractTests(unittest.TestCase):
         from loki_agent.credentials import CredentialStore
         from loki_agent.sessions import Session
 
-        old_session = loki._DEFAULT_SESSION
-        old_credentials = loki.CREDENTIALS
         paths = []
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                loki.CREDENTIALS = CredentialStore({})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with ExitStack() as cleanup:
+                cleanup.enter_context(mock.patch.object(loki, 'CREDENTIALS', CredentialStore({})))
                 for number in range(2):
                     session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
-                    loki._DEFAULT_SESSION = session
+                    cleanup.callback(session.response_headers.close)
+                    cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', session))
                     worker = Worker(session, lambda message: None)
                     with mock.patch.object(
                             models, "ensure_index",
@@ -3694,16 +4458,9 @@ class WorkerSessionContractTests(unittest.TestCase):
                         [entry["value"] for entry in option["options"]],
                     )
                 self.assertNotEqual(paths[0], paths[1])
-                # Session paths are stored through os.path.realpath; compare
-                # resolved directories, or a differently-spelled temp path
-                # (Windows short names) fails on spelling alone.
-                log_dir = os.path.realpath(app_paths.chat_log_dir_for(tmpdir))
-                self.assertTrue(all(
-                    os.path.realpath(os.path.dirname(path)) == log_dir
-                    for path in paths))
-        finally:
-            loki._DEFAULT_SESSION = old_session
-            loki.CREDENTIALS = old_credentials
+                log_dir = app_paths.chat_log_dir_for(tmpdir)
+                self.assertEqual(paths, [
+                    os.path.join(log_dir, f'chat-live-{number}.json') for number in range(2)])
 
     def test_acp_turn_end_hook_outcomes(self):
         from loki_agent import loki, protocols, tool_runtime
@@ -3711,8 +4468,9 @@ class WorkerSessionContractTests(unittest.TestCase):
         from loki_agent.sessions import Session
 
         for outcome in ["completed", "stream_error", "raised", "cancelled"]:
-            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmpdir:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmpdir, ExitStack() as cleanup:
                 session = Session(shell_cwd=tmpdir)
+                cleanup.callback(session.response_headers.close)
                 worker = Worker(session, lambda message: None, "s")
 
                 async def run_loop(*args, on_event, **kwargs):
@@ -3737,8 +4495,6 @@ class WorkerSessionContractTests(unittest.TestCase):
                 with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
                         mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline), \
                         mock.patch.object(loki, "current_model", return_value="test"), \
-                        mock.patch.object(worker, "_ask_advertised_tools",
-                                          return_value=[[], None]), \
                         mock.patch.object(loki, "run_tool_loop_async", side_effect=run_loop), \
                         mock.patch.object(loki, "save_chat_log"):
                     prompt = worker.prompt({
@@ -3774,14 +4530,14 @@ class WorkerSessionContractTests(unittest.TestCase):
         from loki_agent.acp_worker import TurnFailure, Worker
         from loki_agent.sessions import Session
 
-        old_session = loki._DEFAULT_SESSION
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with ExitStack() as cleanup:
                 session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
+                cleanup.callback(session.response_headers.close)
                 session.transcript_items = [
                     formats.instruction_item("system"),
                 ]
-                loki._DEFAULT_SESSION = session
+                cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', session))
                 worker = Worker(session, lambda message: None, "s")
 
                 async def failed_turn(on_event, _reasoning_effort):
@@ -3798,8 +4554,6 @@ class WorkerSessionContractTests(unittest.TestCase):
                         "sessionId": "s",
                         "prompt": [{"type": "text", "text": "hello"}],
                     }))
-        finally:
-            loki._DEFAULT_SESSION = old_session
 
     def test_stop_reasons_cover_protocol_terminal_states(self):
         from loki_agent.acp_worker import Worker
@@ -3826,11 +4580,11 @@ class WorkerSessionContractTests(unittest.TestCase):
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
 
-        old_session = loki._DEFAULT_SESSION
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with ExitStack() as cleanup:
                 session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
-                loki._DEFAULT_SESSION = session
+                cleanup.callback(session.response_headers.close)
+                cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', session))
                 worker = Worker(session, lambda message: None, "s")
 
                 async def cancelled_failure(
@@ -3844,8 +4598,6 @@ class WorkerSessionContractTests(unittest.TestCase):
                     "prompt": [{"type": "text", "text": "hello"}],
                 }))
                 self.assertEqual(result["stopReason"], "cancelled")
-        finally:
-            loki._DEFAULT_SESSION = old_session
 
     def test_refused_prompt_is_retained_persisted_replayed_and_reused(self):
         import copy
@@ -3854,9 +4606,8 @@ class WorkerSessionContractTests(unittest.TestCase):
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
 
-        old_session = loki._DEFAULT_SESSION
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with ExitStack() as cleanup:
                 initial = [formats.instruction_item("system")]
                 chat_path = os.path.join(tmpdir, "chat-refusal.json")
                 session = Session(
@@ -3864,7 +4615,8 @@ class WorkerSessionContractTests(unittest.TestCase):
                     transcript_items=list(initial),
                     chat_log_path=chat_path,
                 )
-                loki._DEFAULT_SESSION = session
+                cleanup.callback(session.response_headers.close)
+                cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', session))
                 messages = []
                 worker = Worker(session, messages.append, "s")
                 turns = [
@@ -3947,22 +4699,20 @@ class WorkerSessionContractTests(unittest.TestCase):
                 ]
                 self.assertIn("unsafe", replay_text)
                 self.assertIn("No", replay_text)
-        finally:
-            loki._DEFAULT_SESSION = old_session
 
     def test_refusal_does_not_erase_prior_tool_activity_in_prompt(self):
         from loki_agent import formats, loki
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
 
-        old_session = loki._DEFAULT_SESSION
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with ExitStack() as cleanup:
                 session = Session(
                     shell_cwd=os.path.join(tmpdir, "workspace"),
                     transcript_items=[formats.instruction_item("system")],
                 )
-                loki._DEFAULT_SESSION = session
+                cleanup.callback(session.response_headers.close)
+                cleanup.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', session))
                 worker = Worker(session, lambda message: None, "s")
                 call = {
                     "type": "function_call",
@@ -4004,8 +4754,6 @@ class WorkerSessionContractTests(unittest.TestCase):
                     ],
                 )
                 formats.validate_events(session.transcript_items)
-        finally:
-            loki._DEFAULT_SESSION = old_session
 
 
 class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
@@ -4045,8 +4793,8 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         from loki_agent import credential_storages, http_client, loki
         from loki_agent.sessions import Session
 
-        async with asyncio.timeout(20):
-            with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
+        with tempfile.TemporaryDirectory() as root:
+            async with AsyncExitStack() as stack:
                 workspace = os.path.join(root, 'workspace')
                 os.mkdir(workspace)
                 environment = {key: value for key, value in os.environ.items()
@@ -4094,12 +4842,12 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                     f.changed.set()
 
                 f.storage = credential_storages.JsonCredentialStorage(os.path.join(root, 'config', 'loki', 'credentials'))
+                stack.callback(f.storage.close)
                 f.front = acp.Front(lambda: None, write, credentials, f.storage)
-                f.source = _FrontInput(f.front)
-                await f.source.send(acps.request(0, 'initialize', {
-                    'clientCapabilities': {'elicitation': {'form': {}}}}))
                 stack.enter_context(mock.patch.object(loki, 'CREDENTIALS', f.front.credentials))
-                stack.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', Session(shell_cwd=workspace)))
+                base_session = Session(shell_cwd=workspace)
+                stack.push_async_callback(base_session.close_state)
+                stack.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', base_session))
                 real_connect = asyncio.open_connection
 
                 async def connect(*args, **kwargs):
@@ -4137,6 +4885,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
 
                 async def launch(cwd, environment, delegation, *, credential_directory=None):
                     session = Session(shell_cwd=cwd)
+                    stack.push_async_callback(session.close_state)
                     # Same-process authority, as in the existing selection
                     # journey; no worker credential-IPC claim is made here.
                     session.credential_authority = f.front.credential_broker
@@ -4160,14 +4909,13 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(mock.patch.object(acp.runtime_isolation, 'start_worker', new=launch))
                 stack.enter_context(mock.patch.object(acp.runtime_isolation, 'close_runtime_process', new=lambda process: None))
 
-                async def wait_message(predicate):
-                    async with asyncio.timeout(3):
-                        while True:
-                            f.changed.clear()
-                            for message in f.messages:
-                                if predicate(message):
-                                    return message
-                            await f.changed.wait()
+                async def wait_message(predicate, *finished):
+                    while True:
+                        f.changed.clear()
+                        for message in f.messages:
+                            if predicate(message):
+                                return message
+                        await observe_fixture(f.changed.wait(), f.source.task, *finished)
 
                 async def request(request_id, method, params):
                     await f.source.send(acps.request(request_id, method, params))
@@ -4176,7 +4924,10 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                     return message['result']
 
                 f.wait_message, f.request = wait_message, request
+                f.source = _FrontInput(f.front)
                 try:
+                    await f.source.send(acps.request(0, 'initialize', {
+                        'clientCapabilities': {'elicitation': {'form': {}}}}))
                     opened = await request(1, 'session/new', {'cwd': workspace})
                     f.session_id = opened['sessionId']
                     f.channel = f.front.workers[f.session_id]
@@ -4215,7 +4966,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
             request_id, 'session/set_config_option', f.params))
         elicitation = await f.wait_message(
             lambda message: message.get('method') == 'elicitation/create'
-            and message['params'].get('requestId') == request_id)
+            and message['params'].get('requestId') == request_id, task)
         self.assertFalse(task.done())
         self.assertIn(elicitation['id'], f.front._client_requests)
         self.assertEqual(elicitation['jsonrpc'], '2.0')
@@ -4264,8 +5015,8 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(delegation.credential_child)
             server = delegation.credential_server
             self.assertTrue(server._reader_task.done())
-            self.assertTrue(server._writer_close_task.done())
-            self.assertIsNone(server._writer_close_task.exception())
+            self.assertTrue(server._close_task.done())
+            self.assertIsNone(server._close_task.exception())
         for writer in f.connector.writers:
             self.assertTrue(writer.closed)
             self.assertTrue(writer.wait_closed_called)
@@ -4302,7 +5053,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(task.done())
             await f.source.send(acps.response(elicitation['id'], result={
                 'action': 'accept', 'content': {'approve': True}}))
-            await asyncio.wait_for(task, 3)
+            await task
             reply = await f.wait_message(lambda message: message.get('id') == 9)
             self.assertNotIn('error', reply, reply)
             self.assertEqual(f.trace, ['describe', 'elicitation', 'approval', 'switch'])
@@ -4373,38 +5124,114 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                                        'describe', 'switch', 'lease', 'http'])
             await self._close_approval_journey(f)
 
-    async def test_declined_approval_fails_the_switch(self):
-        refusals = ({'action': 'decline'}, {'action': 'cancel'}, {}, [],
-                    {'action': 'accept', 'content': {'approve': False}},
-                    {'action': 'accept', 'content': {}},
-                    {'action': 'accept', 'content': {'approve': 1}},
-                    {'action': 'accept', 'content': {'approve': 'true'}})
-        for refusal in refusals:
-            with self.subTest(refusal=refusal):
+    @contextmanager
+    def _record_session_stores(self):
+        from loki_agent import sessions
+        session_type = sessions.Session
+        stores = []
+
+        def create(*args, **kwargs):
+            session = session_type(*args, **kwargs)
+            stores.append(session.response_headers)
+            return session
+
+        # Retain every Store across scope exit so GC cannot supply the closure
+        # that this regression requires from the fixture's explicit owner.
+        with mock.patch.object(sessions, 'Session', side_effect=create):
+            yield stores
+
+    async def test_fixture_closes_session_stores_on_success(self):
+        with self._record_session_stores() as stores:
+            async with self._approval_journey() as f:
+                await self._close_approval_journey(f)
+            self.assertEqual(len(stores), 2)
+            for storage in stores:
+                with self.assertRaisesRegex(ValueError, 'closed'):
+                    _ = storage.directory_handle
+
+    async def test_fixture_closes_session_stores_on_pending_failure(self):
+        with self._record_session_stores() as stores:
+            with self.assertRaisesRegex(RuntimeError, 'fixture body failed'):
                 async with self._approval_journey() as f:
-                    for request_id in [9, 10]:
-                        task, elicitation = await self._pending_approval(f, request_id)
-                        await f.source.send(acps.response(elicitation['id'], result=refusal))
-                        await asyncio.wait_for(task, 3)
-                        reply = await f.wait_message(lambda message: message.get('id') == request_id)
-                        self.assertIn('error', reply, reply)
-                        self.assertEqual(reply['error'], {
-                            'code': acps.INVALID_PARAMS,
-                            'message': 'the provider endpoint was not approved'})
-                        self.assertIs(f.session.runtime_config, f.original_config)
-                        self.assertEqual(f.session.session_state['connection'],
-                                         json.loads(f.original_chat)['session_state']['connection'])
-                        self.assertFalse(f.session.chat_log_dirty)
-                        with open(f.path, 'rb') as stream:
-                            self.assertEqual(stream.read(), f.original_chat)
-                        with open(f.approvals_path, 'rb') as stream:
-                            self.assertEqual(stream.read(), f.original_approvals_document)
-                        self.assertEqual(f.leases, [])
-                        self.assertEqual(f.connector.calls, [])
-                        self.assertFalse(f.front._client_requests)
-                        self.assertNotIn('switch', f.trace)
-                        self.assertNotIn('approval', f.trace)
-                    await self._close_approval_journey(f)
+                    await self._pending_approval(f, 9)
+                    raise RuntimeError('fixture body failed')
+            self.assertEqual(len(stores), 2)
+            for storage in stores:
+                with self.assertRaisesRegex(ValueError, 'closed'):
+                    _ = storage.directory_handle
+
+    async def test_fixture_initialization_failure_joins_front_and_closes_storage(self):
+        from loki_agent import credential_storages
+        before = asyncio.all_tasks()
+        failure = OSError('initialize fixture failed')
+        storage = credential_storages.JsonCredentialStorage
+        with mock.patch.object(_FrontInput, 'send', side_effect=failure), mock.patch.object(
+                storage, 'close', autospec=True, side_effect=storage.close) as close:
+            with self.assertRaises(OSError) as caught:
+                async with self._approval_journey():
+                    self.fail('initialization unexpectedly succeeded')
+            self.assertIs(caught.exception, failure)
+            close.assert_called_once()
+        self.assertFalse(asyncio.all_tasks() - before)
+
+    async def test_fixture_observes_reply_before_elicitation(self):
+        async with self._approval_journey() as f:
+            with mock.patch.object(f.front, '_approve_config_endpoint',
+                                   side_effect=acps.TransportError('failed before elicitation')):
+                with self.assertRaisesRegex(AssertionError, 'failed before elicitation'):
+                    await self._pending_approval(f, 9)
+            self._assert_no_approval_or_inference(f)
+            await self._close_approval_journey(f)
+
+    async def _assert_approval_refused(self, refusal):
+        async with self._approval_journey() as f:
+            for request_id in [9, 10]:
+                task, elicitation = await self._pending_approval(f, request_id)
+                await f.source.send(acps.response(elicitation['id'], result=refusal))
+                await task
+                reply = await f.wait_message(lambda message: message.get('id') == request_id)
+                self.assertIn('error', reply, reply)
+                self.assertEqual(reply['error'], {
+                    'code': acps.INVALID_PARAMS,
+                    'message': 'the provider endpoint was not approved'})
+                self.assertIs(f.session.runtime_config, f.original_config)
+                self.assertEqual(f.session.session_state['connection'],
+                                 json.loads(f.original_chat)['session_state']['connection'])
+                self.assertFalse(f.session.chat_log_dirty)
+                with open(f.path, 'rb') as stream:
+                    self.assertEqual(stream.read(), f.original_chat)
+                with open(f.approvals_path, 'rb') as stream:
+                    self.assertEqual(stream.read(), f.original_approvals_document)
+                self.assertEqual(f.leases, [])
+                self.assertEqual(f.connector.calls, [])
+                self.assertFalse(f.front._client_requests)
+                self.assertNotIn('switch', f.trace)
+                self.assertNotIn('approval', f.trace)
+            await self._close_approval_journey(f)
+
+    async def test_declined_approval_fails_the_switch(self):
+        await self._assert_approval_refused({'action': 'decline'})
+
+    async def test_cancelled_approval_fails_the_switch(self):
+        await self._assert_approval_refused({'action': 'cancel'})
+
+    async def test_empty_approval_response_fails_the_switch(self):
+        await self._assert_approval_refused({})
+
+    async def test_list_approval_response_fails_the_switch(self):
+        await self._assert_approval_refused([])
+
+    async def test_false_approval_fails_the_switch(self):
+        await self._assert_approval_refused({'action': 'accept', 'content': {'approve': False}})
+
+    async def test_missing_approval_value_fails_the_switch(self):
+        await self._assert_approval_refused({'action': 'accept', 'content': {}})
+
+    async def test_numeric_approval_value_fails_the_switch(self):
+        await self._assert_approval_refused({'action': 'accept', 'content': {'approve': 1}})
+
+    async def test_string_approval_value_fails_the_switch(self):
+        await self._assert_approval_refused({'action': 'accept', 'content': {'approve': 'true'}})
 
     def _assert_no_approval_or_inference(self, f):
         with open(f.approvals_path, 'rb') as stream:
@@ -4470,7 +5297,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 acps.request(10, 'session/close', {'sessionId': f.session_id}),
                 acps.response(ask['id'], result={
                     'action': 'accept', 'content': {'approve': True}}))
-            self.assertIn('error', await asyncio.wait_for(task, 3))
+            self.assertIn('error', await task)
             self.assertEqual(await f.wait_message(lambda m: m.get('id') == 10),
                              acps.response(10, result={}))
             self._assert_no_approval_or_inference(f)
@@ -4491,23 +5318,25 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('error', await f.wait_message(lambda m: m.get('id') == 12))
             await self._close_approval_journey(f)
 
-    async def test_pending_approval_eof_and_worker_exit_release_authority(self):
-        for ending in ['eof', 'worker exit']:
-            with self.subTest(ending=ending):
-                async with self._approval_journey() as f:
-                    task, _ask = await self._pending_approval(f, 9)
-                    if ending == 'worker exit':
-                        f.processes[0].close()
-                        self.assertIn('error', await asyncio.wait_for(task, 3))
-                        await f.source.finish()
-                    else:
-                        # No response is owed over a disconnected transport.
-                        task.cancel()
-                        await asyncio.gather(task, return_exceptions=True)
-                        await f.source.finish()
-                        self.assertFalse(any(m.get('id') == 9 for m in f.messages))
-                    self._assert_no_approval_or_inference(f)
-                    await self._assert_approval_released(f)
+    async def test_pending_approval_eof_releases_authority_without_a_reply(self):
+        async with self._approval_journey() as f:
+            task, _ask = await self._pending_approval(f, 9)
+            # No response is owed over a disconnected transport.
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await f.source.finish()
+            self.assertFalse(any(m.get('id') == 9 for m in f.messages))
+            self._assert_no_approval_or_inference(f)
+            await self._assert_approval_released(f)
+
+    async def test_pending_approval_worker_exit_releases_authority(self):
+        async with self._approval_journey() as f:
+            task, _ask = await self._pending_approval(f, 9)
+            f.processes[0].close()
+            self.assertIn('error', await task)
+            await f.source.finish()
+            self._assert_no_approval_or_inference(f)
+            await self._assert_approval_released(f)
 
     async def test_active_prompt_rejects_model_change_before_asking(self):
         async with self._approval_journey() as f:
@@ -4521,36 +5350,42 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 return ''
 
             with mock.patch.object(worker, '_run_turn', side_effect=turn):
+                pending = asyncio.create_task(f.wait_message(lambda m: m.get('id') == 9))
+                f.tasks.append(pending)
                 await f.source.send(acps.request(9, 'session/prompt', {
                     'sessionId': f.session_id,
                     'prompt': [{'type': 'text', 'text': 'running turn'}]}))
-                await asyncio.wait_for(entered.wait(), 3)
+                await observe_fixture(entered.wait(), pending, f.source.task)
                 await f.source.send(acps.request(10, 'session/set_config_option', f.params))
                 reply = await f.wait_message(lambda m: m.get('id') == 10)
                 self.assertIn('prompt is running', reply['error']['message'])
                 self.assertFalse(any(m.get('method') == 'elicitation/create' for m in f.messages))
                 self._assert_no_approval_or_inference(f)
                 await f.source.send(acps.notification('session/cancel', {'sessionId': f.session_id}))
-                reply = await f.wait_message(lambda m: m.get('id') == 9)
+                reply = await pending
                 self.assertEqual(reply['result'], {'stopReason': 'cancelled'})
             await self._close_approval_journey(f)
 
+    async def _assert_client_error_denies_duplicate_approval(self, error, expected):
+        async with self._approval_journey() as f:
+            task, ask = await self._pending_approval(f, 9)
+            await f.source.send_many(
+                acps.response(ask['id'], error=error),
+                acps.response(ask['id'], result={
+                    'action': 'accept', 'content': {'approve': True}}))
+            reply = await task
+            self.assertEqual(reply['error'], expected)
+            self._assert_no_approval_or_inference(f)
+            await self._close_approval_journey(f)
+
     async def test_client_error_and_duplicate_response_do_not_authorize(self):
-        valid_error = {'code': -32800, 'message': 'dismissed'}
-        for error, expected in ((valid_error, valid_error), (['invalid error'], {
-                'code': acps.INVALID_PARAMS,
-                'message': 'ACP client response has an invalid error object'})):
-            with self.subTest(error=error):
-                async with self._approval_journey() as f:
-                    task, ask = await self._pending_approval(f, 9)
-                    await f.source.send_many(
-                        acps.response(ask['id'], error=error),
-                        acps.response(ask['id'], result={
-                            'action': 'accept', 'content': {'approve': True}}))
-                    reply = await asyncio.wait_for(task, 3)
-                    self.assertEqual(reply['error'], expected)
-                    self._assert_no_approval_or_inference(f)
-                    await self._close_approval_journey(f)
+        error = {'code': -32800, 'message': 'dismissed'}
+        await self._assert_client_error_denies_duplicate_approval(error, error)
+
+    async def test_malformed_client_error_and_duplicate_response_do_not_authorize(self):
+        await self._assert_client_error_denies_duplicate_approval(['invalid error'], {
+            'code': acps.INVALID_PARAMS,
+            'message': 'ACP client response has an invalid error object'})
 
     async def test_unapproved_exact_urls_are_displayed(self):
         front = self._front()
@@ -4585,40 +5420,30 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         front._request_client.assert_not_awaited()
 
 
-class _AskLoopProcess:
+class _AskLoopProcess(_LocalWorkerProcess):
     """Both transport ends in one object for model-question round trips.
 
     The real WorkerChannel reads this object as its child process; the real
     Worker writes reverse requests into it and consumes the front's reverse
-    responses. Front->worker session requests (session/cancel) are answered
-    with an empty result, matching the real worker's reply.
+    responses. Front->worker session/cancel requests are dispatched by the
+    real Worker too; the fixture supplies byte transport, not protocol replies.
     """
 
-    def __init__(self):
-        from loki_agent.acp_worker import Worker
-
-        class _StubSession:
-            job_manager = None
-
-        self.stdout = asyncio.StreamReader()
-        self.stdin = self
-        self.returncode = None
-        self.buffer = bytearray()
-        self.finished = asyncio.Event()
+    def __init__(self, session):
+        super().__init__(session, 'worker', lambda message: None)
+        self.worker.write = self._feed
         self.replies = []
-        self.methods = []
-        self.worker = Worker(_StubSession(), self._feed)
-        self._closed = False
+        self.asks = []
+        self.changed = asyncio.Event()
+
+    def ask(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.asks.append(task)
+        return task
 
     def _feed(self, message):
         self.stdout.feed_data(
             (json.dumps(message) + "\n").encode("utf-8"))
-
-    async def readline(self):
-        return await self.stdout.readline()
-
-    def write(self, data):
-        self.buffer.extend(data)
 
     async def drain(self):
         while b"\n" in self.buffer:
@@ -4634,24 +5459,11 @@ class _AskLoopProcess:
                     raise AssertionError(
                         "test harness received unhandled front->worker "
                         f"method {message['method']!r}")
-                self._feed(acps.response(message["id"], result={}))
+                await self.worker.handle(message, concurrent=True)
             else:
                 self.replies.append(message)
                 self.worker.resolve_reverse(message["id"], message)
-
-    def close(self):
-        self._closed = True
-
-    async def wait_closed(self):
-        return None
-
-    async def wait(self):
-        while not self._closed:
-            await asyncio.sleep(0.01)
-        self.returncode = 0
-        self.stdout.feed_eof()
-        self.finished.set()
-        return self.returncode
+                self.changed.set()
 
 
 class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
@@ -4664,54 +5476,84 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
 
     @asynccontextmanager
     async def _roundtrip(self, *, advertise=True):
-        messages = []
+        from loki_agent.sessions import Session
 
-        def client_write(message):
-            messages.append(message)
+        async with AsyncExitStack() as cleanup:
+            session = Session()
+            cleanup.push_async_callback(session.close_state)
+            messages = []
+            process = _AskLoopProcess(session)
 
-        front = acp.Front(lambda: None, client_write, CredentialStore({}))
-        if advertise:
-            front.initialize({
-                "clientCapabilities": {"elicitation": {"form": {}}}})
-        owner = self._owner(front)
-        process = _AskLoopProcess()
-        channel = acp.WorkerChannel(
-            owner.session_id, process, lambda message: None, None,
-            reverse_handler=lambda message: front._worker_request(
-                owner, message))
-        owner.channel = channel
-        self._seen_elicitations = set()
-        try:
-            yield front, process, messages
-        finally:
-            await channel.close()
-            for task in list(front._tasks):
-                task.cancel()
-            await asyncio.gather(*front._tasks, return_exceptions=True)
+            def client_write(message):
+                messages.append(message)
+                process.changed.set()
 
-    @staticmethod
-    async def _next_elicitation(messages, seen):
-        async with asyncio.timeout(3):
-            while True:
-                for message in messages:
-                    if (message.get("method") == "elicitation/create"
-                            and message["id"] not in seen):
-                        seen.add(message["id"])
-                        return message
-                await asyncio.sleep(0.01)
+            front = acp.Front(lambda: None, client_write, CredentialStore({}))
+            if advertise:
+                front.initialize({
+                    "clientCapabilities": {"elicitation": {"form": {}}}})
+            owner = self._owner(front)
+            channel = acp.WorkerChannel(
+                owner.session_id, process, lambda message: None, None,
+                reverse_handler=lambda message: front._worker_request(
+                    owner, message))
+            owner.channel = channel
+            self._seen_elicitations = set()
+            try:
+                yield front, process, messages
+            finally:
+                for task in process.asks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*process.asks, return_exceptions=True)
+                await front.shutdown()
+                self.assertEqual(process.returncode, 0)
+                self.assertTrue(process.close_task.done())
+                self.assertIsNone(process.close_task.exception())
+                self.assertTrue(channel._reader_task.done())
+                self.assertFalse(front._client_requests)
+                self.assertFalse(process.worker._reverse_requests)
 
-    async def _answer(self, front, messages, result):
-        elicitation = await self._next_elicitation(
-            messages, self._seen_elicitations)
+    async def _next_elicitation(self, front, process, messages, ask_task):
+        while True:
+            process.changed.clear()
+            for message in messages:
+                if (message.get("method") == "elicitation/create"
+                        and message["id"] not in self._seen_elicitations):
+                    self._seen_elicitations.add(message["id"])
+                    return message
+            await observe_fixture(
+                process.changed.wait(), ask_task, front.workers['ask-session']._reader_task)
+
+    async def _answer(self, front, process, messages, ask_task, result):
+        elicitation = await self._next_elicitation(front, process, messages, ask_task)
         front.handle(acps.response(elicitation["id"], result=result))
         return elicitation
 
+    async def test_roundtrip_cleanup_joins_unstarted_and_pending_asks(self):
+        before = asyncio.all_tasks()
+        for started in [False, True]:
+            with self.subTest(started=started):
+                async with self._roundtrip() as (front, process, messages):
+                    ask_task = process.ask(process.worker._ask_user(
+                        'Unanswered?', [('Yes', None), ('No', None)]))
+                    if started:
+                        await self._next_elicitation(front, process, messages, ask_task)
+                self.assertTrue(ask_task.cancelled())
+                self.assertFalse(asyncio.all_tasks() - before)
+
+    async def test_roundtrip_closes_its_session_storage(self):
+        async with self._roundtrip() as (_front, process, _messages):
+            storage = process.worker.session.response_headers
+        with self.assertRaisesRegex(ValueError, 'closed'):
+            _ = storage.directory_handle
+
     async def test_ask_roundtrip_builds_the_form_and_returns_the_answer(self):
         async with self._roundtrip() as (front, process, messages):
-            ask_task = asyncio.create_task(process.worker._ask_user(
+            ask_task = process.ask(process.worker._ask_user(
                 "Which storage?", [("Local", "on disk"), ("Remote", "S3")]))
             elicitation = await self._answer(
-                front, messages,
+                front, process, messages, ask_task,
                 {"action": "accept",
                  "content": {"answer": "Remote", "custom": "via VPN"}})
             self.assertEqual(await ask_task, {
@@ -4738,21 +5580,21 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_custom_text_alone_becomes_the_answer(self):
         async with self._roundtrip() as (front, process, messages):
-            ask_task = asyncio.create_task(process.worker._ask_user(
+            ask_task = process.ask(process.worker._ask_user(
                 "Proceed?", [("Yes", None), ("No", None)]))
             await self._answer(
-                front, messages,
+                front, process, messages, ask_task,
                 {"action": "accept", "content": {"custom": " maybe later "}})
             self.assertEqual(await ask_task, {
                 "action": "answered", "answer": "maybe later"})
 
     async def test_multi_select_uses_an_array_schema_and_answer(self):
         async with self._roundtrip() as (front, process, messages):
-            ask_task = asyncio.create_task(process.worker._ask_user(
+            ask_task = process.ask(process.worker._ask_user(
                 "Which parts?", [("Legs", None), ("Roof", None)],
                 multi_select=True))
             elicitation = await self._answer(
-                front, messages,
+                front, process, messages, ask_task,
                 {"action": "accept",
                  "content": {"answer": ["Legs", "Roof"]}})
             self.assertEqual(await ask_task, {
@@ -4763,22 +5605,22 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_decline_is_not_a_cancel(self):
         async with self._roundtrip() as (front, process, messages):
-            ask_task = asyncio.create_task(process.worker._ask_user(
+            ask_task = process.ask(process.worker._ask_user(
                 "Proceed?", [("Yes", None), ("No", None)]))
-            await self._answer(front, messages, {"action": "decline"})
+            await self._answer(front, process, messages, ask_task, {"action": "decline"})
             self.assertEqual(
                 await ask_task, {"action": "declined"})
 
-            ask_task = asyncio.create_task(process.worker._ask_user(
+            ask_task = process.ask(process.worker._ask_user(
                 "Proceed?", [("Yes", None), ("No", None)]))
-            await self._answer(front, messages, {"action": "cancel"})
+            await self._answer(front, process, messages, ask_task, {"action": "cancel"})
             self.assertEqual(await ask_task, {"action": "cancelled"})
 
     async def test_no_answer_in_an_accept_is_a_worker_error(self):
         async with self._roundtrip() as (front, process, messages):
-            ask_task = asyncio.create_task(process.worker._ask_user(
+            ask_task = process.ask(process.worker._ask_user(
                 "Proceed?", [("Yes", None), ("No", None)]))
-            await self._answer(front, messages,
+            await self._answer(front, process, messages, ask_task,
                                {"action": "accept", "content": {}})
             with self.assertRaisesRegex(
                     acps.TransportError, "contained no answer"):
@@ -4797,20 +5639,20 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_cancel_settles_the_pending_ask(self):
         async with self._roundtrip() as (front, process, messages):
-            ask_task = asyncio.create_task(process.worker._ask_user(
+            ask_task = process.ask(process.worker._ask_user(
                 "Proceed?", [("Yes", None), ("No", None)]))
-            elicitation = await self._next_elicitation(messages, self._seen_elicitations)
+            elicitation = await self._next_elicitation(front, process, messages, ask_task)
+            pending = set(front._tasks)
             front.handle(acps.request(
                 91, "session/cancel", {"sessionId": "ask-session"}))
+            await asyncio.gather(*(front._tasks - pending))
             self.assertEqual(
-                await asyncio.wait_for(ask_task, 3),
+                await ask_task,
                 {"action": "cancelled"})
-            # The front answered the worker's reverse request.
-            async with asyncio.timeout(3):
-                while not any(
-                        reply.get("result") == {"action": "cancelled"}
-                        for reply in process.replies):
-                    await asyncio.sleep(0.01)
+            self.assertTrue(process.worker.cancel_event.is_set())
+            # Completion above already witnessed the worker's reverse reply.
+            self.assertTrue(any(reply.get("result") == {"action": "cancelled"}
+                                for reply in process.replies))
             # A late client answer resolves nothing and raises nothing.
             front.handle(acps.response(
                 elicitation["id"],
@@ -4822,9 +5664,7 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
         async with self._roundtrip() as (front, process, messages):
             process._feed(acps.request(
                 "ask-x", "session/plumb", {}))
-            async with asyncio.timeout(3):
-                while not process.replies:
-                    await asyncio.sleep(0.01)
+            await observe_fixture(process.changed.wait(), front.workers['ask-session']._reader_task)
             error = process.replies[0]["error"]
             self.assertEqual(error["code"], acps.METHOD_NOT_FOUND)
             self.assertIn("session/plumb", error["message"])
@@ -4833,9 +5673,9 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
         async with self._roundtrip() as (front, process, messages):
             worker = process.worker
             worker.cancel_event.set()
-            ask_task = asyncio.create_task(worker._ask_user(
+            ask_task = process.ask(worker._ask_user(
                 "Proceed?", [("Yes", None), ("No", None)]))
-            elicitation = await self._next_elicitation(messages, self._seen_elicitations)
+            elicitation = await self._next_elicitation(front, process, messages, ask_task)
             front.handle(acps.response(
                 elicitation["id"],
                 result={"action": "accept", "content": {"answer": "Yes"}}))
@@ -4843,13 +5683,13 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
             # arrives after the turn's cancellation must not drive the
             # cancelled turn onward.
             self.assertEqual(
-                await asyncio.wait_for(ask_task, 3), {"action": "cancelled"})
+                await ask_task, {"action": "cancelled"})
 
     async def test_worker_request_input_reaches_the_client_session_scoped(self):
         async with self._roundtrip() as (front, process, messages):
-            ask_task = asyncio.create_task(process.worker.request_input(
+            ask_task = process.ask(process.worker.request_input(
                 "Proceed?", [("Yes", None), ("No", None)]))
-            elicitation = await self._next_elicitation(messages, self._seen_elicitations)
+            elicitation = await self._next_elicitation(front, process, messages, ask_task)
             front.handle(acps.response(elicitation["id"], result={
                 "action": "accept", "content": {"answer": "Yes"}}))
             self.assertEqual(await ask_task, {
@@ -4860,14 +5700,13 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
     async def test_late_reverse_reply_is_discarded(self):
         async with self._roundtrip() as (front, process, messages):
             worker = process.worker
-            ask_task = asyncio.create_task(worker._ask_user(
+            ask_task = process.ask(worker._ask_user(
                 "Proceed?", [("Yes", None), ("No", None)]))
-            elicitation = await self._next_elicitation(
-                messages, self._seen_elicitations)
+            elicitation = await self._next_elicitation(front, process, messages, ask_task)
             front.handle(acps.response(elicitation["id"], result={
                 "action": "accept", "content": {"answer": "Yes"}}))
             self.assertEqual(
-                await asyncio.wait_for(ask_task, 3),
+                await ask_task,
                 {"action": "answered", "answer": "Yes"})
             # The reverse request was settled and removed. A second response
             # for it is a deterministic no-op: nothing raises, nothing stays
@@ -4880,50 +5719,67 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
     async def test_worker_request_without_handler_is_refused(self):
         # A channel built without a reverse handler must answer a worker
         # request with an error, never drop it and leave the worker waiting.
-        process = _AskLoopProcess()
-        channel = acp.WorkerChannel("s", process, lambda message: None, None)
-        try:
-            process._feed(acps.request(
-                "ask-7", "session/request_input", {
-                    "question": "q?",
-                    "options": [{"label": "a"}, {"label": "b"}]}))
-            async with asyncio.timeout(3):
-                while not process.replies:
-                    await asyncio.sleep(0.01)
-            error = process.replies[0]["error"]
-            self.assertEqual(error["code"], acps.METHOD_NOT_FOUND)
-            self.assertIn("cannot accept", error["message"])
-        finally:
-            await channel.close()
+        from loki_agent.sessions import Session
+
+        async with AsyncExitStack() as cleanup:
+            session = Session()
+            cleanup.push_async_callback(session.close_state)
+            process = _AskLoopProcess(session)
+            channel = acp.WorkerChannel("s", process, lambda message: None, None)
+            try:
+                process._feed(acps.request(
+                    "ask-7", "session/request_input", {
+                        "question": "q?",
+                        "options": [{"label": "a"}, {"label": "b"}]}))
+                await observe_fixture(process.changed.wait(), channel._reader_task)
+                error = process.replies[0]["error"]
+                self.assertEqual(error["code"], acps.METHOD_NOT_FOUND)
+                self.assertIn("cannot accept", error["message"])
+            finally:
+                await channel.close()
 
     async def test_close_fails_a_pending_question(self):
         async with self._roundtrip() as (front, process, messages):
             worker = process.worker
-            ask_task = asyncio.create_task(worker._ask_user(
+            ask_task = process.ask(worker._ask_user(
                 "Proceed?", [("Yes", None), ("No", None)]))
-            await self._next_elicitation(messages, self._seen_elicitations)
+            await self._next_elicitation(front, process, messages, ask_task)
             await worker.close()
             with self.assertRaises(acps.TransportError):
                 await ask_task
 
 
-class WorkerAskAdvertisementTests(unittest.TestCase):
-    def test_ask_is_withheld_without_capability(self):
+class WorkerAskAdvertisementTests(unittest.IsolatedAsyncioTestCase):
+    async def _offered_tools(self, capable):
+        from loki_agent import formats, loki, model_requests
         from loki_agent.acp_worker import Worker
-        worker = Worker(None, lambda message: None)
-        advertised, withheld = worker._ask_advertised_tools()
-        self.assertEqual(withheld, "Ask")
-        self.assertNotIn("Ask", [
-            tool["function"]["name"] for tool in advertised])
+        from response_header_fixtures import isolated_response_headers
 
-    def test_ask_is_advertised_with_capability(self):
-        from loki_agent.acp_worker import Worker
-        worker = Worker(None, lambda message: None)
-        worker.can_ask_user = True
-        advertised, withheld = worker._ask_advertised_tools()
-        self.assertIsNone(withheld)
-        self.assertIn("Ask", [
-            tool["function"]["name"] for tool in advertised])
+        with isolated_response_headers():
+            async with AsyncExitStack() as cleanup:
+                session = loki.current_session()
+                cleanup.push_async_callback(session.close_state)
+                worker = Worker(session, lambda message: None)
+                worker.can_ask_user = capable
+                offered = []
+
+                async def completion(_items, *, tools, **_kwargs):
+                    offered.append(tools)
+                    return formats.DecodedTurn([formats.message_item('assistant', 'done')])
+
+                with mock.patch.object(loki, 'current_model', return_value='model'), mock.patch.object(
+                        loki, 'async_chat_completion', new=completion):
+                    result = await worker._run_turn(lambda _event: None, model_requests.TurnThinkingSettings())
+                self.assertEqual(result, 'done')
+                self.assertEqual(len(offered), 1)
+                self.assertEqual(session.session_toolsets, offered)
+                return {tool['function']['name'] for tool in offered[0]}
+
+    async def test_ask_is_withheld_without_capability(self):
+        self.assertNotIn('Ask', await self._offered_tools(False))
+
+    async def test_ask_is_advertised_with_capability(self):
+        self.assertIn('Ask', await self._offered_tools(True))
 
 
 class FrontAskValidationTests(unittest.IsolatedAsyncioTestCase):
