@@ -10,10 +10,10 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+from windows_state_fixtures import directory_identity_patch
 
 from loki_agent import windows_runtime as runtime
 from loki_agent import windows_api as api
-from loki_agent import windows_state
 from loki_agent.windows_state import Check
 from loki_agent.runtime_isolations import RuntimeIsolationError
 
@@ -23,24 +23,15 @@ from loki_agent.runtime_isolations import RuntimeIsolationError
 # the ledger, plan and gate logic on every host, so they substitute the
 # platform's canonicalisation with its Python equivalent; the real call is
 # exercised by the Windows legs.
-_final_path_patch = None
 
 
 def setUpModule():
-    global _final_path_patch
-    _final_path_patch = mock.patch.object(
-        windows_state, '_final_path',
-        side_effect=lambda path: os.path.realpath(path))
-    _final_path_patch.start()
-
-
-def tearDownModule():
-    _final_path_patch.stop()
+    unittest.enterModuleContext(directory_identity_patch())
 
 
 class GateTests(unittest.TestCase):
     def test_empty_or_unfinished_checks_refuse(self):
-        for checks in ([], [Check('probe', 'untested')], [Check('probe', 'fail')]):
+        for checks in [[], [Check('probe', 'untested')], [Check('probe', 'fail')]]:
             with self.subTest(checks=checks), self.assertRaises(RuntimeIsolationError):
                 runtime.require_checks(checks)
 
@@ -52,7 +43,7 @@ class GateTests(unittest.TestCase):
         verify.assert_not_called()
 
     def test_recorded_workspace_is_checked(self):
-        workspace = runtime.state.canonical_workspace(os.getcwd())
+        workspace = os.getcwd()
         entry = {'profile': runtime.state.profile_name_for(workspace),
                  'grants': [{'path': workspace, 'access': 'read-write',
                              'origin': 'workspace'}]}
@@ -67,7 +58,7 @@ class GateTests(unittest.TestCase):
     def test_required_workspace_gates_the_same_ledger(self):
         # The ACP front resolves the workspace from the session cwd, not a
         # command line; the gate it passes must be the same one.
-        workspace = runtime.state.canonical_workspace(os.getcwd())
+        workspace = os.getcwd()
         entry = {'profile': runtime.state.profile_name_for(workspace),
                  'grants': [{'path': workspace, 'access': 'read-write',
                              'origin': 'workspace'}]}
@@ -76,6 +67,20 @@ class GateTests(unittest.TestCase):
                 mock.patch.object(runtime.windows_verify, 'verify_workspace',
                                   return_value=[Check('inventory', 'pass')]) as verify:
             self.assertEqual(runtime.required_workspace(workspace), workspace)
+        verify.assert_called_once_with(ledger, workspace)
+
+    def test_required_workspace_keeps_the_raw_operand_and_one_selected_identity(self):
+        workspace = 'relative/link/../workspace//'
+        key = 'native-directory-identity'
+        entry = {'profile': runtime.state.profile_name_for_key(key),
+                 'grants': [{'path': workspace, 'access': 'read-write', 'origin': 'workspace'}]}
+        ledger = {'workspaces': {key: entry}}
+        with mock.patch.object(runtime.state, '_directory_identity', return_value=key) as selected, \
+                mock.patch.object(runtime.state, 'load_ledger', return_value=ledger), \
+                mock.patch.object(runtime.windows_verify, 'verify_workspace',
+                                  return_value=[Check('inventory', 'pass')]) as verify:
+            self.assertEqual(runtime.required_workspace(workspace), workspace)
+        selected.assert_called_once_with(workspace)
         verify.assert_called_once_with(ledger, workspace)
 
     def test_required_workspace_without_ledger_refuses(self):

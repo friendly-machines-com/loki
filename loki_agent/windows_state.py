@@ -75,112 +75,199 @@ def access_mask(access: Access) -> int:
 
 # -- path rules ----------------------------------------------------------
 
-def _runtime_trees(include_code: bool = True) -> list[str]:
-    """Private trees, plus trusted code when checking a writable grant."""
-    trees = [paths.loki_config_dir(), paths.loki_state_dir(),
-             paths.credential_directory()]
-    if include_code:
-        trees.append(os.path.dirname(os.path.abspath(__file__)))
-    if include_code and getattr(sys, "frozen", False):
-        # A packaged build's own directory holds the runtime and its bundled
-        # interpreter; a grant covering it would let a tool rewrite Loki.
-        trees.append(os.path.dirname(os.path.abspath(sys.executable)))
-    return trees
+@dataclass(frozen=True)
+class ObjectLocation:
+    """An opened object's identity and a snapshot of its proper ancestor IDs."""
+
+    key: str
+    ancestors: frozenset[str]
+
+    def contains(self, other: ObjectLocation) -> bool:
+        return self.key == other.key or self.key in other.ancestors
 
 
-def _final_path(path: str) -> str:
-    """The canonical path of an object, read from that object's open handle.
+def object_location(handle) -> ObjectLocation:
+    """Inspect a borrowed handle; own and close only the opened parent handles."""
+    key = windows_api.file_identity(handle)
+    ancestors: set[str] = set()
+    current = handle
+    with contextlib.ExitStack() as cleanup:
+        while True:
+            parent = windows_api.open_parent_directory(current)
+            if parent is None:
+                break
+            cleanup.callback(windows_api.close_handle, parent)
+            identity = windows_api.file_identity(parent)
+            if identity == key or identity in ancestors:
+                raise windows_api.WindowsApiError('Location changed while inspecting its parents')
+            ancestors.add(identity)
+            current = parent
+    return ObjectLocation(key, frozenset(ancestors))
 
-    Loki never resolves or normalises a name -- never, for any purpose.  Where
-    an answer about identity is needed it is asked of the object itself, so no
-    name is rewritten and a rename between two calls cannot change the answer.
-    """
+
+def _directory_location_from_handle(handle) -> ObjectLocation:
+    information = windows_api.by_handle_file_information(handle)
+    if not information.dwFileAttributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY:
+        raise windows_api.WindowsApiError('Selected location is not a directory')
+    return object_location(handle)
+
+
+def _directory_location(path: str) -> ObjectLocation:
     handle = windows_api.open_directory_handle(path)
     try:
-        return windows_api.final_path_from_handle(handle)
+        return _directory_location_from_handle(handle)
     finally:
         windows_api.close_handle(handle)
 
 
-def _canonical_or_absolute(path: str) -> str:
-    """The object's canonical path if it exists, else its absolute spelling.
-
-    A protected tree that does not exist yet still has a location, and a grant
-    covering that location must be refused before it is created -- there is no
-    handle to ask, so the spelling is the only answer available.
-    """
+def _object_at(path: str) -> ObjectLocation:
+    handle = windows_api.open_directory_handle(path)
     try:
-        return os.path.normcase(_final_path(path))
+        return object_location(handle)
+    finally:
+        windows_api.close_handle(handle)
+
+
+def _optional_location(path: str) -> ObjectLocation | None:
+    try:
+        return _directory_location(path)
     except windows_api.WindowsResourceError:
         raise
-    except windows_api.WindowsApiError:
-        return os.path.normcase(os.path.abspath(path))
+    except windows_api.WindowsApiError as error:
+        if error.status in [windows_api.ERROR_FILE_NOT_FOUND, windows_api.ERROR_PATH_NOT_FOUND]:
+            return None
+        raise
 
 
-def configuration_path_errors() -> list[str]:
-    """Readable configuration must not also expose private state or credentials."""
-    config = _canonical_or_absolute(paths.loki_config_dir())
-    state = _canonical_or_absolute(paths.loki_state_dir())
-    credentials = _canonical_or_absolute(paths.credential_directory())
+def program_directories(*, automatic_read=False) -> list[str]:
+    """Resolve setup's program-directory roles through actual opened objects.
+
+    Frozen releases put the two runtime bundles beside the selected editor
+    bundle. Source execution needs the selected interpreter and the package's
+    enclosing source directory. These are installation-layout selections, not
+    rewriting of a workspace/configuration operand. Automatic reads exclude
+    the editor-only bundle; protection includes it. Role selection lives here,
+    not in a second flag attached to each returned pathname.
+    """
+    selected: dict[str, str] = {}
+    with contextlib.ExitStack() as cleanup:
+        def own(handle):
+            cleanup.callback(windows_api.close_handle, handle)
+            return handle
+
+        def parent(handle):
+            opened = windows_api.open_parent_directory(handle)
+            return handle if opened is None else own(opened)
+
+        def add(handle):
+            key = windows_api.file_identity(handle)
+            if key not in selected:
+                selected[key] = windows_api.kernel_path_from_handle(handle)
+
+        image = own(windows_api.open_with_access(sys.executable, windows_api.AccessMask.FILE_READ_ATTRIBUTES))
+        image_directory = parent(image)
+        if getattr(sys, 'frozen', False):
+            release = parent(image_directory)
+            for name in ['loki', 'loki-acp']:
+                bundle = own(windows_api.nt_create_file(
+                    release, name, windows_api.AccessMask.FILE_READ_ATTRIBUTES,
+                    windows_api.NtCreateDisposition.FILE_OPEN, windows_api.NtCreateOptions.FILE_DIRECTORY_FILE))
+                add(bundle)
+            if not automatic_read:
+                add(image_directory)
+        else:
+            module = own(windows_api.open_with_access(__file__, windows_api.AccessMask.FILE_READ_ATTRIBUTES))
+            add(parent(parent(module)))
+            add(image_directory)
+    return list(selected.values())
+
+
+def _root_locations(include_code: bool = True) -> dict[str, ObjectLocation | None]:
+    """Existing protected objects; absent automatic roots are checked on Apply."""
+    roots = {
+        'configuration': _optional_location(paths.loki_config_dir()),
+        'state': _optional_location(paths.loki_state_dir()),
+        'credentials': _optional_location(paths.credential_directory()),
+    }
+    if include_code:
+        for index, program in enumerate(program_directories(), 1):
+            roots[f'program files ({index})'] = _optional_location(program)
+    return roots
+
+
+def _configuration_errors(roots: dict[str, ObjectLocation | None]) -> list[str]:
+    config, state, credentials = roots['configuration'], roots['state'], roots['credentials']
     errors = []
-    if config == state or _contains(config, state) or _contains(state, config):
-        errors.append("Loki configuration and state directories must not overlap")
-    if config == credentials or _contains(credentials, config):
-        errors.append("Loki configuration must not resolve inside credentials")
+    if config is not None and state is not None and (config.contains(state) or state.contains(config)):
+        errors.append('Loki configuration and state directories must not overlap')
+    if config is not None and credentials is not None and credentials.contains(config):
+        errors.append('Loki configuration must not resolve inside credentials')
     return errors
 
 
-def _protected_reasons(target: str, path: str, access: Access, origin='user') -> list[str]:
-    """Overlap verdict for an already-canonical ``target`` spelling."""
-    managed_state = origin == 'state' and target == _canonical_or_absolute(paths.loki_state_dir())
-    if (access is Access.READ
-            and target == _canonical_or_absolute(paths.loki_config_dir())):
-        # This exact tree is deliberately readable. Its credential child has a
-        # protected DACL; no ancestor or arbitrary private-tree grant is allowed.
-        return configuration_path_errors()
-    reasons = configuration_path_errors() if managed_state else []
-    for tree in _runtime_trees(include_code=access is Access.READ_WRITE):
-        protected = _canonical_or_absolute(tree)
-        if managed_state and protected == _canonical_or_absolute(paths.loki_state_dir()):
-            # The state exception never permits overlap with credentials,
-            # configuration or executable code, and never grants the tool role.
+def configuration_path_errors() -> list[str]:
+    """Judge existing objects; creation is followed by the same check on Apply."""
+    try:
+        return _configuration_errors(_root_locations(include_code=False))
+    except windows_api.WindowsApiError as error:
+        return [f'Could not inspect the configuration layout: {error}']
+
+
+def _protected_reasons(target: ObjectLocation, path: str, access: Access, origin='user') -> list[str]:
+    """Compare opened objects and their ancestry, never pathname spellings."""
+    roots = _root_locations(include_code=access is Access.READ_WRITE)
+    state, config = roots['state'], roots['configuration']
+    managed_state = origin == 'state' and state is not None and target.key == state.key
+    if access is Access.READ and config is not None and target.key == config.key:
+        # This exact object is deliberately readable; its credential child has
+        # a protected DACL. An alias does not change which object is judged.
+        return _configuration_errors(roots)
+    reasons = _configuration_errors(roots) if managed_state else []
+    for role, protected in roots.items():
+        if protected is None or (managed_state and role == 'state'):
             continue
-        if target == protected:
-            reasons.append(f"{path} is {tree}, which Loki never grants")
-        elif _contains(target, protected):
-            reasons.append(
-                f"{path} contains {tree}, which Loki never grants")
-        elif _contains(protected, target):
-            reasons.append(f"{path} is inside {tree}, which Loki never grants")
+        if target.key == protected.key:
+            reasons.append(f"{path!r} is Loki's protected {role}")
+        elif target.contains(protected):
+            reasons.append(f"{path!r} contains Loki's protected {role}")
+        elif protected.contains(target):
+            reasons.append(f"{path!r} is inside Loki's protected {role}")
     return reasons
 
 
-def protected_path_errors(path: str, access: Access = Access.READ_WRITE, *, origin='user') -> list[str]:
-    """Reject overlap with private data; trusted code may be read, not written.
+def _automatic_default(path: str, access: Access, origin: str) -> bool:
+    # Classify only the producer's configured automatic operand, not an object
+    # identity. A missing object is never admitted to an ACL write by this test.
+    return ((origin == 'config' and access is Access.READ and path == paths.loki_config_dir())
+            or (origin == 'state' and path == paths.loki_state_dir()))
 
-    Both sides are canonicalised from an open handle, so an alias (junction or
-    symlink) is seen through.  This decides only; the backend re-asks through
-    the same handle it re-ACLs, via ``handle_path_errors``.
-    """
-    return _protected_reasons(_canonical_or_absolute(path), path, access, origin)
+
+def protected_path_errors(path: str, access: Access = Access.READ_WRITE, *, origin='user') -> list[str]:
+    """Preflight native lookup; Apply rechecks the handle whose ACL it changes."""
+    try:
+        return _protected_reasons(_directory_location(path), path, access, origin)
+    except windows_api.WindowsApiError as error:
+        if (not isinstance(error, windows_api.WindowsResourceError)
+                and _automatic_default(path, access, origin)
+                and error.status in [windows_api.ERROR_FILE_NOT_FOUND, windows_api.ERROR_PATH_NOT_FOUND]):
+            # First setup creates these directories on Apply, then checks the
+            # actual grant handle. Do not invent an absolute spelling as identity.
+            return []
+        return [f'Could not inspect {path!r}: {error}']
 
 
 def handle_path_errors(handle, path: str,
                        access: Access = Access.READ_WRITE, *, origin='user') -> list[str]:
-    """Overlap verdict for the object ``handle`` already names.
+    """Judge the same opened directory whose ACL the caller will read/write.
 
-    The target's canonical spelling is read from the open handle, so the object
-    judged here is exactly the object whose DACL the caller can then read and
-    write through that handle.  A name swapped afterwards cannot redirect the
-    decision to a different object.
+    ``path`` labels an error only; it never supplies the target's identity.
+    Parent selection verifies each binding through object IDs and retains the
+    native namespace. No name-based fallback admits an unverified grant.
     """
-    target = os.path.normcase(windows_api.final_path_from_handle(handle))
-    return _protected_reasons(target, path, access, origin)
-
-
-def _contains(parent: str, child: str) -> bool:
-    """Whether normalized ``child`` lies strictly under ``parent``."""
-    return child.startswith(parent.rstrip(os.sep) + os.sep)
+    try:
+        return _protected_reasons(_directory_location_from_handle(handle), path, access, origin)
+    except windows_api.WindowsApiError as error:
+        return [f'Could not inspect {path!r}: {error}']
 
 
 # Conventional secret locations, checked for existence before warning: we only
@@ -197,45 +284,46 @@ def covered_secret_warnings(path: str) -> list[str]:
     """Return warnings for existing secret locations a grant would cover."""
     profile = os.path.expanduser("~")
     try:
-        target = os.path.normcase(_final_path(path))
+        target = _directory_location(path)
     except windows_api.WindowsApiError:
         return []
     warnings = []
     for hint in SECRET_HINTS:
         candidate = os.path.join(profile, hint)
-        if not os.path.exists(candidate):
+        try:
+            protected = _object_at(candidate)
+        except windows_api.WindowsApiError:
+            # These are advisory hints about objects we can inspect, never an
+            # admission decision or a fallback that authorizes a grant.
             continue
-        protected = os.path.normcase(_final_path(candidate))
-        if target == protected or _contains(target, protected):
-            warnings.append(
-                f"{path} also covers {candidate}, which exists")
+        if target.contains(protected):
+            warnings.append(f"{path!r} also covers {candidate!r}, which exists")
     return warnings
 
 
 # -- names ---------------------------------------------------------------
 
-def canonical_workspace(path: str) -> str:
-    """Canonical form used as the workspace key.
+def _directory_identity(path: str) -> str:
+    """Select a directory through native lookup, then identify that object."""
+    handle = windows_api.open_directory_handle(path)
+    try:
+        information = windows_api.by_handle_file_information(handle)
+        if not information.dwFileAttributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY:
+            raise windows_api.WindowsApiError(f"Not a directory: {path!r}")
+        return windows_api.file_identity(handle)
+    finally:
+        windows_api.close_handle(handle)
 
-    Naming only: it folds case and asks the kernel for the object's canonical
-    path so one directory has one profile, and it is never used to rewrite the
-    operand itself.  The answer comes from an open handle, so it does not
-    depend on the caller's cwd and cannot be changed by a rename during the
-    call.
-    """
-    return os.path.normcase(_final_path(path))
+
+def profile_name_for_key(key: str) -> str:
+    """Derive the profile from an already-selected native directory identity."""
+    digest = hashlib.sha256(key.encode("ascii")).hexdigest()
+    return PROFILE_NAME_PREFIX + digest[:32]
 
 
 def profile_name_for(workspace: str) -> str:
-    """Derive the AppContainer profile name for a workspace.
-
-    Derived, not stored: names are case-insensitive and
-    ``DeriveAppContainerSidFromAppContainerName`` is deterministic, so the SID
-    can be computed before anything is created.
-    """
-    digest = hashlib.sha256(canonical_workspace(workspace).encode(
-        "utf-8", "surrogatepass")).hexdigest()
-    return PROFILE_NAME_PREFIX + digest[:32]
+    """Aliases and renames of one existing directory select one profile."""
+    return profile_name_for_key(workspace_key(workspace))
 
 
 def tool_role_sid(package: str) -> str:
@@ -337,13 +425,13 @@ def save_ledger(blob: dict, path: str | None = None) -> None:
 
 
 def workspace_key(workspace: str) -> str:
-    return canonical_workspace(workspace)
+    return _directory_identity(workspace)
 
 
 def ledger_entry(workspace: str, profile: str,
                  grants: list[Grant]) -> dict:
     return {
-        "workspace": os.path.abspath(workspace),
+        "workspace": workspace,
         "profile": profile,
         "grants": [
             {"path": grant.path, "access": grant.access.value,
@@ -531,13 +619,16 @@ class Plan:
 
 
 def _grant_identity(grant: Grant) -> str:
-    # First setup creates configuration only on Apply. Planning must identify
-    # that absent directory without creating it; the eventual grant is still
-    # checked against the actual handle in WindowsBackend.apply().
-    if ((grant.path == paths.loki_config_dir() and grant.access is Access.READ)
-            or (grant.origin == 'state' and grant.path == paths.loki_state_dir())):
-        return _canonical_or_absolute(grant.path)
-    return canonical_workspace(grant.path)
+    try:
+        return _directory_identity(grant.path)
+    except windows_api.WindowsApiError as error:
+        if (not isinstance(error, windows_api.WindowsResourceError)
+                and _automatic_default(grant.path, grant.access, grant.origin)
+                and error.status in [windows_api.ERROR_FILE_NOT_FOUND, windows_api.ERROR_PATH_NOT_FOUND]):
+            # This is a pending automatic role, not a fabricated filesystem
+            # identity. Apply creates/selects the object and rechecks its handle.
+            return 'pending-default:' + grant.origin
+        raise
 
 
 def build_plan(definition: Definition, previous: dict | None) -> Plan:
@@ -549,8 +640,14 @@ def build_plan(definition: Definition, previous: dict | None) -> Plan:
         if grant.origin == "user":
             warnings.extend(covered_secret_warnings(grant.path))
 
-    current = {_grant_identity(g): g for g in definition.grants}
-    recorded = {_grant_identity(g): g for g in entry_grants(previous or {})}
+    profile = ''
+    try:
+        profile = profile_name_for(definition.workspace)
+        current = {_grant_identity(g): g for g in definition.grants}
+        recorded = {_grant_identity(g): g for g in entry_grants(previous or {})}
+    except windows_api.WindowsApiError as error:
+        # An uninspectable recorded grant is not a removal we can safely apply.
+        return Plan(definition.workspace, profile, [], warnings, errors + [str(error)])
     changes = []
     for key, grant in sorted(current.items()):
         if key not in recorded:
@@ -560,9 +657,7 @@ def build_plan(definition: Definition, previous: dict | None) -> Plan:
     for key, grant in sorted(recorded.items()):
         if key not in current:
             changes.append(Change("remove", grant.path, grant.access))
-    return Plan(definition.workspace,
-                profile_name_for(definition.workspace),
-                changes, warnings, errors)
+    return Plan(definition.workspace, profile, changes, warnings, errors)
 
 
 @dataclass(frozen=True)

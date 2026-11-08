@@ -96,10 +96,10 @@ def required_workspace(path):
     allowed; a path that cannot be identified is a refusal like any other, not
     a raw Windows error.
     """
+    workspace = path
     try:
-        workspace = state.canonical_workspace(path)
-        profile = state.profile_name_for(workspace)
         key = state.workspace_key(workspace)
+        profile = state.profile_name_for_key(key)
     except api.WindowsApiError as error:
         raise RuntimeIsolationError(
             f"Cannot identify the workspace {path!r}: {error}") from error

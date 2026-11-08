@@ -25,6 +25,7 @@ from __future__ import annotations
 from contextlib import ExitStack, contextmanager
 import ctypes
 import enum
+import ntpath
 import subprocess
 import sys
 from ctypes import wintypes
@@ -325,14 +326,11 @@ def open_directory_for_acl(path: str):
         share_mode=FileShareMode.FILE_SHARE_READ | FileShareMode.FILE_SHARE_WRITE)
 
 
-def final_path_from_handle(handle) -> str:
-    """The canonical DOS path of the object behind ``handle``.
+def kernel_path_from_handle(handle) -> str:
+    """Return the kernel-reported name without removing its native namespace.
 
-    The answer comes from the object the handle names, so no name is resolved
-    and no ancestor is walked, and a rename between two calls cannot change it.
-    ``VOLUME_NAME_DOS`` is requested so the answer is in the same namespace a
-    user-supplied path uses, and the extended-length prefix is stripped because
-    the paths compared here never carry it.
+    This is navigation metadata, not object identity. Renames can change the
+    answer; a caller opening another object through it must verify that binding.
     """
     get_final = bind("kernel32", "GetFinalPathNameByHandleW", wintypes.DWORD,
                      ctypes.c_void_p, wintypes.LPWSTR, wintypes.DWORD,
@@ -343,29 +341,50 @@ def final_path_from_handle(handle) -> str:
         raise WindowsApiError(
             f"GetFinalPathNameByHandleW sizing failed: {status}",
             status=status)
-    buffer = ctypes.create_unicode_buffer(size + 1)
-    written = get_final(handle, buffer, size + 1, VOLUME_NAME_DOS)
-    if not written:
-        status = ctypes.get_last_error()
-        raise WindowsApiError(
-            f"GetFinalPathNameByHandleW failed: {status}",
-            status=status)
-    return _strip_extended_prefix(buffer.value)
+    while True:
+        buffer = ctypes.create_unicode_buffer(size + 1)
+        written = get_final(handle, buffer, len(buffer), VOLUME_NAME_DOS)
+        if not written:
+            status = ctypes.get_last_error()
+            raise WindowsApiError(
+                f"GetFinalPathNameByHandleW failed: {status}",
+                status=status)
+        if written < len(buffer):
+            return buffer.value
+        # A rename can lengthen the name between sizing and retrieval. The
+        # API then returns the required size, not a complete usable pathname.
+        size = written
 
 
-def _strip_extended_prefix(path: str) -> str:
-    """Map a ``VOLUME_NAME_DOS`` handle path to the plain DOS namespace.
+def open_parent_directory(handle):
+    """Own the parent selected from an object's kernel name, or None at a root.
 
-    ``GetFinalPathNameByHandleW`` returns an extended-length path (a UNC one
-    for a share); the names Loki compares never carry that prefix, so it is
-    removed before any comparison.  Getting this wrong is invisible off
-    Windows, so the cases are pinned on every host in ``test_windows_api``.
+    NT handle-relative '..' lookup is not supported. Split only the kernel's
+    name to navigate to its parent, preserving the extended namespace needed
+    for trailing dots/spaces. Reopen the leaf without following a reparse point
+    and verify its identity before returning that parent. The input is borrowed;
+    the caller closes the returned handle. No directory names are pinned.
     """
-    if path.startswith("\\\\?\\UNC\\"):
-        return "\\\\" + path[len("\\\\?\\UNC\\"):]
-    if path.startswith("\\\\?\\"):
-        return path[len("\\\\?\\"):]
-    return path
+    selected = file_identity(handle)
+    parent_name, leaf = ntpath.split(kernel_path_from_handle(handle))
+    if not leaf:
+        return None
+    parent = open_directory_handle(parent_name)
+    try:
+        reopened = nt_create_file(
+            parent, leaf, AccessMask.FILE_READ_ATTRIBUTES,
+            NtCreateDisposition.FILE_OPEN, NtCreateOptions.FILE_OPEN_REPARSE_POINT)
+        try:
+            attributes = by_handle_file_information(reopened).dwFileAttributes
+            if (attributes & FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT
+                    or file_identity(reopened) != selected):
+                raise WindowsApiError("Location changed while inspecting its parent")
+        finally:
+            close_handle(reopened)
+        return parent
+    except BaseException:
+        close_handle(parent)
+        raise
 
 
 def label_sddl(path: str) -> str:
@@ -1586,6 +1605,28 @@ class ByHandleFileInformation(ctypes.Structure):
                 ("nNumberOfLinks", ctypes.c_uint32),
                 ("nFileIndexHigh", ctypes.c_uint32),
                 ("nFileIndexLow", ctypes.c_uint32)]
+
+
+class FileIdInformation(ctypes.Structure):
+    """FILE_ID_INFO: native volume identity and the complete 128-bit file ID."""
+
+    _fields_ = [("volume_serial", ctypes.c_uint64),
+                ("file_id", ctypes.c_ubyte * 16)]
+
+
+def file_identity(handle) -> str:
+    """Identify an open object without interpreting its pathname.
+
+    The identity remains stable across aliases and renames while the object
+    exists. It is not an everlasting capability: deleted file IDs can be reused.
+    """
+    query = bind("kernel32", "GetFileInformationByHandleEx", wintypes.BOOL,
+                 ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    information = FileIdInformation()
+    if not query(handle, 18, ctypes.byref(information), ctypes.sizeof(information)):
+        raise WindowsApiError("Could not inspect the selected location",
+                              status=ctypes.get_last_error())
+    return f"{information.volume_serial:016x}:{bytes(information.file_id).hex()}"
 
 
 def nt_create_file(directory, name, desired_access, disposition, options,

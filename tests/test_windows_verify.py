@@ -10,6 +10,7 @@ denials look successful by making them vacuous.
 import os
 import unittest
 from unittest import mock
+from windows_state_fixtures import directory_identity_patch
 
 from loki_agent import paths
 from loki_agent import windows_api
@@ -481,6 +482,7 @@ class VerifyContainerTests(unittest.TestCase):
                             STATE: f'D:P(A;OICI;FA;;;{OTHER})(A;OICI;0x1301BF;;;{PACKAGE})',
                             os.path.join(STATE, 'windows-setup.json'): f'D:P(A;;FA;;;{OTHER})'}
         patches = [
+            directory_identity_patch(),
             mock.patch.object(windows_verify, "profile_name_for",
                               return_value="profile"),
             mock.patch.object(windows_api, "derive_app_container_sid",

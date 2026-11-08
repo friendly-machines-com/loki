@@ -6,6 +6,7 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+from windows_state_fixtures import directory_identity_patch, real_directory_locations
 
 from loki_agent import windows_api as api
 from loki_agent import windows_containers as containers
@@ -18,19 +19,10 @@ from loki_agent import windows_verify as verify
 # exists on Windows; this module tests the ledger and recovery logic on every
 # host, so it substitutes the platform's canonicalisation.  The real call is
 # exercised by the Windows legs.
-_final_path_patch = None
 
 
 def setUpModule():
-    global _final_path_patch
-    _final_path_patch = mock.patch.object(
-        state, '_final_path',
-        side_effect=lambda path: os.path.realpath(path))
-    _final_path_patch.start()
-
-
-def tearDownModule():
-    _final_path_patch.stop()
+    unittest.enterModuleContext(directory_identity_patch())
 
 
 SID = 'S-1-15-2-1-2-3'
@@ -69,7 +61,6 @@ class RecoveryTests(unittest.TestCase):
             mock.patch.object(containers, 'set_dacl_sddl', side_effect=self.descriptors.__setitem__),
             # The grant is checked, read and written through one handle; this
             # host has no handles, so the path itself stands in for it.
-            mock.patch.object(api, 'final_path_from_handle', side_effect=lambda handle: handle),
             mock.patch.object(api, 'open_directory_for_acl', side_effect=lambda path: path),
             mock.patch.object(api, 'close_handle'),
             mock.patch.object(api, 'handle_dacl_sddl', side_effect=self.descriptors.__getitem__),
@@ -198,9 +189,17 @@ class RulesTests(unittest.TestCase):
             private = os.path.join(root, 'private')
             alias = os.path.join(root, 'alias')
             os.mkdir(private)
-            os.symlink(private, alias)
-            with mock.patch.object(state, '_runtime_trees', return_value=[private]):
-                self.assertTrue(state.protected_path_errors(alias, state.Access.READ))
+            try:
+                os.symlink(private, alias, target_is_directory=True)
+            except OSError as error:
+                if getattr(error, 'winerror', None) != 1314:
+                    raise
+                self.skipTest('this account cannot create a directory symlink')
+            with real_directory_locations():
+                selected = state._directory_location(private)
+                roots = {'configuration': None, 'state': None, 'credentials': selected}
+                with mock.patch.object(state, '_root_locations', return_value=roots):
+                    self.assertTrue(state.protected_path_errors(alias, state.Access.READ))
 
     def test_reload_does_not_duplicate_automatic_grants(self):
         expected = len(setup.automatic_grants('/work'))

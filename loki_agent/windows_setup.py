@@ -48,6 +48,7 @@ import sys
 
 from . import paths
 from . import windows_api
+from . import windows_state
 from . import windows_containers
 from . import windows_verify
 from .windows_acl import names_package, dacl_parts
@@ -186,13 +187,12 @@ class WindowsBackend:
 
     def _grant_state(self, package, user, root_handle):
         writers = state_writer_sids(self.ledger)
-        root = os.path.normcase(windows_api.final_path_from_handle(root_handle))
+        root = windows_state.object_location(root_handle)
         for path in state_objects():
             handle = self._state_handle(path)
             try:
-                actual = os.path.normcase(windows_api.final_path_from_handle(handle))
-                if actual != root and not actual.startswith(root.rstrip(os.sep) + os.sep):
-                    raise windows_api.WindowsApiError('state object resolved outside the managed tree: ' + path)
+                if not root.contains(windows_state.object_location(handle)):
+                    raise windows_api.WindowsApiError(f'State object resolved outside the managed tree: {path!r}')
                 current = windows_api.handle_dacl_sddl(handle)
                 errors = state_acl_errors(current, user, writers)
                 if errors:
@@ -372,25 +372,14 @@ def automatic_grants(workspace: str) -> list[Grant]:
     remain private. Owning packages maintain state, but the tool write role is
     granted only to writable workspace/user paths, never managed state.
     """
-    # The extracted release bundle:
-    #
-    #   <release>/
-    #   |- loki/         loki.exe       + _internal/
-    #   |- loki-acp/     loki-acp.exe   + _internal/
-    #   '- loki-setup/   loki-setup.exe + _internal/   <- this process
-    #
-    # The contained model runs the two runtimes, so both of their bundles are
-    # granted read.  This process's own bundle is deliberately not granted:
-    # the model must never reach the executable that writes profiles and ACLs.
-    setup_bundle = os.path.dirname(sys.executable)
-    release_bundle = os.path.dirname(setup_bundle)
-    runtimes = [os.path.join(release_bundle, name)
-                for name in ["loki", "loki-acp"]]
+    # The shared installation selector also supplies protected program objects:
+    # do not separately reconstruct bundle paths or infer identity from names.
+    programs = windows_state.program_directories(automatic_read=True)
     return [
         Grant(workspace, Access.READ_WRITE, "workspace"),
         Grant(paths.loki_config_dir(), Access.READ, "config"),
         Grant(paths.loki_state_dir(), Access.READ_WRITE, 'state'),
-        *(Grant(runtime, Access.READ, "runtime") for runtime in runtimes),
+        *(Grant(program, Access.READ, 'runtime') for program in programs),
     ]
 
 

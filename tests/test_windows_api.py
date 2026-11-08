@@ -21,7 +21,200 @@ from unittest import mock
 
 from loki_agent import paths
 from loki_agent import windows_api
+from loki_agent import windows_state
 from loki_agent import windows_runtime
+
+
+class FileIdentityTests(unittest.TestCase):
+    def test_file_id_info_has_the_documented_native_layout(self):
+        self.assertEqual(ctypes.sizeof(windows_api.FileIdInformation), 24)
+        self.assertEqual(windows_api.FileIdInformation.file_id.offset, 8)
+
+    def test_volume_and_all_128_file_id_bits_select_the_identity(self):
+        identities = []
+        for volume, last in [[1, 0xaa], [2, 0xaa], [1, 0xbb]]:
+            def query(handle, kind, buffer, size):
+                self.assertEqual([handle, kind, size], [17, 18, 24])
+                information = ctypes.cast(buffer, ctypes.POINTER(windows_api.FileIdInformation)).contents
+                information.volume_serial = volume
+                information.file_id[:] = bytes([0] * 15 + [last])
+                return 1
+
+            with mock.patch.object(windows_api, 'bind', return_value=query):
+                identities.append(windows_api.file_identity(17))
+        self.assertEqual(len(set(identities)), 3)
+        self.assertEqual(identities[0], '0000000000000001:' + '00' * 15 + 'aa')
+
+    def test_query_failure_preserves_the_native_error(self):
+        with mock.patch.object(windows_api, 'bind', return_value=lambda *args: 0), \
+                mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+            with self.assertRaises(windows_api.WindowsApiError) as raised:
+                windows_api.file_identity(17)
+        self.assertEqual(raised.exception.status, 5)
+
+    def test_directory_selection_preserves_raw_operands_and_releases_each_handle(self):
+        raw = 'relative\\\\link\\\\..\\\\workspace\\\\'
+        for outcome in ['success', 'not-directory', 'information-error', 'identity-error']:
+            with self.subTest(outcome=outcome):
+                information = windows_api.ByHandleFileInformation()
+                if outcome != 'not-directory':
+                    information.dwFileAttributes = windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY
+                with mock.patch.object(windows_api, 'open_directory_handle', return_value=17) as opened, \
+                        mock.patch.object(windows_api, 'by_handle_file_information', return_value=information) as facts, \
+                        mock.patch.object(windows_api, 'file_identity', return_value='native-object') as identify, \
+                        mock.patch.object(windows_api, 'close_handle') as closed:
+                    if outcome == 'information-error':
+                        facts.side_effect = windows_api.WindowsApiError('attribute query failed', status=5)
+                    elif outcome == 'identity-error':
+                        identify.side_effect = windows_api.WindowsApiError('identity query failed', status=5)
+                    if outcome == 'success':
+                        self.assertEqual(windows_state._directory_identity(raw), 'native-object')
+                    else:
+                        with self.assertRaises(windows_api.WindowsApiError):
+                            windows_state._directory_identity(raw)
+                    opened.assert_called_once_with(raw)
+                    closed.assert_called_once_with(17)
+                    if outcome in ['not-directory', 'information-error']:
+                        identify.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == 'win32', 'native Windows file identities')
+    def test_native_identity_survives_rename_and_distinguishes_other_objects(self):
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as handles:
+            original, renamed, other = [root + os.sep + name for name in ['original', 'renamed', 'other']]
+            os.mkdir(original)
+            os.mkdir(other)
+            handle = windows_api.open_directory_handle(original)
+            handles.callback(windows_api.close_handle, handle)
+            identity = windows_api.file_identity(handle)
+            profile = windows_state.profile_name_for(original)
+            os.rename(original, renamed)
+            self.assertEqual(windows_api.file_identity(handle), identity)
+            self.assertEqual(windows_state.workspace_key(renamed), identity)
+            self.assertEqual(windows_state.profile_name_for(renamed), profile)
+            self.assertNotEqual(windows_state.workspace_key(other), identity)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'native Windows case-sensitive directories')
+    def test_native_case_distinct_objects_select_different_profiles(self):
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as handles:
+            handle = windows_api.open_with_access(
+                root, windows_api.AccessMask.FILE_READ_ATTRIBUTES | windows_api.AccessMask.FILE_WRITE_ATTRIBUTES,
+                flags=windows_api.FileFlags.FILE_FLAG_BACKUP_SEMANTICS)
+            handles.callback(windows_api.close_handle, handle)
+            setter = windows_api.bind('kernel32', 'SetFileInformationByHandle', wintypes.BOOL,
+                                      ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+            enabled = ctypes.c_uint32(1)
+            if not setter(handle, 23, ctypes.byref(enabled), ctypes.sizeof(enabled)):
+                error = ctypes.get_last_error()
+                if error in [1, 50]:
+                    self.skipTest(f'this filesystem does not support case-sensitive directories: {error}')
+                raise ctypes.WinError(error)
+            first, second = root + os.sep + 'Case', root + os.sep + 'case'
+            os.mkdir(first)
+            os.mkdir(second)
+            self.assertNotEqual(windows_state.workspace_key(first), windows_state.workspace_key(second))
+            self.assertNotEqual(windows_state.profile_name_for(first), windows_state.profile_name_for(second))
+
+
+class ParentDirectoryTests(unittest.TestCase):
+    def test_kernel_name_keeps_namespace_and_retries_a_growing_name(self):
+        name = r'\\?\C:\parent\longer name. '
+        lengths = []
+
+        def query(handle, output, length, flags):
+            self.assertEqual([handle, flags], [17, windows_api.VOLUME_NAME_DOS])
+            lengths.append(length)
+            if output is None:
+                return 3
+            if length <= len(name):
+                return len(name) + 1
+            output.value = name
+            return len(name)
+
+        with mock.patch.object(windows_api, 'bind', return_value=query):
+            self.assertEqual(windows_api.kernel_path_from_handle(17), name)
+        self.assertEqual(len(lengths), 3)
+
+    def test_parent_selection_preserves_namespace_and_owns_only_new_handles(self):
+        name = r'\\?\C:\parent\child. '
+        for outcome in ['success', 'replacement', 'reparse', 'open-error', 'query-error']:
+            with self.subTest(outcome=outcome):
+                facts = windows_api.ByHandleFileInformation()
+                if outcome == 'reparse':
+                    facts.dwFileAttributes = windows_api.FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT
+                with mock.patch.object(windows_api, 'file_identity',
+                                       side_effect=lambda handle: 'changed' if outcome == 'replacement' and handle == 30 else 'selected'), \
+                        mock.patch.object(windows_api, 'kernel_path_from_handle', return_value=name), \
+                        mock.patch.object(windows_api, 'open_directory_handle', return_value=20) as parent, \
+                        mock.patch.object(windows_api, 'nt_create_file', return_value=30) as reopen, \
+                        mock.patch.object(windows_api, 'by_handle_file_information', return_value=facts) as information, \
+                        mock.patch.object(windows_api, 'close_handle') as close:
+                    if outcome == 'open-error':
+                        reopen.side_effect = windows_api.WindowsApiError('reopen failed', status=5)
+                    if outcome == 'query-error':
+                        information.side_effect = windows_api.WindowsApiError('query failed', status=5)
+                    if outcome == 'success':
+                        self.assertEqual(windows_api.open_parent_directory(17), 20)
+                        self.assertEqual(close.call_args_list, [mock.call(30)])
+                    else:
+                        with self.assertRaises(windows_api.WindowsApiError):
+                            windows_api.open_parent_directory(17)
+                        expected = [mock.call(20)] if outcome == 'open-error' else [mock.call(30), mock.call(20)]
+                        self.assertEqual(close.call_args_list, expected)
+                    parent.assert_called_once_with(r'\\?\C:\parent')
+                    reopen.assert_called_once_with(
+                        20, 'child. ', windows_api.AccessMask.FILE_READ_ATTRIBUTES,
+                        windows_api.NtCreateDisposition.FILE_OPEN,
+                        windows_api.NtCreateOptions.FILE_OPEN_REPARSE_POINT)
+
+    def test_volume_and_unc_roots_have_no_filesystem_parent(self):
+        for name in ['\\\\?\\C:\\', '\\\\?\\UNC\\server\\share\\']:
+            with self.subTest(name=name), \
+                    mock.patch.object(windows_api, 'file_identity', return_value='root'), \
+                    mock.patch.object(windows_api, 'kernel_path_from_handle', return_value=name), \
+                    mock.patch.object(windows_api, 'open_directory_handle') as opened, \
+                    mock.patch.object(windows_api, 'close_handle') as closed:
+                self.assertIsNone(windows_api.open_parent_directory(17))
+                opened.assert_not_called()
+                closed.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == 'win32', 'native Windows parent-object selection')
+    def test_native_parent_selection_keeps_trailing_character_names(self):
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as handles:
+            parent = windows_api.open_directory_handle(root)
+            handles.callback(windows_api.close_handle, parent)
+            expected = windows_api.file_identity(parent)
+            native = windows_api.kernel_path_from_handle(parent)
+            for leaf in ['plain', 'trailing.', 'trailing ']:
+                operand = native + '\\' + leaf
+                os.mkdir(operand)
+                with contextlib.ExitStack() as children:
+                    children.callback(os.rmdir, operand)
+                    handle = windows_api.open_directory_handle(operand)
+                    children.callback(windows_api.close_handle, handle)
+                    selected_parent = windows_api.open_parent_directory(handle)
+                    children.callback(windows_api.close_handle, selected_parent)
+                    self.assertEqual(windows_api.file_identity(selected_parent), expected)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'native Windows replacement interval')
+    def test_native_parent_selection_refuses_replaced_names_without_closing_the_input(self):
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as handles:
+            original, moved = root + os.sep + 'original', root + os.sep + 'moved'
+            os.mkdir(original)
+            handle = windows_api.open_directory_handle(original)
+            handles.callback(windows_api.close_handle, handle)
+            native_name = windows_api.kernel_path_from_handle
+            identity = windows_api.file_identity(handle)
+
+            def replace_name(selected):
+                result = native_name(selected)
+                os.rename(original, moved)
+                os.mkdir(original)
+                return result
+
+            with mock.patch.object(windows_api, 'kernel_path_from_handle', side_effect=replace_name):
+                with self.assertRaises(windows_api.WindowsApiError):
+                    windows_api.open_parent_directory(handle)
+            self.assertEqual(windows_api.file_identity(handle), identity)
 
 
 class GuidTests(unittest.TestCase):
@@ -53,25 +246,17 @@ class GuidTests(unittest.TestCase):
 
 
 class ExtendedPathTests(unittest.TestCase):
-    """GetFinalPathNameByHandleW returns a prefixed path; comparisons do not.
+    def test_kernel_names_preserve_dos_unc_and_root_namespace_shapes(self):
+        for name in ['\\\\?\\C:\\work. ', '\\\\?\\UNC\\server\\share\\name. ', '\\\\?\\C:\\']:
+            with self.subTest(name=name):
+                def query(handle, output, size, flags):
+                    if output is None:
+                        return len(name) + 1
+                    output.value = name
+                    return len(name)
 
-    The prefix literals are easy to get a backslash wrong, and the mistake
-    changes nothing off Windows, so the shapes are pinned on every host.
-    """
-
-    def test_the_extended_length_prefix_is_stripped(self):
-        self.assertEqual(
-            windows_api._strip_extended_prefix('\\\\?\\C:\\work'),
-            'C:\\work')
-
-    def test_a_unc_share_keeps_its_double_leading_backslash(self):
-        self.assertEqual(
-            windows_api._strip_extended_prefix('\\\\?\\UNC\\server\\share'),
-            '\\\\server\\share')
-
-    def test_a_plain_path_is_returned_unchanged(self):
-        self.assertEqual(
-            windows_api._strip_extended_prefix('C:\\work'), 'C:\\work')
+                with mock.patch.object(windows_api, 'bind', return_value=query):
+                    self.assertEqual(windows_api.kernel_path_from_handle(17), name)
 
 
 class DeclarationSafetyTests(unittest.TestCase):

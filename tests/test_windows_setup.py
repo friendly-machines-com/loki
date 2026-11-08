@@ -8,6 +8,7 @@ too much or refuses something legitimate.
 """
 
 import contextlib
+import ctypes
 import io
 import json
 import os
@@ -15,6 +16,8 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from directory_fixtures import directory_alias
+from windows_state_fixtures import directory_identity_patch, directory_handle, real_directory_locations
 
 from loki_agent import windows_acl
 from loki_agent import windows_api
@@ -28,19 +31,10 @@ from loki_agent import windows_state
 # the ledger, plan and gate logic on every host, so they substitute the
 # platform's canonicalisation with its Python equivalent; the real call is
 # exercised by the Windows legs.
-_final_path_patch = None
 
 
 def setUpModule():
-    global _final_path_patch
-    _final_path_patch = mock.patch.object(
-        windows_state, '_final_path',
-        side_effect=lambda path: os.path.realpath(path))
-    _final_path_patch.start()
-
-
-def tearDownModule():
-    _final_path_patch.stop()
+    unittest.enterModuleContext(directory_identity_patch())
 
 
 PACKAGE_SID = "S-1-15-2-1-2-3-4-5-6-7-8"
@@ -241,6 +235,10 @@ class ProtectedPathTests(unittest.TestCase):
         self.config = os.path.join(self.root, "loki")
         self.credentials = os.path.join(self.config, "credentials")
         self.state = os.path.join(self.root, "state")
+        os.makedirs(self.credentials)
+        os.mkdir(self.state)
+        os.mkdir(self.root + os.sep + 'elsewhere')
+        self.enterContext(real_directory_locations())
         for target, attribute in ((self.config, "loki_config_dir"),
                                   (self.state, "loki_state_dir"),
                                   (self.credentials, "credential_directory")):
@@ -257,8 +255,9 @@ class ProtectedPathTests(unittest.TestCase):
             windows_state.protected_path_errors(self.credentials))
 
     def test_refuses_a_grant_inside_a_protected_tree(self):
-        self.assertTrue(windows_state.protected_path_errors(
-            os.path.join(self.config, "sessions")))
+        selected = self.config + os.sep + 'sessions'
+        os.mkdir(selected)
+        self.assertTrue(windows_state.protected_path_errors(selected))
 
     def test_refuses_the_runtime_tree(self):
         package = os.path.dirname(os.path.abspath(windows_setup.__file__))
@@ -275,7 +274,9 @@ class ProtectedPathTests(unittest.TestCase):
                     path, windows_state.Access.READ))
 
     def test_overlapping_config_and_state_are_rejected(self):
-        for state in [self.config, os.path.join(self.config, 'state'), self.root]:
+        child = self.config + os.sep + 'state'
+        os.mkdir(child)
+        for state in [self.config, child, self.root]:
             with self.subTest(state=state), mock.patch.object(
                     windows_setup.paths, 'loki_state_dir', return_value=state):
                 self.assertTrue(windows_state.configuration_path_errors())
@@ -283,8 +284,10 @@ class ProtectedPathTests(unittest.TestCase):
                     self.config, windows_state.Access.READ))
 
     def test_alias_of_state_cannot_be_granted_as_configuration(self):
-        with mock.patch.object(windows_state, '_final_path', side_effect=lambda path:
-                               self.state if path == self.config else path):
+        locate = windows_state._directory_location
+        state_object = locate(self.state)
+        with mock.patch.object(windows_state, '_directory_location', side_effect=lambda path:
+                               state_object if path == self.config else locate(path)):
             self.assertTrue(windows_state.protected_path_errors(
                 self.config, windows_state.Access.READ))
 
@@ -292,6 +295,74 @@ class ProtectedPathTests(unittest.TestCase):
         self.assertEqual(
             windows_state.protected_path_errors(
                 os.path.join(self.root, "elsewhere")), [])
+
+
+@unittest.skipUnless(sys.platform == 'win32', 'native Windows object containment')
+class NativeObjectPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.root = self.enterContext(tempfile.TemporaryDirectory(prefix='loki-object-policy-'))
+        self.enterContext(real_directory_locations())
+        handle = windows_api.open_with_access(
+            self.root, windows_api.AccessMask.FILE_READ_ATTRIBUTES | windows_api.AccessMask.FILE_WRITE_ATTRIBUTES,
+            flags=windows_api.FileFlags.FILE_FLAG_BACKUP_SEMANTICS)
+        try:
+            setter = windows_api.bind('kernel32', 'SetFileInformationByHandle', ctypes.wintypes.BOOL,
+                                      ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.wintypes.DWORD)
+            enabled = ctypes.c_uint32(1)
+            if not setter(handle, 23, ctypes.byref(enabled), ctypes.sizeof(enabled)):
+                error = ctypes.get_last_error()
+                if error in [1, 50]:
+                    self.skipTest(f'this filesystem has no case-sensitive directories: {error}')
+                raise ctypes.WinError(error)
+        finally:
+            windows_api.close_handle(handle)
+        self.upper, self.lower, self.other = [self.root + os.sep + leaf for leaf in ['Case', 'case', 'other']]
+        for path in [self.upper, self.lower, self.other]:
+            os.mkdir(path)
+        self.credentials = self.upper + os.sep + 'credentials'
+        os.mkdir(self.credentials)
+
+    @contextlib.contextmanager
+    def layout(self, state):
+        with contextlib.ExitStack() as cleanup:
+            for name, path in [['loki_config_dir', self.upper], ['loki_state_dir', state],
+                               ['credential_directory', self.credentials]]:
+                cleanup.enter_context(mock.patch.object(windows_state.paths, name, return_value=path))
+            yield
+
+    def test_case_distinct_config_and_state_do_not_overlap(self):
+        with self.layout(self.lower):
+            self.assertEqual(windows_state.configuration_path_errors(), [])
+            self.assertEqual(windows_state.protected_path_errors(
+                self.lower, windows_state.Access.READ_WRITE, origin='state'), [])
+
+    def test_actual_handle_not_its_label_selects_the_containment_verdict(self):
+        with self.layout(self.other):
+            handle = windows_api.open_directory_for_acl(self.lower)
+            try:
+                self.assertEqual(windows_state.handle_path_errors(handle, self.upper), [])
+            finally:
+                windows_api.close_handle(handle)
+            handle = windows_api.open_directory_for_acl(self.upper)
+            try:
+                self.assertTrue(windows_state.handle_path_errors(handle, self.lower))
+            finally:
+                windows_api.close_handle(handle)
+
+    def test_state_acl_update_refuses_a_case_lookalike_sibling_object(self):
+        child = self.lower + os.sep + 'child.txt'
+        with open(child, 'w', encoding='utf-8') as stream:
+            stream.write('not managed state')
+        backend = windows_setup.WindowsBackend({})
+        root = windows_api.open_directory_for_acl(self.upper)
+        try:
+            with mock.patch.object(windows_setup, 'state_objects', return_value=[child]), \
+                    mock.patch.object(windows_api, 'set_handle_dacl') as write:
+                with self.assertRaises(windows_api.WindowsApiError):
+                    backend._grant_state(PACKAGE_SID, windows_api.current_user_sid(), root)
+            write.assert_not_called()
+        finally:
+            windows_api.close_handle(root)
 
 
 class HandlePathTests(unittest.TestCase):
@@ -304,6 +375,10 @@ class HandlePathTests(unittest.TestCase):
         self.config = os.path.join(self.root, "loki")
         self.credentials = os.path.join(self.config, "credentials")
         self.state = os.path.join(self.root, "state")
+        os.makedirs(self.credentials)
+        os.mkdir(self.state)
+        os.mkdir(self.root + os.sep + 'elsewhere')
+        self.enterContext(real_directory_locations())
         for target, attribute in ((self.config, "loki_config_dir"),
                                   (self.state, "loki_state_dir"),
                                   (self.credentials, "credential_directory")):
@@ -312,29 +387,23 @@ class HandlePathTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def _named_by_handle(self, path):
-        return mock.patch.object(
-            windows_api, "final_path_from_handle", return_value=os.path.realpath(path))
-
     def test_refuses_the_credential_directory_through_the_handle(self):
-        with self._named_by_handle(self.credentials):
-            errors = windows_state.handle_path_errors(
-                object(), self.credentials)
+        with directory_handle(self.credentials) as handle:
+            errors = windows_state.handle_path_errors(handle, self.credentials)
         self.assertTrue(errors)
 
     def test_config_read_exception_is_bound_to_the_actual_handle(self):
-        with self._named_by_handle(self.config):
+        with directory_handle(self.config) as handle:
             self.assertEqual(windows_state.handle_path_errors(
-                object(), self.config, windows_state.Access.READ), [])
-        with self._named_by_handle(self.credentials):
+                handle, self.config, windows_state.Access.READ), [])
+        with directory_handle(self.credentials) as handle:
             self.assertTrue(windows_state.handle_path_errors(
-                object(), self.config, windows_state.Access.READ))
+                handle, self.config, windows_state.Access.READ))
 
     def test_allows_an_unrelated_directory_through_the_handle(self):
-        elsewhere = os.path.join(self.root, "elsewhere")
-        with self._named_by_handle(elsewhere):
-            self.assertEqual(
-                windows_state.handle_path_errors(object(), elsewhere), [])
+        elsewhere = self.root + os.sep + 'elsewhere'
+        with directory_handle(elsewhere) as handle:
+            self.assertEqual(windows_state.handle_path_errors(handle, elsewhere), [])
 
 
 class GrantHandleTests(unittest.TestCase):
@@ -382,6 +451,7 @@ class SecretWarningTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.home = temporary.name
+        self.enterContext(real_directory_locations())
         patch = mock.patch.object(
             windows_setup.os.path, "expanduser", return_value=self.home)
         patch.start()
@@ -408,37 +478,57 @@ class SecretWarningTests(unittest.TestCase):
 
 
 class NamingTests(unittest.TestCase):
-    def test_canonical_form_collapses_spellings_of_one_directory(self):
+    def setUp(self):
+        self.enterContext(real_directory_locations())
+
+    def test_workspace_key_is_shared_by_native_aliases(self):
         with tempfile.TemporaryDirectory() as root:
             child = os.path.join(root, "project")
             os.makedirs(child)
             link = os.path.join(root, "link")
-            try:
-                os.symlink(child, link, target_is_directory=True)
-            except OSError as error:
-                if getattr(error, 'winerror', None) != 1314:
-                    raise
-                self.skipTest('this Windows account cannot create symbolic links')
+            directory_alias(child, link)
 
             self.assertEqual(
-                windows_state.canonical_workspace(child),
-                windows_state.canonical_workspace(link))
+                windows_state.workspace_key(child),
+                windows_state.workspace_key(link))
             self.assertEqual(
-                windows_state.canonical_workspace(child),
-                windows_state.canonical_workspace(child + os.sep))
+                windows_state.workspace_key(child),
+                windows_state.workspace_key(child + os.sep))
             self.assertEqual(
-                windows_state.canonical_workspace(child),
-                windows_state.canonical_workspace(
+                windows_state.workspace_key(child),
+                windows_state.workspace_key(
                     os.path.join(child, "..", "project")))
 
     def test_profile_name_is_deterministic_and_usable(self):
-        first = windows_state.profile_name_for("/tmp/project")
-        second = windows_state.profile_name_for("/tmp/project")
+        with tempfile.TemporaryDirectory() as root:
+            project, other = root + os.sep + 'project', root + os.sep + 'other'
+            os.mkdir(project)
+            os.mkdir(other)
+            first = windows_state.profile_name_for(project)
+            self.assertEqual(first, windows_state.profile_name_for(project))
+            self.assertNotEqual(first, windows_state.profile_name_for(other))
+            self.assertTrue(windows_api.app_container_profile_name_is_usable(first))
 
-        self.assertEqual(first, second)
-        self.assertNotEqual(first, windows_state.profile_name_for("/tmp/other"))
-        self.assertTrue(
-            windows_api.app_container_profile_name_is_usable(first))
+    def test_directory_rename_keeps_the_workspace_key_and_profile(self):
+        with tempfile.TemporaryDirectory() as root:
+            original, renamed = root + os.sep + 'original', root + os.sep + 'renamed'
+            os.mkdir(original)
+            key = windows_state.workspace_key(original)
+            profile = windows_state.profile_name_for(original)
+            os.rename(original, renamed)
+            self.assertEqual(windows_state.workspace_key(renamed), key)
+            self.assertEqual(windows_state.profile_name_for(renamed), profile)
+
+    def test_case_distinct_objects_have_distinct_workspace_keys_and_profiles(self):
+        with tempfile.TemporaryDirectory() as root:
+            first, second = root + os.sep + 'Case', root + os.sep + 'case'
+            os.mkdir(first)
+            try:
+                os.mkdir(second)
+            except FileExistsError:
+                self.skipTest('this filesystem does not create case-distinct directories')
+            self.assertNotEqual(windows_state.workspace_key(first), windows_state.workspace_key(second))
+            self.assertNotEqual(windows_state.profile_name_for(first), windows_state.profile_name_for(second))
 
 
 class LedgerTests(unittest.TestCase):
@@ -464,6 +554,11 @@ class LedgerTests(unittest.TestCase):
                 json.dump({"workspaces": "not a mapping"}, stream)
             self.assertEqual(
                 windows_setup.load_ledger(corrupt)["workspaces"], {})
+
+    def test_recorded_workspace_label_preserves_the_callers_operand(self):
+        raw = 'relative/link/../workspace//'
+        entry = windows_state.ledger_entry(raw, 'profile', [])
+        self.assertEqual(entry['workspace'], raw)
 
 
 class PlanTests(unittest.TestCase):
@@ -497,27 +592,16 @@ class PlanTests(unittest.TestCase):
             windows_setup.build_plan(definition, previous).changes, [])
 
     def test_first_setup_can_plan_missing_config_without_creating_it(self):
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root, real_directory_locations():
             # A workspace grant must not cover the protected config/state trees.
-            workspace = os.path.join(root, "workspace")
+            workspace = root + os.sep + 'workspace'
             os.mkdir(workspace)
-            config = os.path.join(root, "config")
-            state = os.path.join(root, "state")
-            credentials = os.path.join(config, "credentials")
-
-            def existing_object(path):
-                if not os.path.isdir(path):
-                    raise windows_api.WindowsApiError(
-                        "directory is missing", status=windows_api.ERROR_PATH_NOT_FOUND)
-                return os.path.realpath(path)
-
+            config, state = root + os.sep + 'config', root + os.sep + 'state'
+            credentials = config + os.sep + 'credentials'
             definition = windows_state.Definition(workspace, [
-                windows_state.Grant(workspace, windows_state.Access.READ_WRITE, "workspace"),
-                windows_state.Grant(config, windows_state.Access.READ, "config")])
-            # Unlike realpath(), the native handle lookup refuses a missing
-            # directory. Model that failure so first setup is actually covered.
-            with mock.patch.object(windows_state, "_final_path", side_effect=existing_object), \
-                    mock.patch.object(windows_state.paths, "loki_config_dir", return_value=config), \
+                windows_state.Grant(workspace, windows_state.Access.READ_WRITE, 'workspace'),
+                windows_state.Grant(config, windows_state.Access.READ, 'config')])
+            with mock.patch.object(windows_state.paths, "loki_config_dir", return_value=config), \
                     mock.patch.object(windows_state.paths, "loki_state_dir", return_value=state), \
                     mock.patch.object(windows_state.paths, "credential_directory",
                                       return_value=credentials):
@@ -528,13 +612,14 @@ class PlanTests(unittest.TestCase):
             self.assertFalse(os.path.exists(state))
 
     def test_protected_paths_are_errors_and_block_apply(self):
-        with tempfile.TemporaryDirectory() as root:
-            credentials = os.path.join(root, "credentials")
-            with mock.patch.object(
-                    windows_state, "_runtime_trees", return_value=[credentials]):
-                plan = windows_setup.build_plan(
-                    self.definition(self.grant(root)), None)
-
+        with tempfile.TemporaryDirectory() as root, real_directory_locations():
+            credentials = root + os.sep + 'credentials'
+            os.mkdir(credentials)
+            selected = windows_state._directory_location(credentials)
+            roots = {'configuration': None, 'state': None, 'credentials': selected}
+            with mock.patch.object(windows_state, '_root_locations', return_value=roots):
+                definition = windows_state.Definition(root, [self.grant(root)])
+                plan = windows_setup.build_plan(definition, None)
         self.assertFalse(plan.applicable)
         self.assertTrue(plan.errors)
 
@@ -697,6 +782,31 @@ class FakeBackend:
 
 
 class NativeCleanupClassificationTests(unittest.TestCase):
+    def test_optional_root_cannot_disappear_after_cleanup_failure(self):
+        failure = windows_api.WindowsResourceError('CloseHandle failed', status=windows_api.ERROR_FILE_NOT_FOUND)
+        with mock.patch.object(windows_state, '_directory_location', side_effect=failure):
+            with self.assertRaises(windows_api.WindowsResourceError) as caught:
+                windows_state._optional_location('configured-operand')
+        self.assertIs(caught.exception, failure)
+
+    def test_automatic_preflight_cannot_accept_cleanup_failure_as_missing(self):
+        failure = windows_api.WindowsResourceError('CloseHandle failed', status=windows_api.ERROR_PATH_NOT_FOUND)
+        with mock.patch.object(windows_state.paths, 'loki_config_dir', return_value='configured-operand'), \
+                mock.patch.object(windows_state, '_directory_location', side_effect=failure):
+            errors = windows_state.protected_path_errors(
+                'configured-operand', windows_state.Access.READ, origin='config')
+        self.assertTrue(errors)
+        self.assertIn('CloseHandle failed', errors[0])
+
+    def test_cleanup_failure_cannot_create_a_pending_default_identity(self):
+        failure = windows_api.WindowsResourceError('CloseHandle failed', status=windows_api.ERROR_PATH_NOT_FOUND)
+        grant = windows_state.Grant('configured-operand', windows_state.Access.READ, 'config')
+        with mock.patch.object(windows_state.paths, 'loki_config_dir', return_value=grant.path), \
+                mock.patch.object(windows_state, '_directory_identity', side_effect=failure):
+            with self.assertRaises(windows_api.WindowsResourceError) as caught:
+                windows_state._grant_identity(grant)
+        self.assertIs(caught.exception, failure)
+
     def test_profile_cleanup_failure_cannot_trigger_an_already_exists_fallback(self):
         failure = windows_api.WindowsResourceError(
             'LocalFree failed', status=windows_containers.PROFILE_ALREADY_EXISTS)
@@ -736,7 +846,11 @@ class ConfigureCommandTests(unittest.TestCase):
         return code, output.getvalue(), backend
 
     def test_configure_applies_the_same_automatic_grants_as_the_editor(self):
-        code, output, backend = self.configure(["/work"])
+        def programs(*, automatic_read=False):
+            return ['/runtime-a', '/runtime-b'] + ([] if automatic_read else ['/editor'])
+
+        with mock.patch.object(windows_state, 'program_directories', side_effect=programs):
+            code, output, backend = self.configure(["/work"])
 
         self.assertEqual(code, 0)
         self.assertIn("pass: profile", output)
@@ -745,6 +859,8 @@ class ConfigureCommandTests(unittest.TestCase):
         self.assertEqual(definition.workspace, "/work")
         self.assertEqual([grant.origin for grant in definition.grants],
                          ["workspace", "config", "state", "runtime", "runtime"])
+        self.assertEqual([grant.path for grant in definition.grants if grant.origin == 'runtime'],
+                         ['/runtime-a', '/runtime-b'])
 
     def test_a_failing_check_is_a_nonzero_exit(self):
         class Failing(FakeBackend):

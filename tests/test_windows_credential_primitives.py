@@ -237,7 +237,7 @@ class GrantHandlePrimitiveTests(unittest.TestCase):
 
     The portable tests in ``test_windows_setup`` substitute these calls; this is
     where ``open_directory_for_acl``, ``handle_dacl_sddl`` and
-    ``set_handle_dacl_sddl`` actually run.  A grant binds the containment check,
+    ``set_handle_dacl`` actually run. A grant binds the containment check,
     the DACL read and the DACL write to one handle so a junction swapped into
     the operand cannot move the decision or the write to a different object.
     """
@@ -261,9 +261,8 @@ class GrantHandlePrimitiveTests(unittest.TestCase):
         # not.
         handle = windows_api.open_directory_for_acl(str(self.target))
         try:
-            self.assertEqual(
-                os.path.normcase(windows_api.final_path_from_handle(handle)),
-                os.path.normcase(str(self.target)))
+            identity = windows_api.file_identity(handle)
+            self.assertEqual(identity, windows_state.workspace_key(str(self.target)))
             current = windows_api.handle_dacl_sddl(handle)
             moved = self.root / 'moved'
             os.rename(self.target, moved)
@@ -271,9 +270,9 @@ class GrantHandlePrimitiveTests(unittest.TestCase):
             updated = windows_state.add_package_ace(
                 current, self.package, windows_state.Access.READ_WRITE)
             windows_containers.set_handle_dacl_sddl(handle, updated)
-            self.assertEqual(
-                os.path.normcase(windows_api.final_path_from_handle(handle)),
-                os.path.normcase(str(moved)))
+            self.assertEqual(windows_api.file_identity(handle), identity)
+            self.assertEqual(windows_state.workspace_key(str(moved)), identity)
+            self.assertNotEqual(windows_state.workspace_key(str(self.target)), identity)
         finally:
             windows_api.close_handle(handle)
         moved_dacl = windows_api.dacl_sddl(str(moved))
@@ -294,13 +293,16 @@ class GrantHandlePrimitiveTests(unittest.TestCase):
         # message names the right the query needs.
         handle = windows_api.open_directory_handle(str(self.target))
         try:
-            final = windows_api.final_path_from_handle(handle)
+            final = windows_api.kernel_path_from_handle(handle)
+            identity = windows_api.file_identity(handle)
+            reopened = windows_api.open_directory_handle(final)
+            try:
+                self.assertEqual(windows_api.file_identity(reopened), identity)
+            finally:
+                windows_api.close_handle(reopened)
         finally:
             windows_api.close_handle(handle)
-        print(json.dumps({'operation': 'identity_open_final_path',
-                          'final': final}), flush=True)
-        self.assertEqual(
-            os.path.normcase(final), os.path.normcase(str(self.target)))
+        print(json.dumps({'operation': 'identity_open_kernel_name', 'name': final}), flush=True)
 
     def test_a_grant_reads_and_writes_the_dacl_of_its_handle(self):
         handle = windows_api.open_directory_for_acl(str(self.target))
