@@ -613,7 +613,14 @@ def canonical_sid(text: str) -> str:
 # gives a value only for TokenUser (1), so these two numbers are from the
 # header and are not confirmed by that page.
 TOKEN_IS_APP_CONTAINER_CLASS = 29
+TOKEN_CAPABILITIES_CLASS = 30
 TOKEN_APP_CONTAINER_SID_CLASS = 31
+
+# Well-known capability SIDs (winnt.h / app capability declarations). The
+# trusted runtime chooses these; declaring them here grants no authority.
+INTERNET_CLIENT_SERVER_SID = 'S-1-15-3-2'
+PRIVATE_NETWORK_CLIENT_SERVER_SID = 'S-1-15-3-3'
+SE_GROUP_ENABLED = 0x00000004
 
 
 # PROCESS_ACCESS_RIGHTS, from
@@ -1021,18 +1028,18 @@ class _TokenGroups(ctypes.Structure):
     _fields_ = [('count', ctypes.c_uint32), ('first', _SidAttributes)]
 
 
-def _token_groups(token, kind):
+def _token_groups(token, kind, name='TokenGroups'):
     query = _get_token_information()
     size = wintypes.DWORD()
     query(token, kind, None, 0, ctypes.byref(size))
     if size.value < ctypes.sizeof(ctypes.c_uint32):
-        raise WindowsApiError('GetTokenInformation(TokenRestrictedSids) sizing failed', status=ctypes.get_last_error())
+        raise WindowsApiError(f'GetTokenInformation({name}) sizing failed', status=ctypes.get_last_error())
     storage = ctypes.create_string_buffer(size.value)
     if not query(token, kind, storage, len(storage), ctypes.byref(size)):
-        raise WindowsApiError('GetTokenInformation(TokenRestrictedSids) failed', status=ctypes.get_last_error())
+        raise WindowsApiError(f'GetTokenInformation({name}) failed', status=ctypes.get_last_error())
     count = ctypes.c_uint32.from_buffer(storage).value
     if count and _TokenGroups.first.offset + count * ctypes.sizeof(_SidAttributes) > len(storage):
-        raise WindowsApiError('TokenRestrictedSids returned a short group buffer')
+        raise WindowsApiError(f'{name} returned a short group buffer')
     entries = [_SidAttributes.from_buffer(storage, _TokenGroups.first.offset + i * ctypes.sizeof(_SidAttributes))
                for i in range(count)]
     return sorted([sid_text(entry.sid), entry.attributes] for entry in entries)
@@ -1040,7 +1047,12 @@ def _token_groups(token, kind):
 
 def token_restricting_sids(token):
     """Read the restricting identities/attributes for pre-resume comparison."""
-    return _token_groups(token, TOKEN_RESTRICTED_SIDS_CLASS)
+    return _token_groups(token, TOKEN_RESTRICTED_SIDS_CLASS, 'TokenRestrictedSids')
+
+
+def token_capabilities(token):
+    """Read actual capability identities/attributes, including local inheritance."""
+    return _token_groups(token, TOKEN_CAPABILITIES_CLASS, 'TokenCapabilities')
 
 
 def token_logon_sid(token):
@@ -1342,7 +1354,7 @@ def create_process_in_app_container(executable, arguments, package_sid,
                                     current_directory=None,
                                     inherited_handles=None, environment=None,
                                     standard_handles=None, pseudoconsole=None, *,
-                                    information, primary_token=None, object_security=None):
+                                    information, primary_token=None, object_security=None, capability_sids=None):
     """Create ``executable`` suspended inside the AppContainer ``package_sid``.
 
     When supplied, ``package_sid`` is the package SID in string form, as
@@ -1357,6 +1369,9 @@ def create_process_in_app_container(executable, arguments, package_sid,
     ``package_sid=None`` is allowed only with a supplied token that already has
     the intended AppContainer identity: no new lowbox attributes are then added.
     The caller must verify the actual child, not infer authority from its argv.
+    ``capability_sids`` supplies explicitly selected capabilities only for an
+    initial package launch. An inherited token keeps its actual capabilities;
+    this primitive adds none by default and cannot widen a local token launch.
     ``object_security`` is optional SDDL applied to both the process and initial
     thread at creation. Suspension prevents execution, not foreign handle opens,
     so tightening those objects only afterwards cannot provide that boundary.
@@ -1379,14 +1394,15 @@ def create_process_in_app_container(executable, arguments, package_sid,
     return create_process_suspended(
         executable, arguments, package_sid, current_directory, inherited_handles,
         environment, standard_handles, pseudoconsole,
-        information=information, primary_token=primary_token, object_security=object_security)
+        information=information, primary_token=primary_token, object_security=object_security,
+        capability_sids=capability_sids)
 
 
 def create_process_suspended(executable, arguments, package_sid=None,
                              current_directory=None, inherited_handles=None,
                              environment=None, standard_handles=None, pseudoconsole=None, *,
                              information, primary_token=None, object_security=None, creationflags=0,
-                             search_path=False):
+                             search_path=False, capability_sids=None):
     """One native creation path, writing into its caller's existing owner.
 
     No new lowbox attributes means retaining the supplied token/caller context,
@@ -1422,8 +1438,12 @@ def create_process_suspended(executable, arguments, package_sid=None,
         create = bind("advapi32", "CreateProcessAsUserW", wintypes.BOOL,
                       ctypes.c_void_p, *parameters)
 
+    if capability_sids and package_sid is None:
+        raise ValueError('new capabilities require an initial AppContainer identity')
     sid = ctypes.c_void_p()
     sid_acquired = False
+    capability_pointers = []
+    capability_array = None
     # The list must be sized for every attribute it will receive: one when a
     # package SID is supplied, one when handles are inherited, and one when the
     # child is attached to a pseudoconsole. Sizing it for fewer and adding more
@@ -1439,11 +1459,21 @@ def create_process_suspended(executable, arguments, package_sid=None,
             if not convert_sid(package_sid, ctypes.byref(sid)):
                 raise WindowsApiError(f"ConvertStringSidToSidW({package_sid!r}) failed")
             sid_acquired = True
+        for capability_sid in capability_sids or []:
+            pointer = ctypes.c_void_p()
+            if not convert_sid(capability_sid, ctypes.byref(pointer)):
+                # Failed native outputs are not acquired allocations, even if
+                # the failed call left a nonzero value in the output slot.
+                raise WindowsApiError(f'ConvertStringSidToSidW({capability_sid!r}) failed')
+            capability_pointers.append(pointer)
+        if capability_pointers:
+            capability_array = (_SidAttributes * len(capability_pointers))(
+                *[_SidAttributes(pointer, SE_GROUP_ENABLED) for pointer in capability_pointers])
         if attribute_count:
             # Sizing is documented to fail with ERROR_INSUFFICIENT_BUFFER
             # while filling the size; another failure leaves no usable size.
             initialize(None, attribute_count, 0, ctypes.byref(size))
-            if not size.value:
+            if ctypes.get_last_error() != 122 or not size.value:
                 raise WindowsApiError(
                     "InitializeProcThreadAttributeList sizing failed")
             attribute_storage = ctypes.create_string_buffer(size.value)
@@ -1456,7 +1486,9 @@ def create_process_suspended(executable, arguments, package_sid=None,
         if package_sid is not None:
             # Both the entry array and its owned SID allocations remain live
             # through CreateProcess, not merely UpdateProcThreadAttribute.
-            capabilities = SecurityCapabilities(sid, None, 0, 0)
+            capabilities = SecurityCapabilities(
+                sid, ctypes.cast(capability_array, ctypes.c_void_p) if capability_array is not None else None,
+                len(capability_pointers), 0)
             if not update(attribute_list, 0,
                           ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
                           ctypes.byref(capabilities),
@@ -1527,6 +1559,9 @@ def create_process_suspended(executable, arguments, package_sid=None,
         with ExitStack() as cleanup:
             if sid_acquired:
                 cleanup.callback(local_free, sid)
+            for pointer in capability_pointers:
+                if pointer.value:
+                    cleanup.callback(local_free, pointer)
             # Only temporary native buffers belong here. Child handles are
             # already held by the caller, including cleanup interruption.
             # Object security is independent of the attribute list and has

@@ -914,7 +914,8 @@ class TokenAclHelpersTests(unittest.TestCase):
         size = windows_api._TokenGroups.first.offset + 2 * ctypes.sizeof(windows_api._SidAttributes)
 
         def query(token, kind, buffer, length, returned):
-            self.assertEqual(kind, windows_api.TOKEN_RESTRICTED_SIDS_CLASS)
+            self.assertIn(kind, [windows_api.TOKEN_RESTRICTED_SIDS_CLASS,
+                                 windows_api.TOKEN_CAPABILITIES_CLASS])
             ctypes.cast(returned, ctypes.POINTER(wintypes.DWORD))[0] = size
             if buffer is None:
                 return False
@@ -926,7 +927,8 @@ class TokenAclHelpersTests(unittest.TestCase):
 
         with mock.patch.object(windows_api, '_get_token_information', return_value=query), \
                 mock.patch.object(windows_api, 'sid_text', side_effect=lambda sid: str(sid)):
-            self.assertEqual(windows_api.token_restricting_sids(42), [['101', 1], ['202', 0]])
+            for readback in [windows_api.token_restricting_sids, windows_api.token_capabilities]:
+                self.assertEqual(readback(42), [['101', 1], ['202', 0]])
 
     def test_generic_call_keeps_command_cwd_group_and_suspension_separate(self):
         create = mock.Mock(return_value=True)
@@ -1097,234 +1099,216 @@ class OwningCreationTests(unittest.TestCase):
 
 
 class AppContainerLaunchTests(unittest.TestCase):
-    def test_launch_carries_security_capabilities_and_leaves_the_child_suspended(self):
-        seen = {"attributes": []}
+    @contextlib.contextmanager
+    def native_calls(self, *, denied_capability=None, sizing_error=122, sizing_size=256):
+        seen = {'attributes': [], 'counts': [], 'sids': [], 'freed': [], 'creations': [], 'error': 5}
+        pending_attributes = []
 
         def convert_sid(string_sid, out):
-            seen["sid"] = string_sid
-            ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p))[0] = 0xABCD
+            pointer = 0xABCD + len(seen['sids']) * 0x100
+            seen['sids'].append(string_sid)
+            if string_sid == denied_capability:
+                ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p))[0] = 0xBAD
+                return False
+            ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p))[0] = pointer
             return True
 
         def initialize(attribute_list, count, flags, size):
-            seen.setdefault("counts", []).append(count)
-            ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = 256
+            seen['counts'].append(count)
+            seen['error'] = sizing_error if attribute_list is None else 5
+            ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = sizing_size
             return attribute_list is not None
 
-        def update(attribute_list, flags, attribute, value, size, previous,
-                   returned):
-            seen["attributes"].append((flags, attribute, value, size))
+        def update(attribute_list, flags, attribute, value, size, previous, returned):
+            seen['attributes'].append([flags, attribute, size])
+            pending_attributes.append([attribute, value, size])
             return True
 
         def delete(attribute_list):
-            seen["deleted"] = True
+            seen['deleted'] = True
 
         def local_free(pointer):
-            seen["freed"] = True
+            seen['freed'].append(pointer.value)
 
         def create(application, command_line, process_attributes,
                    thread_attributes, inherit, flags, environment, directory,
                    startup, information):
-            seen["flags"] = flags
-            seen["inherit"] = inherit
-            seen["command_line"] = command_line.value
-            process = ctypes.cast(
-                information,
-                ctypes.POINTER(windows_api.ProcessInformation)).contents
+            seen['creations'].append(application)
+            self.assertIsNone(process_attributes)
+            self.assertIsNone(thread_attributes)
+            seen['flags'] = flags
+            seen['inherit'] = inherit
+            seen['command_line'] = command_line.value
+            seen['directory'] = directory
+            seen['environment'] = None if environment is None else bytes(environment)
+            # Snapshot every borrowed array at the consuming native call, never
+            # dereference its storage after creation or SID cleanup has returned.
+            self.assertFalse(seen['freed'])
+            for attribute, value, size in pending_attributes:
+                if attribute == windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES:
+                    capabilities = ctypes.cast(value, ctypes.POINTER(windows_api.SecurityCapabilities)).contents
+                    entries = ctypes.cast(capabilities.Capabilities, ctypes.POINTER(windows_api._SidAttributes))
+                    seen['package_sid_at_create'] = capabilities.AppContainerSid
+                    seen['capability_count_at_create'] = capabilities.CapabilityCount
+                    seen['capabilities_at_create'] = [
+                        [entries[index].sid, entries[index].attributes]
+                        for index in range(capabilities.CapabilityCount)]
+                elif attribute == windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST:
+                    handles = ctypes.cast(value, ctypes.POINTER(ctypes.c_void_p))
+                    seen['handles_at_create'] = [handles[index] for index in range(size // ctypes.sizeof(ctypes.c_void_p))]
+                elif attribute == windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE:
+                    seen['pseudoconsole_at_create'] = value.value
+            initial = ctypes.cast(startup, ctypes.POINTER(windows_api.StartupInfoEx)).contents.StartupInfo
+            seen['startup_flags'] = initial.dwFlags
+            seen['standard_handles'] = [initial.hStdInput, initial.hStdOutput, initial.hStdError]
+            process = ctypes.cast(information, ctypes.POINTER(windows_api.ProcessInformation)).contents
+            seen['output_address'] = ctypes.addressof(process)
             process.hProcess = 1
             process.hThread = 2
             process.dwProcessId = 3
             return True
 
         fakes = {
-            "ConvertStringSidToSidW": convert_sid,
-            "LocalFree": local_free,
-            "InitializeProcThreadAttributeList": initialize,
-            "UpdateProcThreadAttribute": update,
-            "DeleteProcThreadAttributeList": delete,
-            "CreateProcessW": create,
+            'ConvertStringSidToSidW': convert_sid,
+            'LocalFree': local_free,
+            'InitializeProcThreadAttributeList': initialize,
+            'UpdateProcThreadAttribute': update,
+            'DeleteProcThreadAttributeList': delete,
+            'CreateProcessW': create,
         }
-        with mock.patch.object(
-                windows_api, "bind",
-                side_effect=lambda library, symbol, *rest: fakes[symbol]):
+        with mock.patch.object(windows_api, 'bind', side_effect=lambda library, symbol, *rest: fakes[symbol]), \
+                mock.patch.object(ctypes, 'get_last_error', side_effect=lambda: seen['error'], create=True):
+            yield seen
+
+    def launch(self, arguments, **options):
+        with self.native_calls() as seen:
             information = windows_api.create_process_in_app_container(
-                "loki.exe", ["--runtime", "x"], "S-1-15-2-1", information=windows_api.ProcessInformation())
-
+                'loki.exe', arguments, 'S-1-15-2-1', **options, information=windows_api.ProcessInformation())
         self.assertEqual(information.dwProcessId, 3)
-        self.assertEqual(seen["sid"], "S-1-15-2-1")
-        self.assertTrue(seen["deleted"])
-        self.assertTrue(seen["freed"])
-        self.assertFalse(seen["inherit"])
-        self.assertTrue(
-            seen["flags"] & windows_api.CreateProcessFlags.CREATE_SUSPENDED)
-        self.assertTrue(
-            seen["flags"]
-            & windows_api.CreateProcessFlags.EXTENDED_STARTUPINFO_PRESENT)
-        self.assertIn("loki.exe", seen["command_line"])
+        self.assertEqual(information.hProcess, 1)
+        self.assertEqual(information.hThread, 2)
+        self.assertEqual(seen['creations'], ['loki.exe'])
+        self.assertTrue(seen['deleted'])
+        self.assertTrue(seen['freed'])
+        self.assertTrue(seen['flags'] & windows_api.CreateProcessFlags.CREATE_SUSPENDED)
+        self.assertTrue(seen['flags'] & windows_api.CreateProcessFlags.EXTENDED_STARTUPINFO_PRESENT)
+        self.assertIn('loki.exe', seen['command_line'])
+        self.assertTrue(all(flags == 0 for flags, attribute, size in seen['attributes']),
+                        'dwFlags must precede the attribute id')
+        self.assertEqual(seen['package_sid_at_create'], 0xABCD)
+        return seen
 
-        capabilities_calls = [
-            call for call in seen["attributes"]
-            if call[1] == windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES]
-        self.assertEqual(len(capabilities_calls), 1)
-        flags, attribute, value, size = capabilities_calls[0]
-        self.assertEqual(flags, 0, "dwFlags must precede the attribute id")
-        self.assertEqual(size, ctypes.sizeof(windows_api.SecurityCapabilities))
-        capabilities = ctypes.cast(
-            value, ctypes.POINTER(windows_api.SecurityCapabilities)).contents
-        self.assertEqual(capabilities.AppContainerSid, 0xABCD)
-        self.assertEqual(capabilities.CapabilityCount, 0)
-        self.assertEqual(seen["counts"], [1, 1],
-                         "the list is sized for exactly the attributes set")
+    def test_suspended_launch_capabilities_handles_console_and_environment_workflow(self):
+        seen = self.launch(['--runtime', 'x'], capability_sids=[
+            windows_api.INTERNET_CLIENT_SERVER_SID, windows_api.PRIVATE_NETWORK_CLIENT_SERVER_SID])
+        self.assertEqual(seen['sids'], [
+            'S-1-15-2-1', windows_api.INTERNET_CLIENT_SERVER_SID, windows_api.PRIVATE_NETWORK_CLIENT_SERVER_SID])
+        self.assertCountEqual(seen['freed'], [0xABCD, 0xACCD, 0xADCD])
+        self.assertEqual(seen['capabilities_at_create'], [
+            [0xACCD, windows_api.SE_GROUP_ENABLED], [0xADCD, windows_api.SE_GROUP_ENABLED]])
+        self.assertEqual(seen['capability_count_at_create'], 2)
+        self.assertFalse(seen['inherit'])
+        self.assertEqual(seen['counts'], [1, 1], 'the list is sized for exactly the attributes set')
+        self.assertEqual(seen['attributes'], [[
+            0, windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            ctypes.sizeof(windows_api.SecurityCapabilities)]])
 
-    def test_inherited_handles_size_the_attribute_list_for_two(self):
-        seen = {"attributes": [], "counts": []}
+        # Still separate native creations: collapsing these into an all-options
+        # launch would lose the zero-capability default and exact list sizes.
+        seen = self.launch(['--runtime'], inherited_handles=[0x11])
+        self.assertEqual(seen['counts'], [2, 2])
+        self.assertEqual(seen['sids'], ['S-1-15-2-1'])
+        self.assertEqual(seen['freed'], [0xABCD])
+        self.assertEqual(seen['capability_count_at_create'], 0)
+        self.assertEqual(seen['capabilities_at_create'], [])
+        self.assertTrue(seen['inherit'])
+        self.assertEqual(seen['handles_at_create'], [0x11])
+        self.assertEqual([attribute for flags, attribute, size in seen['attributes']], [
+            windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST])
 
-        def convert_sid(string_sid, out):
-            ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p))[0] = 0xABCD
-            return True
+        seen = self.launch(['--runtime'], inherited_handles=[0x11], pseudoconsole=0x1234)
+        self.assertEqual(seen['counts'], [3, 3],
+                         'the list is sized for the package SID, the handle list and the pseudoconsole')
+        self.assertEqual([attribute for flags, attribute, size in seen['attributes']], [
+            windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE])
+        self.assertEqual(seen['handles_at_create'], [0x11])
+        self.assertEqual(seen['pseudoconsole_at_create'], 0x1234)
+        self.assertTrue(seen['inherit'])
+        self.assertEqual(seen['freed'], [0xABCD])
 
-        def initialize(attribute_list, count, flags, size):
-            seen["counts"].append(count)
-            ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = 256
-            return attribute_list is not None
+        seen = self.launch(['--runtime'], environment={'Path': 'C:\\bin', 'LOCALAPPDATA': 'C:\\local'},
+                           current_directory='D:\\work\\ws')
+        self.assertEqual(seen['counts'], [1, 1])
+        self.assertEqual(seen['directory'], 'D:\\work\\ws')
+        self.assertFalse(seen['inherit'])
+        self.assertEqual(seen['freed'], [0xABCD])
+        # wchar_t is 2 bytes on Windows and 4 on this host. The explicit block
+        # remains sorted and contains no ambient per-drive current directory.
+        encoding = 'utf-16-le' if ctypes.sizeof(ctypes.c_wchar) == 2 else 'utf-32-le'
+        text = seen['environment'].decode(encoding)
+        self.assertIn('LOCALAPPDATA=C:\\local\0Path=C:\\bin', text)
+        self.assertNotIn('=' + 'D:', text.split('\0', 1)[0])
+        self.assertTrue(text.startswith('LOCALAPPDATA='), repr(text))
 
-        def update(attribute_list, flags, attribute, value, size, previous,
-                   returned):
-            seen["attributes"].append((flags, attribute))
-            return True
+        # The standalone test harness uses this same creator without lowbox
+        # attributes. Its owner exists before native buffers can be released.
+        information = windows_api.ProcessInformation()
+        with self.native_calls() as seen:
+            windows_api.create_process_suspended(
+                'chosen loki.exe', ['--test', 'two words'], information=information,
+                pseudoconsole=0x1234, standard_handles=[None, None, None],
+                environment={'A': 'B'}, current_directory='D:\\work\\ws')
+        self.assertEqual(seen['output_address'], ctypes.addressof(information))
+        self.assertEqual([information.hProcess, information.hThread], [1, 2])
+        self.assertEqual(seen['creations'], ['chosen loki.exe'])
+        self.assertEqual(seen['command_line'], '"chosen loki.exe" --test "two words"')
+        self.assertEqual(seen['counts'], [1, 1])
+        self.assertEqual(seen['attributes'], [[0, windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                                               ctypes.sizeof(ctypes.c_void_p)]])
+        self.assertEqual(seen['pseudoconsole_at_create'], 0x1234)
+        self.assertEqual(seen['startup_flags'], windows_api.StartupInfoFlags.STARTF_USESTDHANDLES)
+        self.assertEqual(seen['standard_handles'], [None, None, None])
+        self.assertEqual(seen['sids'], [])
+        self.assertEqual(seen['freed'], [])
+        self.assertFalse(seen['inherit'])
+        self.assertEqual(seen['directory'], 'D:\\work\\ws')
+        self.assertEqual(seen['environment'].decode(encoding), 'A=B\0\0\0')
+        self.assertTrue(seen['flags'] & windows_api.CreateProcessFlags.CREATE_SUSPENDED)
+        self.assertTrue(seen['flags'] & windows_api.CreateProcessFlags.EXTENDED_STARTUPINFO_PRESENT)
+        self.assertTrue(seen['flags'] & windows_api.CreateProcessFlags.CREATE_UNICODE_ENVIRONMENT)
 
-        def delete(attribute_list):
-            pass
+    def _assert_sizing_refused(self, **options):
+        with self.native_calls(**options) as seen:
+            with self.assertRaises(windows_api.WindowsApiError):
+                windows_api.create_process_suspended(
+                    'chosen-loki.exe', [], package_sid='package', information=windows_api.ProcessInformation())
+        self.assertEqual(seen['counts'], [1])
+        self.assertEqual(seen['freed'], [0xABCD])
+        self.assertEqual(seen['creations'], [])
+        self.assertEqual(seen['attributes'], [])
+        self.assertNotIn('deleted', seen)
 
-        def local_free(pointer):
-            pass
+    def test_wrong_attribute_sizing_error_is_not_a_usable_list_size(self):
+        self._assert_sizing_refused(sizing_error=5)
 
-        def create(application, command_line, process_attributes,
-                   thread_attributes, inherit, flags, environment, directory,
-                   startup, information):
-            seen["inherit"] = inherit
-            return True
+    def test_empty_attribute_list_size_is_refused(self):
+        self._assert_sizing_refused(sizing_size=0)
 
-        fakes = {
-            "ConvertStringSidToSidW": convert_sid,
-            "LocalFree": local_free,
-            "InitializeProcThreadAttributeList": initialize,
-            "UpdateProcThreadAttribute": update,
-            "DeleteProcThreadAttributeList": delete,
-            "CreateProcessW": create,
-        }
-        with mock.patch.object(
-                windows_api, "bind",
-                side_effect=lambda library, symbol, *rest: fakes[symbol]):
-            windows_api.create_process_in_app_container(
-                "loki.exe", ["--runtime"], "S-1-15-2-1",
-                inherited_handles=[0x11], information=windows_api.ProcessInformation())
-
-        self.assertEqual(seen["counts"], [2, 2])
-        self.assertTrue(seen["inherit"])
-        self.assertEqual(
-            [attribute for _, attribute in seen["attributes"]],
-            [windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-             windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST])
-
-    def test_pseudoconsole_adds_a_third_attribute(self):
-        seen = {"attributes": [], "counts": []}
-
-        def convert_sid(string_sid, out):
-            ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p))[0] = 0xABCD
-            return True
-
-        def initialize(attribute_list, count, flags, size):
-            seen["counts"].append(count)
-            ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = 256
-            return attribute_list is not None
-
-        def update(attribute_list, flags, attribute, value, size, previous,
-                   returned):
-            seen["attributes"].append((flags, attribute))
-            return True
-
-        def create(application, command_line, process_attributes,
-                   thread_attributes, inherit, flags, environment, directory,
-                   startup, information):
-            return True
-
-        fakes = {
-            "ConvertStringSidToSidW": convert_sid,
-            "LocalFree": lambda pointer: None,
-            "InitializeProcThreadAttributeList": initialize,
-            "UpdateProcThreadAttribute": update,
-            "DeleteProcThreadAttributeList": lambda attribute_list: None,
-            "CreateProcessW": create,
-        }
-        with mock.patch.object(
-                windows_api, "bind",
-                side_effect=lambda library, symbol, *rest: fakes[symbol]):
-            windows_api.create_process_in_app_container(
-                "loki.exe", ["--runtime"], "S-1-15-2-1",
-                inherited_handles=[0x11], pseudoconsole=0x1234, information=windows_api.ProcessInformation())
-
-        self.assertEqual(seen["counts"], [3, 3],
-                         "the list is sized for the package SID, the handle "
-                         "list and the pseudoconsole")
-        self.assertEqual(
-            [attribute for _, attribute in seen["attributes"]],
-            [windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-             windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-             windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE])
-
-    def test_environment_block_carries_the_given_variables_only(self):
-        seen = {}
-
-        def convert_sid(string_sid, out):
-            ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p))[0] = 0xABCD
-            return True
-
-        def initialize(attribute_list, count, flags, size):
-            ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = 256
-            return attribute_list is not None
-
-        def update(*arguments):
-            return True
-
-        def create(application, command_line, process_attributes,
-                   thread_attributes, inherit, flags, environment, directory,
-                   startup, information):
-            seen["environment"] = bytes(environment)
-            process = ctypes.cast(
-                information,
-                ctypes.POINTER(windows_api.ProcessInformation)).contents
-            process.hProcess = 1
-            process.hThread = 2
-            process.dwProcessId = 3
-            return True
-
-        fakes = {
-            "ConvertStringSidToSidW": convert_sid,
-            "LocalFree": lambda pointer: None,
-            "InitializeProcThreadAttributeList": initialize,
-            "UpdateProcThreadAttribute": update,
-            "DeleteProcThreadAttributeList": lambda attribute_list: None,
-            "CreateProcessW": create,
-        }
-
-        with mock.patch.object(
-                windows_api, "bind",
-                side_effect=lambda library, symbol, *rest: fakes[symbol]):
-            windows_api.create_process_in_app_container(
-                "loki.exe", ["--runtime"], "S-1-15-2-1",
-                environment={"Path": "C:\\bin", "LOCALAPPDATA": "C:\\local"},
-                current_directory="D:\\work\\ws", information=windows_api.ProcessInformation())
-        # wchar_t is 2 bytes on Windows and 4 on this host.
-        width = ctypes.sizeof(ctypes.c_wchar)
-        encoding = "utf-16-le" if width == 2 else "utf-32-le"
-        text = seen["environment"].decode(encoding)
-        # The block is the given variables, sorted, and nothing else: no
-        # per-drive entry -- a plain CreateProcessW starts without one
-        # (tests/test_windows_primitives.py, environment_203_probe).  Trailing
-        # NULs are padding from the decoded buffer, so compare what is there.
-        self.assertIn("LOCALAPPDATA=C:\\local\0Path=C:\\bin", text)
-        self.assertNotIn("=" + "D:", text.split("\0", 1)[0])
-        self.assertTrue(text.startswith("LOCALAPPDATA="), repr(text))
+    def test_denied_capability_releases_acquired_sids_without_a_reduced_retry(self):
+        with self.native_calls(denied_capability=windows_api.PRIVATE_NETWORK_CLIENT_SERVER_SID) as seen:
+            with self.assertRaises(windows_api.WindowsApiError):
+                windows_api.create_process_in_app_container(
+                    'loki.exe', [], 'S-1-15-2-1', capability_sids=[
+                        windows_api.INTERNET_CLIENT_SERVER_SID, windows_api.PRIVATE_NETWORK_CLIENT_SERVER_SID], information=windows_api.ProcessInformation())
+        self.assertEqual(seen['sids'], [
+            'S-1-15-2-1', windows_api.INTERNET_CLIENT_SERVER_SID, windows_api.PRIVATE_NETWORK_CLIENT_SERVER_SID])
+        self.assertFalse(seen['creations'])
+        self.assertNotIn('flags', seen)
+        self.assertFalse(seen['attributes'])
+        self.assertCountEqual(seen['freed'], [0xABCD, 0xACCD])
 
 
 class FileAccessTests(unittest.TestCase):

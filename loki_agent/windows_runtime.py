@@ -26,6 +26,15 @@ WORKSPACE_ENV = "LOKI_CONTAINER_WORKSPACE"
 # child's own gate to compare against -- see verify_runtime.
 PACKAGE_ENV = "LOKI_CONTAINER_PACKAGE_SID"
 
+# Normal development needs package downloads and local/network servers as well
+# as inference HTTP. These fixed capabilities cover the process family, not an
+# agent-selectable policy. The user's firewall and application bind addresses
+# still govern exposure; no firewall rule or loopback exemption is installed.
+_NETWORK_CAPABILITIES = frozenset([
+    api.INTERNET_CLIENT_SERVER_SID,
+    api.PRIVATE_NETWORK_CLIENT_SERVER_SID,
+])
+
 # The contained runtime's scratch directory, relative to the workspace.  It is
 # inside the granted tree on purpose; see ensure_runtime_temp.
 SCRATCH_DIRECTORY = os.path.join(".loki", "tmp")
@@ -400,6 +409,7 @@ def prepare_local(process, command, environment, current_directory, handles, sta
         contained = api.token_is_app_container(source)
         package = api.token_app_container_sid(source) if contained else None
         restricting = api.token_restricting_sids(source)
+        capabilities = api.token_capabilities(source)
         integrity = api.token_integrity_level(source)
         original = api.token_default_dacl(source)
         primary = None
@@ -449,7 +459,8 @@ def prepare_local(process, command, environment, current_directory, handles, sta
         if (api.token_is_app_container(child) != contained or
                 (contained and api.token_app_container_sid(child) != package) or
                 api.token_integrity_level(child) != integrity or
-                api.token_restricting_sids(child) != expected_restricting):
+                api.token_restricting_sids(child) != expected_restricting or
+                api.token_capabilities(child) != capabilities):
             raise api.WindowsApiError('suspended child identity mismatch')
         if owning:
             # Preserving an arbitrary parent's default is not a privacy policy.
@@ -560,13 +571,16 @@ def prepare_contained(process, executable, arguments, environment, workspace, in
             current_directory=current_directory,
             inherited_handles=[*inherited_handles, *duplicates, *(stdio if stdio is not None else [])],
             environment=child_environment, standard_handles=standard_handles,
-            object_security=private)
+            object_security=private, capability_sids=sorted(_NETWORK_CAPABILITIES))
         process.pid = process.information.dwProcessId
         token = api.open_process_token(
             process.information.hProcess, api.TokenAccess.TOKEN_QUERY | api.TokenAccess.TOKEN_ADJUST_DEFAULT)
         try:
+            capabilities = api.token_capabilities(token)
             if (not api.token_is_app_container(token)
-                    or api.token_app_container_sid(token) != package):
+                    or api.token_app_container_sid(token) != package
+                    or {sid for sid, _attributes in capabilities} != _NETWORK_CAPABILITIES
+                    or any(not attributes & api.SE_GROUP_ENABLED for _sid, attributes in capabilities)):
                 raise RuntimeIsolationError("Suspended runtime token mismatch")
             process_protections.install_private_default(token, owner)
         finally:

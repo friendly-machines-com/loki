@@ -352,6 +352,9 @@ class LaunchTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(api, 'open_process_token', return_value=22), \
                 mock.patch.object(api, 'token_is_app_container', return_value=contained), \
                 mock.patch.object(api, 'token_app_container_sid', return_value='package'), \
+                mock.patch.object(api, 'token_capabilities', return_value=(
+                    [[sid, api.SE_GROUP_ENABLED] for sid in sorted(runtime._NETWORK_CAPABILITIES)]
+                    if capabilities is None else capabilities)), \
                 mock.patch.object(api, 'resume_thread',
                                   side_effect=lambda *args: events.append('resume')), \
                 mock.patch.object(api, 'terminate_process',
@@ -385,6 +388,8 @@ class LaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(create.call_args.kwargs['environment'], expected)
             self.assertEqual(create.call_args.kwargs['current_directory'],
                              '/work')
+            self.assertEqual(create.call_args.kwargs['capability_sids'],
+                             sorted(runtime._NETWORK_CAPABILITIES))
             self.assertEqual(create.call_args.kwargs['object_security'],
                              'D:P(A;;GA;;;S-1-5-21-1)(A;;GA;;;SY)(A;;GA;;;BA)')
             self.assertEqual(create.call_args.kwargs['inherited_handles'],
@@ -408,6 +413,22 @@ class LaunchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wrong_token_is_terminated_without_resume(self):
         events = await self.exercise(False)
+        self.assertIn('terminate', events)
+        self.assertNotIn('resume', events)
+
+    async def test_missing_capabilities_are_terminated_without_resume(self):
+        events = await self.exercise(True, capabilities=[])
+        self.assertIn('terminate', events)
+        self.assertNotIn('resume', events)
+
+    async def test_extra_capabilities_are_terminated_without_resume(self):
+        enabled = [[sid, api.SE_GROUP_ENABLED] for sid in sorted(runtime._NETWORK_CAPABILITIES)]
+        events = await self.exercise(True, capabilities=enabled + [['unexpected-capability', api.SE_GROUP_ENABLED]])
+        self.assertIn('terminate', events)
+        self.assertNotIn('resume', events)
+
+    async def test_disabled_capabilities_are_terminated_without_resume(self):
+        events = await self.exercise(True, capabilities=[[sid, 0] for sid in sorted(runtime._NETWORK_CAPABILITIES)])
         self.assertIn('terminate', events)
         self.assertNotIn('resume', events)
 
@@ -459,6 +480,8 @@ class LocalLaunchTests(unittest.TestCase):
             'token_app_container_sid': lambda token: 'S-1-15-2-9' if mismatch == 'package' and token == 66 else 'S-1-15-2-1',
             'token_integrity_level': lambda token: 'S-1-16-4096',
             'token_restricting_sids': lambda token: original_sids if owning or token == 44 else filtered_sids,
+            'token_capabilities': lambda token: [] if token == 66 and mismatch == 'capabilities' else [
+                [sid, api.SE_GROUP_ENABLED] for sid in sorted(runtime._NETWORK_CAPABILITIES)],
             'token_logon_sid': lambda token: 'S-1-5-5-0-99',
             'create_write_restricted_token': mock.Mock(return_value=77),
             'token_default_dacl': lambda token: original if token == 44 else private if token == 66 and owning else compatible,
@@ -517,20 +540,42 @@ class LocalLaunchTests(unittest.TestCase):
             self.assertEqual(seen['create'].call_args.kwargs['current_directory'], '/explicit-trusted-directory')
 
     def test_identity_failure_retains_the_suspended_child_for_async_retirement(self):
-        with self.calls(True, mismatch='package') as seen:
-            process = runtime.ContainedProcess(None)
-            with self.assertRaises(api.WindowsApiError):
-                runtime.prepare_local(process, ['/chosen/loki.exe'], {}, '/trusted', [], [1, 2, 3], owning=True)
-            self.assertEqual(process.information.hProcess, 101)
-            self.assertNotIn(101, seen['closed'])
-            self.assertNotIn(102, seen['closed'])
-            seen['resume'].assert_not_called()
+        self._identity_failure(False, 'package')
 
     def test_only_bare_external_commands_use_windows_command_lookup(self):
         with self.calls(False) as seen:
             runtime.prepare_local(runtime.ContainedProcess(None), ['cmd.exe', '/c', 'exit'], {},
                                   '/workspace', [], [1, 2, 3], owning=False)
             self.assertTrue(seen['create'].call_args.kwargs['search_path'])
+
+    def _identity_failure(self, owning, mismatch):
+        with self.calls(owning, mismatch=mismatch) as seen:
+            process = runtime.ContainedProcess(None)
+            with self.assertRaises(api.WindowsApiError):
+                runtime.prepare_local(process, ['/chosen/loki.exe'], {}, '/trusted', [], [1, 2, 3],
+                                      owning=owning)
+            self.assertEqual(process.information.hProcess, 101)
+            self.assertNotIn(101, seen['closed'])
+            self.assertNotIn(102, seen['closed'])
+            seen['resume'].assert_not_called()
+            if mismatch == 'package':
+                self.assertTrue(api.token_is_app_container(66))
+                self.assertNotEqual(api.token_app_container_sid(66), api.token_app_container_sid(44))
+
+    def test_owning_child_package_mismatch_retains_the_suspended_child(self):
+        self._identity_failure(True, 'package')
+
+    def test_tool_child_capability_mismatch_retains_the_suspended_child(self):
+        self._identity_failure(False, 'capabilities')
+
+    def test_owning_child_capability_mismatch_retains_the_suspended_child(self):
+        self._identity_failure(True, 'capabilities')
+
+    def test_tool_child_losing_appcontainer_identity_retains_the_suspended_child(self):
+        self._identity_failure(False, 'container')
+
+    def test_owning_child_losing_appcontainer_identity_retains_the_suspended_child(self):
+        self._identity_failure(True, 'container')
 
 
 class FamilyAccountingTests(unittest.TestCase):
