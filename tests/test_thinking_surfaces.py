@@ -5,7 +5,7 @@ import io
 import unittest
 from unittest import mock
 
-from loki_agent import acp_commands, acp_events, acp_worker, formats, loki, protocols, terminal_frontend
+from loki_agent import acp_commands, acp_events, acp_worker, models, formats, loki, protocols, terminal_frontend
 from loki_agent.sessions import Session
 from loki_agent import connections
 
@@ -22,6 +22,39 @@ class ThinkingSurfaceTests(unittest.IsolatedAsyncioTestCase):
         worker._model_options = [{"value": "model", "name": "Model"}]
         worker._current_option_value = "model"
         return worker
+
+    async def test_typed_effort_rejection_names_the_advertised_choices(self):
+        # The rejection quotes the same enumeration the status text
+        # shows: one failure view, no second /thinking to learn the set.
+        self.session.runtime_config = connections.make_runtime_config(
+            "https://relay.example/v1/messages", protocols.ANTHROPIC_MESSAGES,
+            model="custom",
+            reasoning_effort_profile=models.ReasoningEffortProfile(
+                ["low", "medium", "high"]))
+        with self.assertRaises(ValueError) as failure:
+            loki.thinking_command("effort minimal")
+        self.assertEqual(
+            str(failure.exception),
+            "reasoning effort 'minimal' is not available for the selected "
+            "model; effort choices: default, low, medium, high")
+
+    async def test_typed_effort_without_a_profile_says_so(self):
+        # "No choices" is its own fact, not a hint that a list exists.
+        self.session.runtime_config = connections.make_runtime_config(
+            "https://relay.example/v1/messages", protocols.ANTHROPIC_MESSAGES,
+            model="custom")
+        with self.assertRaises(ValueError) as failure:
+            loki.thinking_command("effort low")
+        self.assertIn(
+            "no effort choices are advertised", str(failure.exception))
+
+    async def test_unknown_mode_names_the_control_vocabulary(self):
+        with self.assertRaises(ValueError) as failure:
+            loki.thinking_command("mode fastest")
+        self.assertEqual(
+            str(failure.exception),
+            "unknown thinking mode; expected default, on, off, manual, "
+            "adaptive, or between-tools")
 
     async def test_manual_picker_collects_allowance_atomically_and_cancels_without_change(self):
         for replies, expected in [[['1', '2', '2048'], 2048], [['1', '2', ''], None]]:

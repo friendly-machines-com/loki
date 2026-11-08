@@ -271,6 +271,17 @@ def capture_turn_settings() -> model_requests.TurnThinkingSettings:
     return settings
 
 
+def thinking_choices_text(values):
+    """The ``default, ...`` enumeration of one model-fact control's choices.
+
+    Shared by the status text and by the typed-command rejections so
+    every surface that speaks of the choices quotes the same advertised
+    set. ``None`` entries (an unconfirmed catalog value) stay unlisted.
+    """
+    return ", ".join(["default", *(
+        value for value in values if isinstance(value, str))])
+
+
 def set_thinking_controls(changes, *, persist=True):
     """Assign thinking controls in any order.
 
@@ -303,7 +314,9 @@ def set_thinking_controls(changes, *, persist=True):
         raise ValueError("expected retention default or preserve")
     if candidate["mode"] is not None and candidate["mode"] not in [
             "on", "off", "manual", "adaptive", "between-tools"]:
-        raise ValueError("unknown thinking mode")
+        raise ValueError(
+            "unknown thinking mode; expected default, on, off, manual, "
+            "adaptive, or between-tools")
     if candidate["budget"] is not None and (
             not isinstance(candidate["budget"], int)
             or isinstance(candidate["budget"], bool)
@@ -312,12 +325,21 @@ def set_thinking_controls(changes, *, persist=True):
     if candidate["effort"] is not None:
         modelsdev.validate_reasoning_effort(candidate["effort"])
         # Advertised choices are model facts, not joint state: an
-        # unlisted value is invalid in every order.
+        # unlisted value is invalid in every order. The rejection names
+        # the choices it just consulted; the typed command otherwise
+        # prints only the failure sentence, while the success path gets
+        # the enumeration from the status text.
         profile = current_reasoning_effort_profile()
-        if profile is None or not profile.supports(candidate["effort"]):
+        if profile is None:
             raise ValueError(
                 f"reasoning effort {candidate['effort']!r} is not "
-                "available for the selected model")
+                "available for the selected model; no effort choices "
+                "are advertised for this connection")
+        if not profile.supports(candidate["effort"]):
+            raise ValueError(
+                f"reasoning effort {candidate['effort']!r} is not "
+                "available for the selected model; effort choices: "
+                f"{thinking_choices_text(profile.values)}")
     for name, value in changes.items():
         setattr(session, names[name], value)
     mark_chat_log_dirty()
@@ -392,14 +414,13 @@ def thinking_status_text():
     lines = [f"Thinking controls for {model}"]
     profile = current_reasoning_effort_profile()
     if profile is not None:
-        lines.append("Effort choices: default, " + ", ".join(
-            value for value in profile.values
-            if isinstance(value, str)))
+        lines.append("Effort choices: "
+                     + thinking_choices_text(profile.values))
     if modes:
         lines.append(
             "Mode: " + (mode or provider.thinking_default_mode(model)
                         or "not selected"))
-        lines.append("Mode choices: default, " + ", ".join(modes))
+        lines.append("Mode choices: " + thinking_choices_text(modes))
     if provider.kind == protocols.ANTHROPIC_MESSAGES and "manual" in modes:
         lines.append("Allowance: " + (
             f"{budget} thinking tokens" if budget is not None
