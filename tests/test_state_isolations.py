@@ -1,8 +1,9 @@
-"""Native Linux state-view experiments through the real Loki tool boundary.
+"""Native Linux state-view checks through the real Loki tool boundary.
 
-These are mechanism probes, not a production state-isolation implementation.
-The retained pre-cover directory fd and outside hardlink are deliberate bypass
-controls: a read-only pathname view must not be reported as inode immutability.
+Trusted fixture setup creates mount topology before Loki starts. Payloads do
+not install protection: they exercise the production ordinary-child view while
+owning runtimes keep publishing. Outside hardlinks and fixed ancestor names are
+not guarantees of this boundary; existing credential-name evidence is separate.
 """
 
 import asyncio
@@ -29,6 +30,7 @@ from process_lifecycle_fixtures import ProcessResources  # noqa: E402
 
 MS_BIND = 4096
 MS_REMOUNT = 32
+ST_RDONLY = 1
 
 
 def access_result(operation, action):
@@ -95,20 +97,13 @@ def rename_ancestor(state):
 
 
 def retained_mount_flags(path):
-    # Bind-remount does not preserve flags for us. A less-privileged namespace
-    # must not clear inherited locked nosuid/nodev/noexec/atime restrictions.
+    # Bind-remount must not clear inherited locked restrictions. Linux's
+    # statvfs bits are fixed even when PyPy does not export os.ST_* names.
     flags = os.statvfs(path).f_flag
-    mapping = [
-        ['ST_NOSUID', 2], ['ST_NODEV', 4], ['ST_NOEXEC', 8],
-        ['ST_SYNCHRONOUS', 16], ['ST_MANDLOCK', 64],
-        ['ST_NOATIME', 1024], ['ST_NODIRATIME', 2048],
-        ['ST_RELATIME', 1 << 21],
-    ]
-    result = 0
-    for name, mount_flag in mapping:
-        if flags & getattr(os, name, 0):
-            result |= mount_flag
-    return result
+    # nosuid, nodev, noexec, sync, mandlock, noatime and nodiratime match MS_*;
+    # ST_RELATIME (4096) instead maps to MS_RELATIME (1 << 21).
+    retained = flags & (2 | 4 | 8 | 16 | 64 | 1024 | 2048)
+    return retained | ((1 << 21) if flags & 4096 else 0)
 
 
 def credential_cover_probe(manifest_path):
@@ -205,13 +200,24 @@ def deployment_launcher(manifest_path):
     mount_call(libc, None, '/', isolation._MS_REC | isolation._MS_PRIVATE)
     mount_call(libc, home, home, MS_BIND)
     mount_call(libc, state, state, MS_BIND)
+    if manifest['submount']:
+        mount_call(libc, manifest['nested_source'], state / 'nested', MS_BIND)
+    # Validate later attack call shapes while this trusted fixture still has
+    # mount privilege, not by granting privilege to the ordinary payload.
+    control = Path(manifest['workspace']) / 'unmount-control'
+    control.mkdir()
+    mount_call(libc, state, control, MS_BIND)
+    control_flags = MS_BIND | MS_REMOUNT | retained_mount_flags(control)
+    mount_call(libc, None, control, control_flags | isolation._MS_RDONLY)
+    mount_call(libc, None, control, control_flags)
+    unmount_call(libc, control)
+    control.rmdir()
     # The real deployment's code is immutable. Hide the editing session's
     # writable checkout view in this namespace only; never change its contents.
     mount_call(libc, ROOT, ROOT, MS_BIND)
     mount_call(libc, None, ROOT, MS_BIND | MS_REMOUNT |
                retained_mount_flags(ROOT) | isolation._MS_RDONLY)
-    storage = credential_storages.JsonCredentialStorage(
-        str(home / '.config' / 'loki' / 'credentials'))
+    storage = credential_storages.JsonCredentialStorage()
     storage.ensure_directory()
     configuration = Path(storage.directory).parent
     mount_call(libc, configuration, configuration, MS_BIND)
@@ -240,7 +246,7 @@ def deployment_ancestor_attack(state, control, output):
         parent.mkdir()
         state.mkdir()
         (state / 'published-later').write_bytes(b'FORGED-STATE-PUBLICATION')
-        result['replacement_read_only'] = bool(os.statvfs(state).f_flag & os.ST_RDONLY)
+        result['replacement_read_only'] = bool(os.statvfs(state).f_flag & ST_RDONLY)
         output.write(json.dumps({'phase': 'ancestor-replaced', 'result': result}) + '\n')
         output.flush()
         if control.recv(1) != b'a':
@@ -298,51 +304,17 @@ def tool_probe(manifest_path):
         output = control.makefile('w', buffering=1)
         try:
             before = privilege_state()
-            before_namespace = os.readlink('/proc/self/ns/mnt')
             state = Path(manifest['state'])
             deployment = manifest.get('deployment', False)
-            inherited_mount = mountpoint_present(state)
-            code_read_only = bool(os.statvfs(ROOT).f_flag & os.ST_RDONLY)
-            retained = None if deployment else os.open(state, os.O_RDONLY | os.O_DIRECTORY)
-            cross_link = Path(manifest['workspace']) / 'link-before-cover'
-            link_before = access_result('new-hardlink-before-cover', lambda: os.link(state / 'read', cross_link))
-            if cross_link.exists():
-                cross_link.unlink()
             libc = ctypes.CDLL(None, use_errno=True)
-            uid, gid = os.getuid(), os.getgid()
-            isolation._unshare_user_and_mount_namespaces(libc)
-            isolation._map_current_identity(uid, gid)
-            mount_call(libc, None, '/', isolation._MS_REC | isolation._MS_PRIVATE)
-            if deployment and manifest['pin_ancestors']:
-                # Pin directory identities, not their contents: unrelated
-                # ~/.local writes stay allowed, but these ancestors cannot be
-                # renamed out from under the protected state pathname.
-                home = Path(manifest['home'])
-                for ancestor in [home / '.local', home / '.local' / 'state']:
-                    mount_call(libc, ancestor, ancestor, MS_BIND | isolation._MS_REC)
-            if manifest['submount']:
-                mount_call(libc, manifest['nested_source'], state / 'nested', MS_BIND)
-            mount_call(libc, state, state, MS_BIND | isolation._MS_REC)
             remount = MS_BIND | MS_REMOUNT | retained_mount_flags(state)
-            mount_call(libc, None, state, remount | isolation._MS_RDONLY)
-            # A successful writable remount while still privileged validates the
-            # later attack's call shape; denial must not mean bad parameters.
-            mount_call(libc, None, state, remount)
-            mount_call(libc, None, state, remount | isolation._MS_RDONLY)
-            unmount_control = Path(manifest['workspace']) / 'unmount-control'
-            unmount_control.mkdir()
-            mount_call(libc, state, unmount_control, MS_BIND)
-            unmount_call(libc, unmount_control)
-            unmount_control.rmdir()
-            os.chdir(manifest['workspace'])
-            isolation._drop_namespace_capabilities(libc)
+            # The payload must begin restricted. Installing a view here would
+            # let the test pass even if the production launch forgot its policy.
             output.write(json.dumps({'phase': 'ready', 'before': before,
                                      'after': privilege_state(),
-                                     'inherited_state_mount': inherited_mount,
-                                     'code_read_only': code_read_only,
-                                     'new_hardlink_before_cover': link_before,
-                                     'namespace_changed': before_namespace != os.readlink(
-                                         '/proc/self/ns/mnt')}) + '\n')
+                                     'state_read_only': bool(os.statvfs(state).f_flag & ST_RDONLY),
+                                     'nested_read_only': bool(os.statvfs(state / 'nested').f_flag & ST_RDONLY),
+                                     'code_read_only': bool(os.statvfs(ROOT).f_flag & ST_RDONLY)}) + '\n')
             output.flush()
             if control.recv(1) != b'g':
                 raise RuntimeError('probe controller closed before publication')
@@ -351,20 +323,10 @@ def tool_probe(manifest_path):
                 results.append(access_result('unrelated-local-write', lambda: (
                     Path(manifest['home']) / '.local' / 'unrelated-tool-file').write_bytes(b'allowed')))
                 results.append(access_result('deployment-local-ancestor-rename', lambda: rename_ancestor(state.parent)))
-            limitations = []
-            if retained is not None:
-                limitations.extend([
-                    access_result('pre-cover-dirfd-write', lambda: Path(
-                        f'/proc/self/fd/{retained}/legacy-fd').write_bytes(b'legacy')),
-                    access_result('outside-hardlink-write', lambda: (
-                        Path(manifest['workspace']) / 'hardlink').write_bytes(b'alias')),
-                    access_result('state-ancestor-rename', lambda: rename_ancestor(state)),
-                ])
-                os.close(retained)
             ancestor_attack = (deployment_ancestor_attack(state, control, output)
                                if deployment else None)
             if manifest['submount']:
-                limitations.append(access_result('nested-mount-write', lambda: (
+                results.append(access_result('nested-mount-write', lambda: (
                     state / 'nested' / 'nested-write').write_bytes(b'nested')))
             exceptions = []
             for fd in [1, 2]:
@@ -405,7 +367,7 @@ def tool_probe(manifest_path):
             if child.returncode:
                 raise RuntimeError('descendant failed: ' + child.stderr)
             output.write(json.dumps({'phase': 'result', 'operations': results,
-                                     'limitations': limitations, 'stdio_exceptions': exceptions,
+                                     'stdio_exceptions': exceptions,
                                      'attacks': attacks, 'descendant': json.loads(child.stdout),
                                      'deployment_ancestor_attack': ancestor_attack}) + '\n')
         except BaseException as error:
@@ -493,14 +455,11 @@ class StateViewProbes(unittest.TestCase):
                 process.kill()
             await output
 
-    def test_inherited_state_bind_under_writable_home_ancestors(self):
-        for pin_ancestors in [False, True]:
-            with self.subTest(pin_ancestors=pin_ancestors), tempfile.TemporaryDirectory(
-                    prefix='state deployment-') as directory:
-                asyncio.run(self.exercise(Path(directory), False, deployment=True,
-                                          pin_ancestors=pin_ancestors))
+    def test_runtime_state_stays_on_original_when_tool_replaces_ancestor(self):
+        with tempfile.TemporaryDirectory(prefix='state deployment-') as directory:
+            asyncio.run(self.exercise(Path(directory), False, deployment=True))
 
-    async def exercise(self, root, submount, deployment=False, pin_ancestors=False):
+    async def exercise(self, root, submount, deployment=False):
         home = root / 'home' if deployment else root
         home.mkdir(exist_ok=True)
         state_home = home / '.local' / 'state' if deployment else root / 'state'
@@ -508,22 +467,19 @@ class StateViewProbes(unittest.TestCase):
         workspace.mkdir()
         state.mkdir(parents=True)
         for name in ['read', 'append', 'truncate', 'unlink', 'rename', 'replace',
-                     'replacement-temp', 'chmod', 'hardlink-target']:
+                     'replacement-temp', 'chmod']:
             (state / name).write_bytes(b'original')
         (state / 'empty-directory').mkdir()
         (state / 'nested').mkdir()
         nested_source = root / 'nested-source'
         nested_source.mkdir()
         (workspace / 'state-alias').symlink_to(state, target_is_directory=True)
-        if not deployment:
-            os.link(state / 'hardlink-target', workspace / 'hardlink')
         ready = asyncio.get_running_loop().create_future()
         server = await asyncio.start_unix_server(
             lambda reader, writer: ready.set_result([reader, writer]), path=str(workspace / 'control'))
         manifest = {'state': str(state), 'workspace': str(workspace),
                     'control': str(workspace / 'control'), 'submount': submount,
-                    'nested_source': str(nested_source), 'deployment': deployment, 'home': str(home),
-                    'pin_ancestors': pin_ancestors}
+                    'nested_source': str(nested_source), 'deployment': deployment, 'home': str(home)}
         path = workspace / 'manifest.json'
         path.write_text(json.dumps(manifest))
         command = shlex.join([sys.executable, str(Path(__file__).resolve()), '--tool', str(path)])
@@ -532,8 +488,7 @@ class StateViewProbes(unittest.TestCase):
             XDG_CONFIG_HOME=str(home / '.config' if deployment else root / 'config'),
             XDG_STATE_HOME=str(state_home),
             LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1', LOKI_MODEL='dummy')
-        launch = ([sys.executable, str(Path(__file__).resolve()), '--deployment', str(path)]
-                  if deployment else [entrypoint('loki'), '--dangerously-skip-permissions'])
+        launch = [sys.executable, str(Path(__file__).resolve()), '--deployment', str(path)]
         process = await asyncio.create_subprocess_exec(
             *launch, cwd=str(workspace), env=environment,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -548,11 +503,10 @@ class StateViewProbes(unittest.TestCase):
             prepared = json.loads(await reader.readline())
             print(json.dumps({'linux_state_probe_setup': prepared, 'submount': submount}), flush=True)
             self.assertEqual(prepared['phase'], 'ready', prepared)
-            self.assertTrue(prepared['namespace_changed'])
-            if deployment:
-                self.assertTrue(prepared['inherited_state_mount'])
-                self.assertTrue(prepared['code_read_only'])
-                self.assertEqual(prepared['new_hardlink_before_cover']['outcome'], 'cross-mount')
+            self.assertTrue(prepared['state_read_only'])
+            if submount:
+                self.assertTrue(prepared['nested_read_only'])
+            self.assertTrue(prepared['code_read_only'])
             for phase in ['before', 'after']:
                 self.assertEqual(prepared[phase]['NoNewPrivs'], '1')
                 for key in ['CapEff', 'CapPrm', 'CapInh', 'CapBnd']:
@@ -562,10 +516,7 @@ class StateViewProbes(unittest.TestCase):
             await writer.drain()
             if deployment:
                 stage = json.loads(await reader.readline())
-                print(json.dumps({'linux_deployment_ancestor_probe': stage,
-                                  'pin_ancestors': pin_ancestors}), flush=True)
-                if pin_ancestors:
-                    self.assertEqual(stage['phase'], 'ancestor-blocked', stage)
+                print(json.dumps({'linux_deployment_ancestor_probe': stage}), flush=True)
                 if stage['phase'] == 'ancestor-replaced':
                     self.assertFalse(stage['result']['replacement_read_only'])
                     self.assertEqual((state / 'published-later').read_bytes(), b'FORGED-STATE-PUBLICATION')
@@ -581,14 +532,14 @@ class StateViewProbes(unittest.TestCase):
             print(json.dumps({'linux_state_probe': result, 'submount': submount}), flush=True)
             self.assertEqual(result['phase'], 'result', result)
             allowed = ['state-read', 'workspace-write', 'new-owner-file-read', 'unrelated-local-write']
-            if deployment and not pin_ancestors:
+            if deployment:
                 allowed.append('deployment-local-ancestor-rename')
             for row in result['operations']:
                 expected = ('allowed' if row['operation'] in allowed else 'mount-busy'
                             if row['operation'] in ['state-root-rename', 'deployment-local-ancestor-rename']
                             else 'denied')
                 self.assertEqual(row['outcome'], expected, row)
-            for row in result['limitations'] + result['stdio_exceptions']:
+            for row in result['stdio_exceptions']:
                 self.assertEqual(row['outcome'], 'allowed', row)
             for row in result['attacks']:
                 self.assertIn(row['outcome'], ['denied', 'setup-refused', 'locked-mount'], row)

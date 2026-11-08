@@ -28,7 +28,7 @@ from . import model_requests
 from . import recoveries
 from . import files
 from . import jobs
-from . import host_process, private_files
+from . import host_process, private_files, runtime_isolation
 from . import web_tools
 from . import tool_contracts
 from . import formats
@@ -447,10 +447,16 @@ def reasoning_traces_status_text():
     return text
 
 
+def _tool_bootstrap_command():
+    return runtime_isolation.internal_command('--tool-exec')
+
+
 def _tool_process_creator():
     # Capture the owner, not an fd number which could be closed and reused.
     # Hook payloads and their reduced environments never select this authority.
     session = current_session()
+    store = session.response_headers
+    command = _tool_bootstrap_command() if sys.platform.startswith('linux') else None
 
     async def create(*arguments, **options):
         session.require_active()
@@ -462,7 +468,8 @@ def _tool_process_creator():
                 before_resume()
 
         return await host_process.create_exec(
-            *arguments, before_resume=check_owner, **options)
+            *arguments, state_directory=store.directory_handle,
+            tool_command=command, before_resume=check_owner, **options)
 
     return create
 
@@ -2476,9 +2483,9 @@ async def run_turn_end_hooks_async(events, text="", *, error=None):
 def configure_tool_hook_pipeline(configuration, stderr_reporter=None):
     """Install one config snapshot with this Session's launch capability.
 
-    The creator captures the live Session, not hook input. It rechecks
-    admission before launch/publication; configuration cannot bypass runtime
-    revocation. Job storage is selected through the Session's retained Store.
+    The creator captures the retained state owner and sanctioned bootstrap,
+    not hook input. It rechecks active ownership before launch/publication, so
+    configuration loading cannot bypass runtime revocation or isolation.
     """
     global TOOL_HOOK_PIPELINE
     TOOL_HOOK_PIPELINE = tool_runtime.build_hook_pipeline(

@@ -68,6 +68,12 @@ async def amain(credentials: CredentialStore) -> int:
 
 
 def main() -> int:
+    if sys.argv[1:2] == ['--tool-exec']:
+        # Reuse this selected frontend without starting an ACP worker/front or
+        # acquiring credentials. The target's stdout is never an ACP channel.
+        from .tool_executions import main as tool_main
+        return tool_main(sys.argv[2:])
+
     if sys.argv[1:2] == ["--worker"]:
         from .acp_worker_main import main as worker_main
         return worker_main()

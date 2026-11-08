@@ -14,6 +14,7 @@ from unittest import mock
 
 from loki_agent import loki, response_headers
 from loki_agent.sessions import Session
+from job_fixtures import bootstrap_command
 
 
 @contextlib.contextmanager
@@ -26,7 +27,8 @@ def isolated_response_headers(*, runner=None):
                 # Core unit workflows have no frontend caller identity. Select
                 # the real sanctioned test dispatcher; fresh frontend processes
                 # remain unpatched and exercise their own reentry selection.
-                with mock.patch.object(loki, "_DEFAULT_SESSION", session):
+                with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                        mock.patch.object(loki, '_tool_bootstrap_command', side_effect=bootstrap_command):
                     try:
                         yield path
                     finally:

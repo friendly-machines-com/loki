@@ -385,7 +385,7 @@ class ExternalHookTests(unittest.TestCase):
             with self.subTest(output=output, status=status):
                 asyncio.run(scenario(output, status, failed))
 
-    @unittest.skipUnless(sys.platform.startswith('linux'), 'native creation ownership control')
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'native protected startup control')
     def test_turn_cancellation_retires_a_hook_held_during_creation(self):
         async def scenario():
             watching = asyncio.Event()
@@ -400,9 +400,11 @@ class ExternalHookTests(unittest.TestCase):
             original = host_process.create_posix_process
 
             async def observed(*command, **options):
+                startup = options.pop('after_spawn')
 
                 async def ready(process):
                     created.append(ProcessResources(process))
+                    await startup(process)
                     self.assertTrue(watching.is_set(), 'cancellation was not owned during creation')
                     cancel.set()
                     await asyncio.Future()

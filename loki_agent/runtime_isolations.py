@@ -1,4 +1,4 @@
-"""Early, dependency-free isolation for credential-consuming runtimes.
+"""Early Linux credential-directory isolation for POSIX runtimes.
 
 Loki has two kinds of processes:
 
@@ -8,11 +8,12 @@ Loki has two kinds of processes:
   capability.
 
 Supervisors keep their normal filesystem view so they can eventually load and
-atomically update persistent credentials.  Every runtime enters a private
-Linux user/mount namespace before importing the agent core, then covers Loki's
-dedicated credential directory with an empty, read-only tmpfs.  All tools and
-nested subagents inherit that view, while the supervisor remains able to
-persist refreshed credentials.
+atomically update persistent credentials. On Linux, each runtime enters a
+private user/mount namespace before importing the agent core, then covers
+Loki's dedicated credential directory with an empty, read-only tmpfs. Its tools
+and nested subagents inherit that view, while the supervisor remains able to
+persist refreshed credentials. Other POSIX systems do not install this
+Linux-specific mount cover.
 
 The namespace is deliberately established in the newly execed runtime, while
 it is still single-threaded.  Doing this in ``preexec_fn`` from an async
@@ -312,3 +313,76 @@ def isolate_credential_directory(directory_fd: int | None) -> bool:
             if directory_fd is not None:
                 with contextlib.suppress(OSError):
                     os.close(directory_fd)
+
+
+class _MountAttributes(ctypes.Structure):
+    _fields_ = [('attr_set', ctypes.c_uint64), ('attr_clr', ctypes.c_uint64),
+                ('propagation', ctypes.c_uint64), ('userns_fd', ctypes.c_uint64)]
+
+
+def isolate_state_directory(directory_fd: int) -> None:
+    """Consume a staging reference; restrict only this ordinary child's view.
+
+    The runtime keeps its own writable mount and selected root. This is not a
+    filesystem snapshot, inode immutability, or protection of ancestor names:
+    owner publications remain visible and outside hardlinks are not covered.
+    """
+    with contextlib.ExitStack() as cleanup:
+        cleanup.callback(os.close, directory_fd)
+        if not sys.platform.startswith('linux'):
+            raise RuntimeIsolationError('command state protection is unavailable')
+        libc = ctypes.CDLL(None, use_errno=True)
+        original = os.fstat(directory_fd)
+        if not stat.S_ISDIR(original.st_mode):
+            raise RuntimeIsolationError('command state location is not a directory')
+        # Read before unshare: an inherited fd can lose its mount ancestry's
+        # printable name afterward. The name is navigation metadata; fstat,
+        # not that spelling, decides whether the selected object is unchanged.
+        name = os.readlink(f'/proc/self/fd/{directory_fd}')
+        original_cwd = os.getcwd()
+        uid, gid = os.getuid(), os.getgid()
+        _set_no_new_privileges(libc)
+        _unshare_user_and_mount_namespaces(libc)
+        _map_current_identity(uid, gid)
+        mount = libc.mount
+        mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                          ctypes.c_ulong, ctypes.c_void_p]
+        mount.restype = ctypes.c_int
+        if mount(None, b'/', None, _MS_REC | _MS_PRIVATE, None):
+            _raise_errno('private command mount namespace')
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        target = os.open(name, flags)
+        cleanup.callback(os.close, target)
+        selected = os.fstat(target)
+        if original.st_dev != selected.st_dev or original.st_ino != selected.st_ino:
+            raise RuntimeIsolationError('command state location changed while starting')
+        anchor = os.fsencode(f'/proc/self/fd/{target}')
+        # Clone mount topology, not directory entries. In particular, dropping
+        # a nested credential cover must never reveal the underlying directory.
+        if mount(anchor, anchor, None, 4096 | _MS_REC, None):  # MS_BIND
+            _raise_errno('command state bind mount')
+        # The staging fd still names the underlying writable mount. Reopen the
+        # clone before changing attributes: changing the original would either
+        # affect an owner or fail to constrain the view delivered to the tool.
+        view = os.open(name, flags)
+        cleanup.callback(os.close, view)
+        selected = os.fstat(view)
+        if original.st_dev != selected.st_dev or original.st_ino != selected.st_ino:
+            raise RuntimeIsolationError('command state location changed while starting')
+        try:
+            change = libc.mount_setattr
+        except AttributeError as error:
+            raise RuntimeIsolationError('recursive command state protection is unavailable') from error
+        change.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+                           ctypes.POINTER(_MountAttributes), ctypes.c_size_t]
+        change.restype = ctypes.c_int
+        # attr_clr=0 preserves inherited flags. AT_RECURSIVE handles mount
+        # boundaries in the kernel; a root-only remount leaves submounts writable.
+        attributes = _MountAttributes(1, 0, 0, 0)  # MOUNT_ATTR_RDONLY
+        if change(view, b'', 0x1000 | 0x8000,  # AT_EMPTY_PATH | AT_RECURSIVE
+                  ctypes.byref(attributes), ctypes.sizeof(attributes)):
+            _raise_errno('recursive command state protection')
+        # A cwd reference acquired before the cover could otherwise retain the
+        # old writable access path. The caller's raw tool cwd is applied later.
+        os.chdir(original_cwd)
+        _drop_namespace_capabilities(libc)

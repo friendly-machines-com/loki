@@ -43,7 +43,8 @@ def label(signum) -> str:
     return signum.name
 
 
-async def create_exec(*command, owning=False, before_resume=None, **kwargs):
+async def create_exec(*command, owning=False, before_resume=None,
+                      state_directory=None, tool_command=None, **kwargs):
     """Preserve the caller's image/cwd; only trusted callers select authority."""
     if sys.platform == 'win32':
         from . import windows_subprocesses
@@ -53,6 +54,15 @@ async def create_exec(*command, owning=False, before_resume=None, **kwargs):
     # then recheck after startup inside the existing unpublished-child rollback.
     if before_resume is not None:
         before_resume()
+    if sys.platform.startswith('linux') and not owning:
+        # Lifetime ownership and argv never grant writer authority. The owning
+        # runtime chooses both this root and the sanctioned bootstrap image.
+        if state_directory is None or not tool_command:
+            raise OSError(errno.EINVAL, 'command state protection is unavailable')
+        from . import tool_executions
+        return await tool_executions.create_exec(
+            tool_command, state_directory, command,
+            before_publish=before_resume, **kwargs)
     return await create_posix_process(*command, before_publish=before_resume, **kwargs)
 
 
@@ -69,9 +79,9 @@ async def create_posix_process(*command, on_cancel=None, after_spawn=None,
                                limit=64 * 1024, **options):
     """Own creation through optional startup checks, until the caller takes over.
 
-    Runtime delegation needs immediate revocation on cancellation; jobs and
-    hooks need startup/publication checks on the same process owner, not
-    separate pipe-draining retirement implementations. Local
+    Runtime delegation needs immediate revocation on cancellation; an ordinary
+    tool instead needs its second exec checked. Both need the same transport
+    ownership, not separate pipe-draining retirement implementations. Local
     Session/Job admission runs synchronously after these awaits: rejection must
     retire the unpublished child here, not hand it to a revoked caller.
     """

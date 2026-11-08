@@ -66,6 +66,12 @@ def _report_security_error(error) -> int:
 
 
 def main() -> int:
+    if sys.argv[1:2] == ['--tool-exec']:
+        # An ordinary child inherits credential hiding, not credential authority.
+        # Dispatch before capture, logging, Session creation or frontend imports.
+        from .tool_executions import main as tool_main
+        return tool_main(sys.argv[2:])
+
     if sys.argv[1:2] == ["--runtime"]:
         try:
             owner_fd, capability_fd, directory_fd, args = (

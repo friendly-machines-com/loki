@@ -26,6 +26,7 @@ __all__ = [
     "RuntimeIsolationError",
     "close_runtime_process",
     "configured_workspace",
+    "internal_command",
     "isolate_runtime",
     "preflight",
     "prepare_runtime_scratch",
@@ -34,6 +35,17 @@ __all__ = [
     "verify_contained_runtime",
     "worker_command",
 ]
+
+
+def internal_command(mode: str) -> list[str]:
+    """Replay the selected dispatcher with the current image, not tool PATH.
+
+    A hook may intentionally have a minimal environment. A source dispatcher's
+    shebang lookup must not silently choose a different interpreter there.
+    """
+    if getattr(sys, 'frozen', False):
+        return [sys.executable, mode]
+    return [sys.executable, sys.argv[0], mode]
 
 
 def worker_command() -> list[str]:
@@ -49,10 +61,7 @@ def worker_command() -> list[str]:
     ``sys.argv[0]`` and ``"--worker"`` (``launch`` applies the frozen/source
     rule itself); the ``--worker`` token is pinned by ``acp_main``'s dispatch.
     """
-    if getattr(sys, "frozen", False):
-        command = [sys.executable, "--worker"]
-    else:
-        command = [sys.executable, sys.argv[0], "--worker"]
+    command = internal_command('--worker')
     logger.debug(
         "worker command: %r (sys.argv[0]=%r sys.executable=%r frozen=%r)",
         command, sys.argv[0], sys.executable, getattr(sys, "frozen", False))

@@ -17,6 +17,7 @@ import tempfile
 import unittest
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from unittest import mock
+from loki_agent import private_files
 from loki_entrypoints import child_environment, configure_container, loki_acp_command
 from directory_fixtures import directory_alias
 from response_header_fixtures import setUpModule as set_up_response_headers
@@ -1147,9 +1148,10 @@ class _ACPFrontFixture:
 
     _observe_process_exit = observe_process_exit
 
-    async def _front(self, env, workspace, *, cleanup, closed_stderr=False, lifetime_boundary=False, on_diagnostics=None):
+    async def _front(self, env, workspace, *, cleanup, closed_stderr=False, protected_installation=False,
+                     lifetime_boundary=False, on_diagnostics=None):
         command = loki_acp_command()
-        if lifetime_boundary and sys.platform.startswith('linux'):
+        if (protected_installation or lifetime_boundary) and sys.platform.startswith('linux'):
             # Trusted outer-fixture setup, before the actual sanctioned front.
             # Reuse the deployment fixture's mount operations, never install
             # protection in a hook/tool payload or change the host's mounts.
@@ -1163,6 +1165,10 @@ uid, gid = os.getuid(), os.getgid()
 isolation._unshare_user_and_mount_namespaces(libc)
 isolation._map_current_identity(uid, gid)
 mount_call(libc, None, '/', isolation._MS_REC | isolation._MS_PRIVATE)
+if options['readonly']:
+    mount_call(libc, sys.argv[1], sys.argv[1], MS_BIND)
+    mount_call(libc, None, sys.argv[1], MS_BIND | MS_REMOUNT |
+               retained_mount_flags(sys.argv[1]) | isolation._MS_RDONLY)
 if options['lifetime']:
     # POSIX ordinary jobs intentionally outlive worker close. The fixture's
     # outer init supplies root retirement, not a new per-command kill policy.
@@ -1176,7 +1182,7 @@ if options['lifetime']:
 isolation._drop_namespace_capabilities(libc)
 os.execv(sys.argv[3], sys.argv[3:])
 '''
-            options = {'lifetime': lifetime_boundary}
+            options = {'readonly': protected_installation, 'lifetime': lifetime_boundary}
             command = [sys.executable, '-c', prepare, ROOT, json.dumps(options), *command]
         if closed_stderr:
             command = [sys.executable, '-c',
@@ -1255,6 +1261,135 @@ os.execv(sys.argv[3], sys.argv[3:])
         stderr = await diagnostics
         self.assertEqual(front.returncode, 0, stderr.decode(errors="replace"))
         self.assertEqual(await front.stdout.read(), b"")
+
+    def _controlled_search(self, root, workspace, label, *, cwd=None):
+        """A real rg leader and descendant, controlled by fresh file handshakes."""
+        environment = child_environment(
+            HOME=root, PATH=os.environ.get('PATH', ''), TERM='dumb',
+            XDG_CONFIG_HOME=os.path.join(root, 'config'), XDG_STATE_HOME=os.path.join(root, 'state'),
+            LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1', LOKI_MODEL='dummy',
+            LOKI_DUMMY_REPLY=f'Controlled search {label} complete.')
+        state = app_paths.loki_state_dir(environment)
+        payload = os.path.join(workspace, 'controlled-search.py')
+        configuration = json.dumps({'state': state, 'workspace': workspace, 'cwd': cwd or workspace, 'label': label})
+        source = '''import ctypes, json, os, subprocess, sys, time
+configuration = json.loads(CONFIGURATION)
+workspace = configuration['workspace']
+def traversal_failed(error):
+    raise error
+def publish(name, value):
+    with open(os.path.join(workspace, name), 'w', encoding='utf-8') as stream:
+        json.dump(value, stream)
+def host_pid():
+    if sys.platform.startswith('linux'):
+        with open('/proc/self/status') as stream:
+            for line in stream:
+                if line.startswith('NSpid:'):
+                    return int(line.split()[1])
+    return os.getpid()
+def ui_limits():
+    if sys.platform != 'win32':
+        return None
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    query = kernel.QueryInformationJobObject
+    query.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                      wintypes.DWORD, ctypes.c_void_p]
+    query.restype = wintypes.BOOL
+    limits = wintypes.DWORD()
+    if not query(None, 4, ctypes.byref(limits), ctypes.sizeof(limits), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return limits.value
+def hold(role):
+    previous = None
+    while not os.path.exists(os.path.join(workspace, role + '-finish')):
+        path = os.path.join(workspace, role + '-request')
+        if os.path.exists(path):
+            with open(path, encoding='utf-8') as stream:
+                nonce = stream.read()
+            if nonce != previous:
+                with open(os.path.join(workspace, 'parent-ready'), encoding='utf-8') as stream:
+                    metadata = json.load(stream)['metadata']
+                with open(metadata, 'rb') as stream:
+                    before = stream.read()
+                try:
+                    with open(metadata, 'wb') as stream:
+                        stream.write(b'forbidden')
+                except OSError as error:
+                    denied = {'errno': error.errno, 'winerror': getattr(error, 'winerror', None)}
+                else:
+                    denied = {'allowed': True}
+                with open(metadata, 'rb') as stream:
+                    unchanged = stream.read() == before
+                publish(role + '-reply', {'nonce': nonce, 'label': configuration['label'],
+                                         'ui_limits': ui_limits(), 'mutation': denied,
+                                         'unchanged': unchanged})
+                previous = nonce
+        time.sleep(0.01)
+if sys.argv[1:] == ['--descendant']:
+    publish('child-ready', {'pid': os.getpid(), 'host_pid': host_pid(), 'ui_limits': ui_limits()})
+    hold('child')
+else:
+    with open(os.path.join(workspace, 'child-input'), 'w+b') as child_in, \\
+            open(os.path.join(workspace, 'child-output'), 'wb') as child_out, \\
+            open(os.path.join(workspace, 'child-error'), 'wb') as child_err:
+        child = subprocess.Popen([sys.executable, __file__, '--descendant'],
+                                 stdin=child_in, stdout=child_out, stderr=child_err)
+    while not os.path.exists(os.path.join(workspace, 'child-ready')):
+        if child.poll() is not None:
+            raise RuntimeError('descendant exited before readiness')
+        time.sleep(0.01)
+    metadata = None
+    while metadata is None:
+        for directory, _children, names in os.walk(os.path.join(configuration['state'], 'jobs'),
+                                                   onerror=traversal_failed):
+            if 'job.json' in names:
+                path = os.path.join(directory, 'job.json')
+                with open(path, encoding='utf-8') as stream:
+                    record = json.load(stream)
+                if record['pid'] == os.getppid() and record['cwd'] == configuration['cwd']:
+                    metadata = path
+                    break
+        if metadata is None:
+            time.sleep(0.01)
+    publish('parent-ready', {'pid': os.getpid(), 'host_pid': host_pid(), 'metadata': metadata,
+                             'ui_limits': ui_limits(), 'label': configuration['label']})
+    hold('parent')
+    print('CONTROLLED_SEARCH_OUTPUT_' + configuration['label'])
+'''.replace('CONFIGURATION', repr(configuration))
+        with open(payload, 'w', encoding='utf-8') as stream:
+            stream.write(source)
+        rg_config = os.path.join(workspace, 'ripgrep.conf')
+        with open(rg_config, 'w', encoding='utf-8') as stream:
+            stream.write('--pre\n' + sys.executable + '\n')
+        environment['RIPGREP_CONFIG_PATH'] = rg_config
+        environment['LOKI_DUMMY_TOOL_CALL'] = json.dumps({'name': 'Grep', 'arguments': {
+            'pattern': 'CONTROLLED_SEARCH_OUTPUT_' + label, 'path': payload, 'output_mode': 'content'}})
+        return environment
+
+    async def _ping_search(self, workspace, role, nonce, label, *, exited):
+        # A surviving actor may outlive its original request/leader. Observe
+        # its held kernel identity, not a request that legitimately finished.
+        async def actor_exit():
+            while not exited():
+                await asyncio.sleep(0.01)
+            return f'{role} exited before replying to {nonce}'
+
+        watching = asyncio.create_task(actor_exit())
+        try:
+            with open(os.path.join(workspace, role + '-request'), 'w', encoding='utf-8') as stream:
+                stream.write(nonce)
+            reply = await self._search_file(workspace, role + '-reply', watching, nonce=nonce)
+            self.assertEqual(reply['label'], label)
+            self.assertTrue(reply['unchanged'], reply)
+            self.assertNotIn('allowed', reply['mutation'], reply)
+            self.assertIn(reply['mutation']['errno'], [errno.EROFS, errno.EACCES, errno.EPERM], reply)
+            self.assertIn(reply['mutation']['winerror'], [None, 5], reply)
+            if sys.platform == 'win32':
+                self.assertEqual(reply['ui_limits'], 1)
+        finally:
+            watching.cancel()
+            await asyncio.gather(watching, return_exceptions=True)
 
 
 class ProviderFixtureOwnershipTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
@@ -2529,6 +2664,233 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
         for owner in workers:
             with self.assertRaisesRegex(ValueError, 'response status storage is closed'):
                 owner.session.response_headers.directory_handle
+
+    async def test_independent_frontends_overlap_without_sharing_shutdown(self):
+        if sys.platform != 'win32' and not sys.platform.startswith('linux'):
+            self.skipTest('the outer root-retirement fixture needs Linux PID namespaces')
+        root = self.enterContext(tempfile.TemporaryDirectory(prefix='acp-overlapping-frontends-'))
+        workspaces = [os.path.join(root, name) for name in ['workspace-A', 'workspace-B']]
+        fronts, diagnostics, sessions, pending, parents, children = [], [], [], [], [], []
+        exits = {}
+
+        async def release_reader(task):
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        for workspace, label in zip(workspaces, ['A', 'B']):
+            # Fresh test-owned private directories use the explicit-user
+            # creator on both platforms, never ACL repair on an existing tree.
+            # Windows OWNER-RIGHTS-only fixture compatibility is tracked
+            # separately; its failed executed journeys must not be relabelled.
+            private_files.make_private_directory(workspace)
+            # Both legitimate owners intentionally share the configured global
+            # state/configuration. Only their workspaces and launch owners differ.
+            environment = self._controlled_search(root, workspace, label)
+            configure_container(environment, workspace)
+            front, diagnostic = await self._front(environment, workspace, lifetime_boundary=True, cleanup=self.addAsyncCleanup)
+            fronts.append(front)
+            diagnostics.append(diagnostic)
+            await self._request(front, 1, 'initialize', {'protocolVersion': 1})
+            opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
+            sessions.append(opened['sessionId'])
+            pending.append(asyncio.create_task(self._request(front, 3, 'session/prompt', {
+                'sessionId': sessions[-1], 'prompt': [{'type': 'text', 'text': f'Start {label}'}]})))
+            # Register each reader immediately, after its own frontend cleanup:
+            # failure while preparing B must still release A's protocol reader.
+            self.addAsyncCleanup(release_reader, pending[-1])
+
+        for workspace, task, label in zip(workspaces, pending, ['A', 'B']):
+            parent = await self._search_file(workspace, 'parent-ready', task)
+            child = await self._search_file(workspace, 'child-ready', task)
+            parents.append(parent)
+            children.append(child)
+            self.assertEqual(parent['label'], label)
+            for record in [parent, child]:
+                exits[record['host_pid']] = self._observe_process_exit(record['host_pid'])
+            await self._ping_search(workspace, 'parent', 'both-fronts-live', label,
+                                    exited=exits[parent['host_pid']])
+            await self._ping_search(workspace, 'child', 'both-fronts-live', label,
+                                    exited=exits[child['host_pid']])
+        self.assertNotEqual(sessions[0], sessions[1])
+        self.assertNotEqual(parents[0]['metadata'], parents[1]['metadata'])
+        self.assertEqual(len({record['host_pid'] for record in parents + children}), 4)
+        # Cancel only our stream reader, not the product operation. EOF is the
+        # user-facing close event, and the real front must cancel/join its work.
+        pending[0].cancel()
+        await asyncio.gather(pending[0], return_exceptions=True)
+        await self._close_front(fronts[0], diagnostics[0])
+        for record in [parents[0], children[0]]:
+            while not exits[record['host_pid']]():
+                await asyncio.sleep(0.01)
+        self.assertFalse(exits[parents[1]['host_pid']]())
+        self.assertFalse(exits[children[1]['host_pid']]())
+        self.assertFalse(pending[1].done())
+        await self._ping_search(workspaces[1], 'parent', 'after-A-shutdown', 'B',
+                                exited=exits[parents[1]['host_pid']])
+        await self._ping_search(workspaces[1], 'child', 'after-A-shutdown', 'B',
+                                exited=exits[children[1]['host_pid']])
+        with open(os.path.join(workspaces[1], 'parent-finish'), 'x'):
+            pass
+        reply, messages = await pending[1]
+        self.assertEqual(reply, {'stopReason': 'end_turn'})
+        wire = json.dumps(_tool_updates(messages, sessions[1]))
+        self.assertIn('CONTROLLED_SEARCH_OUTPUT_B', wire)
+        self.assertNotIn('CONTROLLED_SEARCH_OUTPUT_A', wire)
+        with open(parents[1]['metadata'], encoding='utf-8') as stream:
+            metadata = json.load(stream)
+        self.assertEqual(metadata['exit_code'], 0)
+        self.assertEqual(metadata['cwd'], workspaces[1])
+        self.assertFalse(exits[children[1]['host_pid']]())
+        await self._ping_search(workspaces[1], 'child', 'after-B-command-close', 'B',
+                                exited=exits[children[1]['host_pid']])
+        await self._finish(fronts[1], diagnostics[1], sessions[1])
+        while not exits[children[1]['host_pid']]():
+            await asyncio.sleep(0.01)
+
+    async def test_shipped_front_agent_runs_restricted_external_search(self):
+        root = self.enterContext(tempfile.TemporaryDirectory(prefix='acp-agent-workflow-'))
+        workspace = os.path.join(root, 'workspace')
+        private_files.make_private_directory(workspace)
+        state_home = os.path.join(root, 'state')
+        environment = child_environment(
+            HOME=root, PATH=os.environ.get('PATH', ''), TERM='dumb',
+            XDG_CONFIG_HOME=os.path.join(root, 'config'), XDG_STATE_HOME=state_home,
+            LOKI_PROVIDER='openai', LOKI_MODEL='workflow-model', LOKI_STREAM='0',
+            LOKI_API_KEY='synthetic-workflow-key',
+            ANTHROPIC_API_KEY='synthetic-unselected-key')
+        state = app_paths.loki_state_dir(environment)
+        witness = os.path.join(workspace, 'observed.json')
+        payload = os.path.join(workspace, 'payload.py')
+        # This is the arbitrary external payload, not a sandbox installer. Real
+        # rg invokes the selected interpreter with the searched filename as its
+        # preprocessor argument. Explore still advertises/adopts only Grep.
+        configuration = json.dumps({'state': state, 'witness': witness})
+        source = '''import errno, json, os
+configuration = json.loads(CONFIGURATION)
+records = []
+for directory, _children, names in os.walk(os.path.join(configuration['state'], 'jobs')):
+    if 'job.json' in names:
+        path = os.path.join(directory, 'job.json')
+        with open(path, encoding='utf-8') as stream:
+            record = json.load(stream)
+        if '--subagent' in (record.get('argv') or []):
+            records.append([path, record])
+assert len(records) == 1, records
+path, owner = records[0]
+with open(path, 'rb') as stream:
+    before = stream.read()
+failures = {}
+for operation, target, mode in [
+        ['mutation', path, 'wb'],
+        ['creation', os.path.join(configuration['state'], 'forbidden-new-file'), 'xb']]:
+    try:
+        with open(target, mode) as stream:
+            stream.write(b'forbidden state write')
+    except OSError as error:
+        failures[operation] = {'errno': error.errno, 'winerror': getattr(error, 'winerror', None)}
+    else:
+        failures[operation] = {'allowed': True}
+with open(path, 'rb') as stream:
+    unchanged = stream.read() == before
+with open(configuration['witness'], 'x', encoding='utf-8') as stream:
+    json.dump({'pid': os.getpid(), 'parent': os.getppid(), 'owner': owner,
+               'read': bool(before), 'unchanged': unchanged,
+               'credential_environment': [name for name in ['LOKI_API_KEY', 'ANTHROPIC_API_KEY']
+                                          if name in os.environ],
+               **failures}, stream)
+print('ACP_AGENT_ORDINARY_COMMAND_OBSERVED')
+'''.replace('CONFIGURATION', repr(configuration))
+        with open(payload, 'w', encoding='utf-8') as stream:
+            stream.write(source)
+        rg_config = os.path.join(workspace, 'ripgrep.conf')
+        with open(rg_config, 'w', encoding='utf-8') as stream:
+            stream.write('--pre\n' + sys.executable + '\n')
+        environment['RIPGREP_CONFIG_PATH'] = rg_config
+        agent_args = {'description': 'Inspect the workflow fixture',
+                      'prompt': 'Search payload.py for ACP_AGENT_ORDINARY_COMMAND_OBSERVED',
+                      'subagent_type': 'Explore'}
+        search_args = {'pattern': 'ACP_AGENT_ORDINARY_COMMAND_OBSERVED',
+                       'path': payload, 'output_mode': 'content'}
+
+        async def respond(request):
+            # Match a role-scoped user prompt, not the child prompt embedded
+            # inside the parent's Agent arguments or its available tools.
+            parent = any(message.get('role') == 'user' and message.get('content') == 'Run the Agent workflow'
+                         for message in request['messages'])
+            call_id = 'workflow-agent' if parent else 'workflow-search'
+            if any(message.get('tool_call_id') == call_id
+                   for message in request['messages']):
+                return {'role': 'assistant', 'content':
+                        'Agent workflow complete.' if parent else 'External search complete.'}
+            return {'role': 'assistant', 'content': None, 'tool_calls': [{
+                'id': call_id, 'type': 'function', 'function': {
+                    'name': 'Agent' if parent else 'Grep',
+                    'arguments': json.dumps(agent_args if parent else search_args)}}]}
+
+        url, requests, authorizations = await self._provider(respond)
+        environment['LOKI_API_BASE'] = url
+        configure_container(environment, workspace)
+        front, diagnostics = await self._front(environment, workspace, cleanup=self.addAsyncCleanup)
+        await self._request(front, 1, 'initialize', {'protocolVersion': 1})
+        opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
+        session_id = opened['sessionId']
+        reply, messages = await self._request(front, 3, 'session/prompt', {
+            'sessionId': session_id, 'prompt': [{'type': 'text', 'text': 'Run the Agent workflow'}]})
+        self.assertEqual(reply, {'stopReason': 'end_turn'})
+        self.assertEqual(len(requests), 4, [
+            {'tools': [tool['function']['name'] for tool in request.get('tools', [])],
+             'last': request['messages'][-1]} for request in requests])
+        for request in requests[1:3]:
+            names = {tool['function']['name'] for tool in request.get('tools', [])}
+            self.assertIn('Grep', names)
+            self.assertNotIn('Bash', names)
+        self.assertTrue(os.path.exists(witness), requests[2]['messages'][-1])
+        with open(witness, encoding='utf-8') as stream:
+            observed = json.load(stream)
+        self.assertEqual(authorizations, ['Bearer synthetic-workflow-key'] * 4)
+        self.assertTrue(observed['read'])
+        self.assertTrue(observed['unchanged'])
+        self.assertEqual(observed['credential_environment'], [])
+        self.assertNotEqual(observed['pid'], observed['parent'])
+        self.assertEqual(observed['owner']['status'], 'running')
+        for operation in ['mutation', 'creation']:
+            self.assertNotIn('allowed', observed[operation], observed)
+            self.assertIn(observed[operation]['errno'], [errno.EACCES, errno.EPERM, errno.EROFS])
+            self.assertIn(observed[operation]['winerror'], [None, 5], observed)
+        records = []
+        for directory, _children, names in os.walk(os.path.join(state, 'jobs')):
+            if 'job.json' in names:
+                with open(os.path.join(directory, 'job.json'), encoding='utf-8') as stream:
+                    records.append(json.load(stream))
+        self.assertEqual(len(records), 2, records)
+        self.assertEqual({record['pid'] for record in records},
+                         {observed['owner']['pid'], observed['parent']})
+        for record in records:
+            self.assertEqual(record['status'], 'exited', record)
+            self.assertEqual(record['exit_code'], 0, record)
+        inner = requests[2]['messages'][-1]
+        self.assertEqual(inner['tool_call_id'], 'workflow-search')
+        self.assertIn('ACP_AGENT_ORDINARY_COMMAND_OBSERVED', inner['content'])
+        updates = _tool_updates(messages, session_id)
+        self.assertTrue(any(update.get('toolCallId') == 'workflow-agent' for update in updates))
+        self.assertIn('External search complete.', json.dumps(updates))
+        await self._finish(front, diagnostics, session_id)
+        saved_path = os.path.join(app_paths.chat_log_dir_for(workspace), f'chat-{session_id}.json')
+        with open(saved_path, encoding='utf-8') as stream:
+            saved = json.load(stream)
+        results = [event for event in saved['events'] if event['type'] == 'tool_result']
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['name'], 'Agent')
+        self.assertFalse(results[0]['is_error'])
+        self.assertIn('External search complete.', json.dumps(results[0]))
+
+    async def test_ping_refuses_an_actor_that_exited_without_a_reply(self):
+        workspace = self.enterContext(tempfile.TemporaryDirectory())
+        before = asyncio.all_tasks()
+        with self.assertRaisesRegex(AssertionError, 'child exited before replying'):
+            await self._ping_search(workspace, 'child', 'fresh-request', 'A', exited=lambda: True)
+        self.assertEqual(asyncio.all_tasks(), before)
 
 
 def _command_fixture(root):
