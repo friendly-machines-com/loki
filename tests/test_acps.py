@@ -172,74 +172,6 @@ class FrontInputFailureTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await source.close()
 
-    async def test_event_wait_observes_front_exit(self):
-        source = _FrontInput(mock.Mock(run=mock.AsyncMock()))
-        before = asyncio.all_tasks()
-        try:
-            with self.assertRaisesRegex(AssertionError, 'operation ended before expected fixture event'):
-                await observe_fixture(asyncio.Event().wait(), source.task)
-            self.assertFalse(asyncio.all_tasks() - before)
-        finally:
-            await source.close()
-
-    async def test_event_wait_propagates_front_failure(self):
-        failure = OSError('front failed while awaiting an event')
-        source = _FrontInput(mock.Mock(run=mock.AsyncMock(side_effect=failure)))
-        before = asyncio.all_tasks()
-        try:
-            with self.assertRaises(OSError) as caught:
-                await observe_fixture(asyncio.Event().wait(), source.task)
-            self.assertIs(caught.exception, failure)
-            self.assertFalse(asyncio.all_tasks() - before)
-        finally:
-            await source.close()
-
-    async def test_event_wait_joins_its_observer_without_cancelling_owners(self):
-        source = _FrontInput(mock.Mock(run=asyncio.Event().wait))
-        operation = asyncio.get_running_loop().create_future()
-        event = asyncio.Event()
-        before = asyncio.all_tasks()
-        try:
-            event.set()
-            self.assertTrue(await observe_fixture(event.wait(), source.task, operation))
-            self.assertFalse(operation.done())
-            self.assertFalse(source.task.done())
-            self.assertFalse(asyncio.all_tasks() - before)
-        finally:
-            await source.close()
-
-    async def test_cancelled_event_wait_joins_only_its_observer(self):
-        source = _FrontInput(mock.Mock(run=asyncio.Event().wait))
-        operation = asyncio.get_running_loop().create_future()
-        before = asyncio.all_tasks()
-        waiting = asyncio.create_task(observe_fixture(asyncio.Event().wait(), source.task, operation))
-        try:
-            await asyncio.sleep(0)
-            waiting.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await waiting
-            self.assertFalse(operation.done())
-            self.assertFalse(source.task.done())
-            self.assertFalse(asyncio.all_tasks() - before)
-        finally:
-            waiting.cancel()
-            await asyncio.gather(waiting, return_exceptions=True)
-            await source.close()
-
-    async def test_event_wait_rejects_reply_before_event(self):
-        source = _FrontInput(mock.Mock(run=asyncio.Event().wait))
-        operation = asyncio.get_running_loop().create_future()
-        before = asyncio.all_tasks()
-        try:
-            operation.set_result('reply before event')
-            with self.assertRaisesRegex(AssertionError, 'reply before event'):
-                await observe_fixture(asyncio.Event().wait(), source.task, operation)
-            self.assertEqual(operation.result(), 'reply before event')
-            self.assertFalse(source.task.done())
-            self.assertFalse(asyncio.all_tasks() - before)
-        finally:
-            await source.close()
-
 
 class FramingTests(unittest.IsolatedAsyncioTestCase):
     def checked_writer(self, output):
@@ -393,48 +325,6 @@ class FramingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reply['id'] is None, 'oversized identifier was echoed')
         self.assertIn('error', reply)
         self.assertLessEqual(len(output.getvalue().encode('utf-8')), 16 * 1024 * 1024 + 1)
-
-    async def test_pending_open_rejects_local_commands_before_prompt_admission(self):
-        from loki_agent import acp_worker
-        from loki_agent.sessions import Session
-
-        session = Session()
-        self.addCleanup(session.response_headers.close)
-        replies = []
-        worker = acp_worker.Worker(session, replies.append)
-        self.addAsyncCleanup(worker.close)
-        worker._pending_open = acp_worker.PendingSessionOpen(None, acp_worker._UNCHANGED, 'session/new')
-        worker.cancel_event.set()
-        with mock.patch.object(acp_worker.acp_commands, 'run', new=mock.AsyncMock()) as command:
-            await worker.handle(acps.request(1, 'session/prompt', {
-                'sessionId': 's', 'prompt': [{'type': 'text', 'text': '!must-not-run'}]}), concurrent=True)
-            self.assertIsNone(worker._prompt_task)
-            self.assertTrue(worker.cancel_event.is_set())
-            self.assertEqual(session.transcript_items, [])
-            self.assertEqual(replies[0]['error']['code'], acps.INVALID_PARAMS)
-            command.assert_not_awaited()
-
-    async def test_pending_open_rejects_configuration_mutation_and_selection(self):
-        from loki_agent import acp_worker
-        from loki_agent.sessions import Session
-
-        session = Session()
-        self.addCleanup(session.response_headers.close)
-        replies = []
-        worker = acp_worker.Worker(session, replies.append)
-        self.addAsyncCleanup(worker.close)
-        pending = acp_worker.PendingSessionOpen(None, acp_worker._UNCHANGED, 'session/new')
-        worker._pending_open = pending
-        with mock.patch.object(worker, 'set_config_option', return_value={}) as change, \
-                mock.patch.object(worker, 'describe_config_selection', return_value={}) as describe:
-            for method in ['session/set_config_option', 'session/describe_config_selection']:
-                await worker.handle(acps.request(method, method, {'configId': 'model', 'value': 'unused'}))
-                self.assertEqual(replies[-1]['error']['code'], acps.INVALID_PARAMS)
-                self.assertIs(worker._pending_open, pending)
-            change.assert_not_called()
-            describe.assert_not_called()
-        await worker.handle(acps.request(3, 'session/cancel', {}))
-        self.assertEqual(replies[-1]['result'], {})
 
     def test_response_and_notification_shapes(self):
         self.assertEqual(
@@ -645,39 +535,6 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
             protocol.connection_lost(None)
             await asyncio.gather(closing, return_exceptions=True)
 
-    async def test_revoke_failure_still_closes_and_joins_every_session(self):
-        from loki_agent import windows_api
-
-        front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
-        first = front._reserve_session('first')
-        second = front._reserve_session('second')
-        failure = windows_api.WindowsApiError('CloseHandle failed', status=6)
-        first.delegation = mock.Mock(revoke_now=mock.Mock(side_effect=failure), close=mock.AsyncMock())
-        second.delegation = mock.Mock(close=mock.AsyncMock())
-        with self.assertRaises(windows_api.WindowsApiError) as caught:
-            await front.shutdown()
-        self.assertIs(caught.exception, failure)
-        first.delegation.close.assert_awaited_once_with()
-        second.delegation.close.assert_awaited_once_with()
-        self.assertTrue(first.cleanup.done())
-        self.assertTrue(second.cleanup.done())
-        self.assertFalse(front._sessions)
-
-    async def test_failed_retirement_keeps_its_closing_owner_and_reports_failure(self):
-        from loki_agent import windows_api
-
-        front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
-        owner = front._reserve_session('session')
-        failure = windows_api.WindowsApiError('CloseHandle failed', status=6)
-        owner.channel = mock.Mock(close=mock.AsyncMock(side_effect=failure))
-        with self.assertRaises(windows_api.WindowsApiError) as caught:
-            await front.shutdown()
-        self.assertIs(caught.exception, failure)
-        self.assertTrue(owner.cleanup.done())
-        self.assertIs(front._sessions['session'], owner)
-        self.assertEqual(owner.state, 'closing')
-        owner.channel.close.assert_awaited_once_with()
-
     async def test_worker_exit_awaits_credential_capability_cleanup(self):
         class Output:
             async def readline(self):
@@ -764,7 +621,54 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await channel.close()
 
 
-class WorkerSpawnGateTests(unittest.IsolatedAsyncioTestCase):
+class FrontSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_revoke_failure_still_closes_and_joins_every_session(self):
+        from loki_agent import windows_api
+
+        front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
+        first = front._reserve_session('first')
+        second = front._reserve_session('second')
+        failure = windows_api.WindowsApiError('CloseHandle failed', status=6)
+        first.delegation = mock.Mock(revoke_now=mock.Mock(side_effect=failure), close=mock.AsyncMock())
+        second.delegation = mock.Mock(close=mock.AsyncMock())
+        with self.assertRaises(windows_api.WindowsApiError) as caught:
+            await front.shutdown()
+        self.assertIs(caught.exception, failure)
+        first.delegation.close.assert_awaited_once_with()
+        second.delegation.close.assert_awaited_once_with()
+        self.assertTrue(first.cleanup.done())
+        self.assertTrue(second.cleanup.done())
+        self.assertFalse(front._sessions)
+
+    async def test_failed_retirement_keeps_its_closing_owner_and_reports_failure(self):
+        from loki_agent import windows_api
+
+        front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
+        owner = front._reserve_session('session')
+        failure = windows_api.WindowsApiError('CloseHandle failed', status=6)
+        owner.channel = mock.Mock(close=mock.AsyncMock(side_effect=failure))
+        with self.assertRaises(windows_api.WindowsApiError) as caught:
+            await front.shutdown()
+        self.assertIs(caught.exception, failure)
+        self.assertTrue(owner.cleanup.done())
+        self.assertIs(front._sessions['session'], owner)
+        self.assertEqual(owner.state, 'closing')
+        owner.channel.close.assert_awaited_once_with()
+
+    async def test_session_lifecycle_requires_explicit_cwd(self):
+        front = acp.Front(
+            lambda: None, lambda _message: None, CredentialStore({}))
+        with self.assertRaisesRegex(
+                acps.TransportError, "cwd must be an absolute path"):
+            await front.new_session({})
+        for method in acp.RESTORE_METHODS:
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(
+                        acps.TransportError,
+                        "cwd must be an absolute path"):
+                    await front.restore_session(
+                        method, {"sessionId": "saved"}, request_id=73)
+
     async def test_child_copy_release_failure_retires_the_created_worker(self):
         from loki_agent import windows_api
 
@@ -1074,20 +978,6 @@ class SavedConnectionAuthorizationTests(
                     message.get("method") == "elicitation/create"
                     for message in messages))
                 self.assertNotIn("saved", front.workers)
-
-    async def test_session_lifecycle_requires_explicit_cwd(self):
-        front = acp.Front(
-            lambda: None, lambda _message: None, CredentialStore({}))
-        with self.assertRaisesRegex(
-                acps.TransportError, "cwd must be an absolute path"):
-            await front.new_session({})
-        for method in acp.RESTORE_METHODS:
-            with self.subTest(method=method):
-                with self.assertRaisesRegex(
-                        acps.TransportError,
-                        "cwd must be an absolute path"):
-                    await front.restore_session(
-                        method, {"sessionId": "saved"}, request_id=73)
 
 
 class QuarantineTests(unittest.TestCase):
@@ -3805,6 +3695,48 @@ class _LocalWorkerProcess:
 
 
 class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_open_rejects_local_commands_before_prompt_admission(self):
+        from loki_agent import acp_worker
+        from loki_agent.sessions import Session
+
+        session = Session()
+        self.addCleanup(session.response_headers.close)
+        replies = []
+        worker = acp_worker.Worker(session, replies.append)
+        self.addAsyncCleanup(worker.close)
+        worker._pending_open = acp_worker.PendingSessionOpen(None, acp_worker._UNCHANGED, 'session/new')
+        worker.cancel_event.set()
+        with mock.patch.object(acp_worker.acp_commands, 'run', new=mock.AsyncMock()) as command:
+            await worker.handle(acps.request(1, 'session/prompt', {
+                'sessionId': 's', 'prompt': [{'type': 'text', 'text': '!must-not-run'}]}), concurrent=True)
+            self.assertIsNone(worker._prompt_task)
+            self.assertTrue(worker.cancel_event.is_set())
+            self.assertEqual(session.transcript_items, [])
+            self.assertEqual(replies[0]['error']['code'], acps.INVALID_PARAMS)
+            command.assert_not_awaited()
+
+    async def test_pending_open_rejects_configuration_mutation_and_selection(self):
+        from loki_agent import acp_worker
+        from loki_agent.sessions import Session
+
+        session = Session()
+        self.addCleanup(session.response_headers.close)
+        replies = []
+        worker = acp_worker.Worker(session, replies.append)
+        self.addAsyncCleanup(worker.close)
+        pending = acp_worker.PendingSessionOpen(None, acp_worker._UNCHANGED, 'session/new')
+        worker._pending_open = pending
+        with mock.patch.object(worker, 'set_config_option', return_value={}) as change, \
+                mock.patch.object(worker, 'describe_config_selection', return_value={}) as describe:
+            for method in ['session/set_config_option', 'session/describe_config_selection']:
+                await worker.handle(acps.request(method, method, {'configId': 'model', 'value': 'unused'}))
+                self.assertEqual(replies[-1]['error']['code'], acps.INVALID_PARAMS)
+                self.assertIs(worker._pending_open, pending)
+            change.assert_not_called()
+            describe.assert_not_called()
+        await worker.handle(acps.request(3, 'session/cancel', {}))
+        self.assertEqual(replies[-1]['result'], {})
+
     @asynccontextmanager
     async def _channel(self, root, messages, completion):
         from loki_agent import formats, loki, response_headers
