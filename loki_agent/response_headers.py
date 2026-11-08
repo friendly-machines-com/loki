@@ -478,6 +478,47 @@ def render(document):
     return "\n".join(lines).rstrip()
 
 
+def status_text(config, store, argument):
+    """Render borrowed observations without saving or scheduling work.
+
+    Terminal and ACP both need the same connection/credential selection and
+    command prose; render(document) alone only formats endpoint entries. Each
+    frontend captures its inputs and retains admission, save and output control.
+    """
+    from . import protocols, provider_controls
+    tokens = argument.split()
+    show_all = "all" in tokens
+    as_json = "--json" in tokens
+    connected = config is not None and config.chat_provider.kind != protocols.DUMMY
+    if show_all:
+        document = store.snapshot()
+    elif connected:
+        credential = config.auth_spec.credential if config.auth_spec else None
+        document = store.snapshot(
+            config.chat_provider.chat_url,
+            credential=credential.encode() if credential else None)
+    else:
+        document = {"version": 1, "endpoints": []}
+    if as_json:
+        return json.dumps(document, indent=2, ensure_ascii=True)
+    scope = "All known connections" if show_all else "Current endpoint and credential"
+    text = (
+        f"{scope} (last observed, not live balances).\n"
+        "Saved observations plus this runtime's memory; other "
+        "runtimes' unsaved observations are not visible.\n")
+    if not show_all and not connected:
+        text += "No active HTTP chat connection. Use /status all."
+    elif not show_all and not document["endpoints"]:
+        text += "No observations for the current connection."
+    else:
+        text += render(document)
+    # This is a static hint, never a live account request or JSON suffix.
+    hint = provider_controls.live_hint(provider_controls.ControlContext(config=config))
+    if hint is not None:
+        text += "\n" + hint
+    return text
+
+
 def main(args):
     parser = argparse.ArgumentParser(description=(
         "Inspect saved HTTP chat response headers (not live worker memory)."))

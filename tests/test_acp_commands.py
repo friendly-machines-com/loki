@@ -1,9 +1,11 @@
+import json
 import os
 import tempfile
 import unittest
 from unittest import mock
 
 from loki_agent import acp_commands
+from loki_agent import authentications, connections, models, openai_models, protocols
 from loki_agent import loki
 from loki_agent import provider_controls, skills
 from loki_agent.sessions import Session
@@ -145,6 +147,19 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         outcome = await acp_commands.run("/status", _session)
 
         self.assertIn("No active HTTP chat connection", outcome.text)
+
+    async def test_status_json_is_json_when_account_controls_are_available(self):
+        current = self._install("/tmp")
+        self.addCleanup(current.response_headers.close)
+        current.runtime_config = connections.make_runtime_config(
+            authentications.OPENAI_CHATGPT_RESPONSES_URL, protocols.OPENAI_RESPONSES,
+            model="model", credential_ref=authentications.CredentialRef.openai_subscription(),
+            auth_scheme="openai-subscription", provider_id=models.OPENAI_SUBSCRIPTION_PROVIDER_ID,
+            openai_request_profile=openai_models.CodexModelRequestProfile.from_catalog_model({}))
+        outcome = await acp_commands.run("/status all --json", current)
+        self.assertEqual(json.loads(outcome.text), current.response_headers.snapshot())
+        outcome = await acp_commands.run("/status all", current)
+        self.assertIn("Live account data: /account usage, /account resets", outcome.text)
 
     async def test_account_without_controls_is_explicit(self):
         _session = self._install("/tmp")

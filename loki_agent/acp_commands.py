@@ -19,8 +19,6 @@ in command_deliveries does not change this gate.
 
 from __future__ import annotations
 
-import json
-
 from . import attachments, loki, provider_controls, skills
 
 
@@ -104,45 +102,9 @@ def _control_context(session):
 
 async def _status(argument: str, session) -> Outcome:
     from . import response_headers
-    tokens = argument.split()
-    show_all = "all" in tokens
-    as_json = "--json" in tokens
     config = loki.current_config()
-    connected = (
-        config is not None
-        and config.chat_provider.kind != loki.protocols.DUMMY)
-    store = session.response_headers
-    if show_all:
-        document = store.snapshot()
-    elif connected:
-        credential = (
-            config.auth_spec.credential if config.auth_spec else None)
-        document = store.snapshot(
-            config.chat_provider.chat_url,
-            credential=credential.encode() if credential else None)
-    else:
-        document = {"version": 1, "endpoints": []}
-    if as_json:
-        text = json.dumps(document, indent=2, ensure_ascii=True)
-    else:
-        scope = (
-            "All known connections" if show_all
-            else "Current endpoint and credential")
-        text = (
-            f"{scope} (last observed, not live balances).\n"
-            "Saved observations plus this runtime's memory; other "
-            "runtimes' unsaved observations are not visible.\n")
-        if not show_all and not connected:
-            text += "No active HTTP chat connection. Use /status all."
-        elif not show_all and not document["endpoints"]:
-            text += "No observations for the current connection."
-        else:
-            text += response_headers.render(document)
-    hint = provider_controls.live_hint(
-        provider_controls.ControlContext(config=config))
-    if hint is not None:
-        text += "\n" + hint
-    return Outcome(text=text)
+    return Outcome(text=response_headers.status_text(
+        config, session.response_headers, argument))
 
 
 async def _status_save(argument: str, session) -> Outcome:

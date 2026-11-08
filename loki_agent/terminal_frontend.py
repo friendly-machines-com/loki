@@ -207,43 +207,7 @@ def _immediate_status(argument: str):
                 raise OSError("response status snapshot is busy")
             text = "Response status saved (this runtime only)."
         else:
-            tokens = argument.split()
-            show_all = "all" in tokens
-            as_json = "--json" in tokens
-            connected = (config is not None
-                         and config.chat_provider.kind != protocols.DUMMY)
-            if show_all:
-                document = store.snapshot()
-            elif connected:
-                credential = (config.auth_spec.credential
-                              if config.auth_spec else None)
-                document = store.snapshot(
-                    config.chat_provider.chat_url,
-                    credential=credential.encode() if credential else None)
-            else:
-                document = {"version": 1, "endpoints": []}
-            if as_json:
-                text = json.dumps(document, indent=2, ensure_ascii=True)
-            else:
-                scope = ("All known connections" if show_all
-                         else "Current endpoint and credential")
-                text = (
-                    f"{scope} (last observed, not live balances).\n"
-                    "Saved observations plus this runtime's memory; other "
-                    "runtimes' unsaved observations are not visible.\n")
-                if not show_all and not connected:
-                    text += ("No active HTTP chat connection. "
-                             "Use /status all.")
-                elif not show_all and not document["endpoints"]:
-                    text += "No observations for the current connection."
-                else:
-                    text += response_headers.render(document)
-            # This is a static hint, never a live account request.
-            from . import provider_controls
-            hint = provider_controls.live_hint(
-                provider_controls.ControlContext(config=config))
-            if hint is not None:
-                text += "\n" + hint
+            text = response_headers.status_text(config, store, argument)
     except (OSError, ValueError, OverflowError) as error:
         action = "save" if argument == "save" else "read"
         text = f"Could not {action} response status: {error}"

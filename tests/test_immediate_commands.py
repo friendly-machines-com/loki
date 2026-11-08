@@ -21,7 +21,7 @@ from config_fixtures import setUpModule as set_up_config
 from test_terminals import RecordingTerminal
 
 from loki_agent import (
-    connections, file_locks, formats, loki, models, protocols,
+    authentications, connections, file_locks, formats, loki, models, openai_models, protocols,
     settings, terminal_frontend, terminals,
 )
 from loki_agent.provider_controls import ControlAction, ControlResult
@@ -256,6 +256,20 @@ class ImmediateCommandTests(unittest.TestCase):
             thread.assert_not_called()
             async_save.assert_not_called()
             chat.assert_not_called()
+
+    def test_status_json_is_json_when_account_controls_are_available(self):
+        self.session.runtime_config = connections.make_runtime_config(
+            authentications.OPENAI_CHATGPT_RESPONSES_URL, protocols.OPENAI_RESPONSES,
+            model="model", credential_ref=authentications.CredentialRef.openai_subscription(),
+            auth_scheme="openai-subscription", provider_id=models.OPENAI_SUBSCRIPTION_PROVIDER_ID,
+            openai_request_profile=openai_models.CodexModelRequestProfile.from_catalog_model({}))
+        with mock.patch.object(terminal_frontend, '_emit_immediate_output') as output:
+            self.assertTrue(terminal_frontend._submit_immediate("/status all --json"))
+            self.assertEqual(json.loads(output.call_args.args[1]), self.session.response_headers.snapshot())
+            self.assertTrue(terminal_frontend._submit_immediate("/status all"))
+            self.assertIn("Live account data: /account usage, /account resets", output.call_args.args[1])
+        self.assertFalse(terminal_frontend._immediate_tasks)
+        self.assertEqual(self.session.transcript_items, self.initial)
 
     def test_status_finishes_inline_during_a_running_turn(self):
         async def scenario():
