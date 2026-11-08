@@ -26,14 +26,35 @@ _PREVIEW_RE = re.compile(
 )
 
 
+_CHAT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
+
+
+def valid_chat_id(chat_id: str) -> bool:
+    """The same identifier alphabet applies to allocation and saved-name admission."""
+    return isinstance(chat_id, str) and _CHAT_ID_RE.fullmatch(chat_id) is not None
+
+
+def _saved_chat_id(filename: str) -> str | None:
+    if filename.startswith('chat-') and filename.endswith('.json'):
+        identifier = filename[len('chat-'):-len('.json')]
+        if valid_chat_id(identifier):
+            return identifier
+    return None
+
+
 def chat_log_filename(chat_id: str) -> str:
-    if chat_id.startswith("chat-") and chat_id.endswith(".json"):
+    if _saved_chat_id(chat_id) is not None:
         return chat_id
+    if not valid_chat_id(chat_id):
+        raise ValueError('conversation name is invalid')
     return "chat-{}.json".format(chat_id)
 
 
-def new_chat_log_path(chat_log_dir: str) -> str:
-    return os.path.join(chat_log_dir, chat_log_filename(str(uuid.uuid4())))
+def new_chat_log_path(chat_log_dir: str, chat_id: str | None = None) -> str:
+    identifier = str(uuid.uuid4()) if chat_id is None else chat_id
+    if not valid_chat_id(identifier):
+        raise ValueError('new conversation name is invalid')
+    return os.path.join(chat_log_dir, chat_log_filename(identifier))
 
 
 def resolve_chat_log_path(resume_arg: str, startup_cwd: str,
@@ -47,13 +68,26 @@ def resolve_chat_log_path(resume_arg: str, startup_cwd: str,
     return os.path.join(chat_log_dir, chat_log_filename(resume_arg))
 
 
-def chat_log_entries(chat_log_dir: str) -> list[os.DirEntry]:
+def chat_log_entries(chat_log_dir: str) -> list[os.DirEntry[str]]:
     try:
         with os.scandir(chat_log_dir) as directory:
             return [entry for entry in directory
-                    if entry.name.startswith("chat-") and entry.name.endswith(".json")]
+                    if _saved_chat_id(entry.name) is not None]
     except FileNotFoundError:
         return []
+
+
+def saved_chat_log_path(chat_log_dir: str, chat_id: str) -> str | None:
+    """Select an exact saved ID without trusting names merely because they exist.
+
+    The directory may be writable by tools. Filter its names through the same
+    allowlist as new IDs, and use the enumerated path rather than an ID-built
+    pathname. Filename-looking aliases are not valid conversation IDs.
+    """
+    if not valid_chat_id(chat_id):
+        return None
+    return next((entry.path for entry in chat_log_entries(chat_log_dir)
+                 if _saved_chat_id(entry.name) == chat_id), None)
 
 
 @contextmanager
@@ -105,17 +139,19 @@ def preview(text: str) -> str:
     return snippet
 
 
-def format_picker_row(idx: int, entry: os.DirEntry) -> str:
+def format_picker_row(idx: int, entry: os.DirEntry[str]) -> str:
+    chat_id = _saved_chat_id(entry.name)
+    if chat_id is None:
+        raise ValueError('saved conversation name is invalid')
     try:
         mtime = os.path.getmtime(entry.path)
     except OSError:
         mtime = 0
     when = time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))
-    chat_id = entry.name[len("chat-"):-len(".json")]
     return f"  {idx}. {when}  {chat_id[:8]}  {preview(text_for(entry.path))}"
 
 
-def filtered_chat_log_entries(query: str, chat_log_dir: str) -> list[os.DirEntry]:
+def filtered_chat_log_entries(query: str, chat_log_dir: str) -> list[os.DirEntry[str]]:
     # Match by whole-file substring, not parsed JSON -- fast, tolerant of
     # partially-written logs. mtime ordering puts the most recently touched
     # conversation at the bottom of the list.

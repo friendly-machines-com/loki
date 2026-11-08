@@ -373,10 +373,11 @@ class Front:
                 "message": str(error),
             }))
 
-    def _reserve_session(self, session_id):
-        if not isinstance(session_id, str) or not session_id:
+    def _reserve_session(self, session_id: object):
+        # Wire values are untrusted; the shared bool predicate is not a type guard.
+        if not isinstance(session_id, str) or not savefiles.valid_chat_id(session_id):
             raise acps.TransportError(
-                "session open requires sessionId", code=acps.INVALID_PARAMS)
+                "session name is invalid", code=acps.INVALID_PARAMS)
         if session_id in self._sessions:
             raise acps.TransportError(
                 f"session {session_id!r} is already active",

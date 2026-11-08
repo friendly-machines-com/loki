@@ -9,7 +9,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-from . import connections, model_requests, paths, tool_contracts
+from . import connections, model_requests, paths, savefiles, tool_contracts
 from . import (
     acp_commands,
     acps,
@@ -412,17 +412,11 @@ class Worker:
                 code=acps.INVALID_PARAMS,
             )
         session_id = params.get("sessionId")
-        if not isinstance(session_id, str) or not session_id:
+        if not savefiles.valid_chat_id(session_id):
             raise acps.TransportError(
-                "session/open requires sessionId",
+                "session name is invalid",
                 code=acps.INVALID_PARAMS,
             )
-        self.session_id = session_id
-        # The front relays the client's advertised elicitation capability.
-        # Absent means the client cannot render questions: the Ask tool is
-        # withheld from the model entirely.
-        self.can_ask_user = params.get("formElicitation") is True
-
         open_method = params.get("openMethod")
         if open_method not in [
                 "session/new", "session/load", "session/resume"]:
@@ -430,22 +424,27 @@ class Worker:
                 f"unsupported session opening method {open_method!r}",
                 code=acps.INVALID_PARAMS,
             )
+        # Validate both new and restored IDs before state publication or model
+        # discovery. A tool-created filename cannot widen the allowed alphabet.
+        directory = paths.chat_log_dir_for(cwd)
+        try:
+            path = (savefiles.new_chat_log_path(directory, session_id)
+                    if open_method == 'session/new'
+                    else savefiles.saved_chat_log_path(directory, session_id))
+        except (OSError, ValueError) as error:
+            raise acps.TransportError(
+                f'could not select session name {session_id!r}: {error}',
+                code=acps.INVALID_PARAMS) from error
+        if path is None:
+            raise acps.TransportError(
+                f'no saved session named {session_id!r}', code=acps.INVALID_PARAMS)
+        self.session_id = session_id
+        # The front relays whether its client can render questions. Saved
+        # conversation data cannot supply this live capability.
+        self.can_ask_user = params.get('formElicitation') is True
         saved_descriptor = None
         connection_update = _UNCHANGED
         if open_method != "session/new":
-            if os.path.basename(session_id) != session_id:
-                raise acps.TransportError(
-                    "saved session id must be a local chat-log name",
-                    code=acps.INVALID_PARAMS,
-                )
-            path = os.path.join(
-                paths.chat_log_dir_for(cwd),
-                loki.chat_log_filename(session_id))
-            if not os.path.isfile(path):
-                raise acps.TransportError(
-                    f"no saved session named {session_id!r}",
-                    code=acps.INVALID_PARAMS,
-                )
             try:
                 loki.load_chat_log(path)
                 saved_descriptor = loki.connection_from_session_state(
@@ -476,23 +475,7 @@ class Worker:
             self.session.shell_cwd = cwd
         else:
             self.session.shell_cwd = cwd
-            try:
-                loki.new_chat_log(os.path.join(
-                    paths.chat_log_dir_for(cwd),
-                    loki.chat_log_filename(session_id),
-                ))
-            except OSError as error:
-                # A refused write here is the first thing a session does, and
-                # the descriptors that look benign from outside are met from
-                # inside this process; record what it saw before failing.
-                if os.name == "nt":
-                    import traceback
-
-                    from . import windows_runtime
-                    windows_runtime.report_write_failure(
-                        "chat-log", getattr(error, "filename", None), error,
-                        traceback.format_exc())
-                raise
+            loki.new_chat_log(path)
 
         # Await discovery so a resumed subscription uses fresh exact-slug
         # request data before any config choice or prompt becomes available.
