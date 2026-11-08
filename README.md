@@ -34,6 +34,20 @@ On Windows, requires Python 3.12.4 or later and one of:
 * Windows 11 24H2 (build 26100) or later (desktop apps only).
 * Windows Server 2025 (build 26100) or later.
 
+On Windows, also install:
+
+* **ripgrep 15** (`rg.exe`), used by Grep.
+* **Bash** (`bash.exe`), used by the Bash tool and `!` commands. PowerShell
+  and `cmd.exe` are not substitutes for Bash.
+
+Both must be on `PATH` in the terminal or editor that launches Loki.
+Restart the terminal or editor after changing `PATH`, then check in PowerShell:
+
+```powershell
+rg --version
+bash --version
+```
+
 Run it in a VM or container.
 
 On Windows there is no VM requirement: ``loki-setup`` configures an
