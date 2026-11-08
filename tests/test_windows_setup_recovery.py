@@ -1,7 +1,9 @@
 """Setup decision/recovery tests. ACL calls are substituted, not native evidence."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import os
+import subprocess
+import time
 import sys
 import tempfile
 import types
@@ -27,6 +29,149 @@ def setUpModule():
 
 
 SID = 'S-1-15-2-1-2-3'
+
+
+class SetupTransactionTests(unittest.TestCase):
+    def test_lock_precedes_reload_and_releases_after_body_failure(self):
+        ledger = {'workspaces': {'stale': {}}}
+        backend = setup.WindowsBackend(ledger)
+        latest = {'version': 1, 'workspaces': {'current': {}}}
+        events = []
+        user = 'S-1-5-21-1-2-3-1001'
+
+        @contextmanager
+        def lock(name, *, security_descriptor):
+            self.assertEqual(name, 'Global\\Loki.Setup.' + user)
+            self.assertEqual(security_descriptor, setup.private_dacl_sddl(user))
+            events.append('lock')
+            try:
+                yield
+            finally:
+                events.append('release')
+
+        def load():
+            self.assertEqual(events, ['lock'])
+            events.append('reload')
+            return latest
+
+        with mock.patch.object(api, 'current_user_sid', return_value=user), \
+                mock.patch.object(api, 'named_mutex', new=lock), \
+                mock.patch.object(setup, 'load_ledger', side_effect=load):
+            with self.assertRaisesRegex(RuntimeError, 'body failure'):
+                with backend._transaction():
+                    self.assertIs(backend.ledger, ledger)
+                    self.assertEqual(ledger, latest)
+                    events.append('body')
+                    raise RuntimeError('body failure')
+        self.assertEqual(events, ['lock', 'reload', 'body', 'release'])
+
+    def test_uninstall_uses_current_grants_without_removing_unrequested_workspaces(self):
+        old = state.ledger_entry('workspace', 'profile', [state.Grant('stale-path', state.Access.READ, 'user')])
+        ledger = {'version': 1, 'workspaces': {'selected': old}}
+        backend = setup.WindowsBackend(ledger)
+        latest = {'version': 1, 'workspaces': {
+            'selected': state.ledger_entry('workspace', 'profile', [state.Grant('current-path', state.Access.READ, 'user')]),
+            'unrequested': state.ledger_entry('other', 'other-profile', [])}}
+        with mock.patch.object(api, 'current_user_sid', return_value='S-1-5-21-1-2-3-1001'), \
+                mock.patch.object(api, 'named_mutex', side_effect=lambda *args, **kwargs: nullcontext()), \
+                mock.patch.object(setup, 'load_ledger', return_value=latest), \
+                mock.patch.object(setup, 'save_ledger'), \
+                mock.patch.object(api, 'derive_app_container_sid', return_value=SID), \
+                mock.patch.object(backend, '_ungrant_path') as revoke, \
+                mock.patch.object(containers, 'delete_app_container_profile') as delete:
+            checks = backend.uninstall(ledger)
+        self.assertTrue(all(check.status == 'pass' for check in checks), checks)
+        revoke.assert_called_once_with('current-path', SID)
+        delete.assert_called_once_with('profile')
+        self.assertEqual(list(ledger['workspaces']), ['unrequested'])
+
+    def test_coordination_failure_does_not_enter_mutation(self):
+        backend = setup.WindowsBackend({})
+        with mock.patch.object(api, 'current_user_sid', return_value='S-1-5-21-1-2-3-1001'), \
+                mock.patch.object(api, 'named_mutex', side_effect=api.WindowsApiError('lock denied')), \
+                mock.patch.object(backend, '_apply') as apply, \
+                mock.patch.object(backend, '_uninstall') as uninstall:
+            for checks in [backend.apply(None, None), backend.uninstall({'workspaces': {}})]:
+                self.assertEqual([check.status for check in checks], ['fail'])
+                self.assertIn('lock denied', checks[0].detail)
+        apply.assert_not_called()
+        uninstall.assert_not_called()
+
+
+class NativeSetupTransactionTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'win32', 'native shared setup coordination')
+    def test_separate_configuration_roots_preserve_shared_directory_grants(self):
+        script = '''
+import os, sys, time
+from loki_agent import windows_api as api, windows_setup as setup, windows_state as state
+root, shared, role, ready, release, committed, started = sys.argv[1:]
+os.environ.update(XDG_CONFIG_HOME=os.path.join(root, 'config'), XDG_STATE_HOME=os.path.join(root, 'state'))
+package = api.derive_app_container_sid(state.profile_name_for(root))
+with open(started, 'w') as stream:
+    stream.write('started')
+backend = setup.WindowsBackend({})
+with backend._transaction():
+    handle = api.open_directory_for_acl(shared)
+    try:
+        if role == 'first':
+            with open(ready, 'w') as stream:
+                stream.write('ready')
+            while not os.path.exists(release):
+                time.sleep(0.01)
+        else:
+            assert os.path.exists(committed), 'entered before the competing grant was committed'
+        backend._grant_path(handle, shared, state.Access.READ, package)
+        if role == 'first':
+            with open(committed, 'w') as stream:
+                stream.write('committed')
+    finally:
+        api.close_handle(handle)
+print(package, flush=True)
+'''
+        with tempfile.TemporaryDirectory(prefix='loki-setup-coordination-') as root:
+            first, second, shared, ready, release, committed, started = [
+                os.path.join(root, name) for name in
+                ['first', 'second', 'shared', 'ready', 'release', 'committed', 'second-started']]
+            for directory in [first, second, shared]:
+                os.mkdir(directory)
+            workers = []
+
+            def launch(directory, role, marker):
+                process = subprocess.Popen(
+                    [sys.executable, '-c', script, directory, shared, role, ready, release, committed, marker],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                workers.append(process)
+                return process
+
+            def witness(marker, process):
+                while not os.path.exists(marker):
+                    if process.poll() is not None:
+                        self.fail(f'coordination actor exited before readiness: {process.communicate()}')
+                    time.sleep(0.01)
+
+            try:
+                one = launch(first, 'first', os.path.join(root, 'first-started'))
+                witness(ready, one)
+                two = launch(second, 'second', started)
+                witness(started, two)
+                with open(release, 'w') as stream:
+                    stream.write('release')
+                packages = []
+                for process in workers:
+                    stdout, stderr = process.communicate()
+                    self.assertEqual(process.returncode, 0, stderr)
+                    packages.append(stdout.strip())
+                descriptor = api.dacl_sddl(shared)
+                self.assertNotEqual(packages[0], packages[1])
+                self.assertTrue(all(state.grants_access(descriptor, package, state.Access.READ)
+                                    for package in packages), descriptor)
+            finally:
+                with open(release, 'w') as stream:
+                    stream.write('release')
+                for process in workers:
+                    if process.poll() is None:
+                        process.terminate()
+                    process.communicate()
 
 
 class RecoveryTests(unittest.TestCase):
@@ -64,6 +209,7 @@ class RecoveryTests(unittest.TestCase):
         patches = [
             # This decision fixture owns an authored ledger and substituted ACLs;
             # acquisition/reload and native contention have separate controls.
+            mock.patch.object(self.backend, '_transaction', side_effect=nullcontext),
             mock.patch.object(setup.paths, 'loki_config_dir', return_value=self.config),
             mock.patch.object(setup.paths, 'loki_state_dir', return_value=self.state),
             mock.patch.object(setup.paths, 'credential_directory',
@@ -142,6 +288,20 @@ class RecoveryTests(unittest.TestCase):
             self.descriptors[self.config], other_sid, state.Access.READ))
         self.assertIn(state.workspace_key(other_workspace), self.ledger['workspaces'])
 
+    def test_independent_pending_workspace_does_not_block_apply_or_lose_recovery(self):
+        other = os.path.join(self.root, 'other-workspace')
+        other_key = state.workspace_key(other)
+        pending = state.ledger_entry(other, state.profile_name_for(other), [
+            state.Grant(other, state.Access.READ_WRITE, 'workspace')])
+        pending['pending'] = True
+        self.ledger['workspaces'][other_key] = pending
+        checks = self.apply()
+        self.assertTrue(all(check.status == 'pass' for check in checks), checks)
+        self.assertIs(self.ledger['workspaces'][other_key], pending)
+        self.assertTrue(pending['pending'])
+        self.assertEqual(state.load_ledger()['workspaces'][other_key], pending)
+        self.assertFalse(self.ledger['workspaces'][self.key].get('pending'))
+
     def test_failed_apply_keeps_recovery_paths_and_blocks_startup(self):
         with mock.patch.object(self.backend, '_grant_path', side_effect=api.WindowsApiError('grant failed')):
             checks = self.apply()
@@ -190,6 +350,41 @@ class RecoveryTests(unittest.TestCase):
             checks = self.backend.apply(plan, definition)
         create.assert_not_called()
         self.assertEqual(checks[0].status, 'fail')
+
+        definition = self.definition()
+        valid_plan = state.build_plan(definition, self.ledger['workspaces'][self.key])
+        identify = state._directory_identity
+        before = dict(self.descriptors)
+        for missing in [self.workspace, self.removed]:
+            def identify_missing(path):
+                if path == missing:
+                    raise api.WindowsApiError('recorded directory is missing', status=2)
+                return identify(path)
+            with self.subTest(missing=missing), \
+                    mock.patch.object(state, '_directory_identity', side_effect=identify_missing), \
+                    mock.patch.object(setup, 'save_ledger') as save, \
+                    mock.patch.object(self.backend, '_ensure_profile') as create:
+                plan = state.build_plan(definition, self.ledger['workspaces'][self.key])
+                self.assertFalse(plan.applicable)
+                self.assertEqual(plan.changes, [])
+                checks = self.backend.apply(valid_plan, definition)
+                self.assertEqual(checks[0].status, 'fail')
+                create.assert_not_called()
+                save.assert_not_called()
+                self.assertEqual(self.descriptors, before)
+                self.assertEqual(state.entry_grants(self.ledger['workspaces'][self.key]), self.old)
+
+        entry = self.ledger['workspaces'].pop(self.key)
+        self.ledger['workspaces']['old-path-key'] = {**entry, 'pending': True}
+        with mock.patch.object(setup, 'save_ledger') as save, \
+                mock.patch.object(self.backend, '_ensure_profile') as create:
+            checks = self.backend.apply(valid_plan, definition)
+        self.assertEqual(checks[0].status, 'fail')
+        self.assertEqual(list(self.ledger['workspaces']), ['old-path-key'])
+        self.assertTrue(self.ledger['workspaces']['old-path-key']['pending'])
+        self.assertEqual(self.descriptors, before)
+        save.assert_not_called()
+        create.assert_not_called()
 
 
 class RulesTests(unittest.TestCase):

@@ -507,6 +507,76 @@ class VerifyContainerTests(unittest.TestCase):
             WORKSPACE, [windows_state.Grant(path, access, "user")])
         return {check.name: check for check in checks}
 
+    def independent_pending_ledger(self):
+        other = 'other-workspace'
+        other_package = 'S-1-15-2-9-8-7'
+        windows_api.derive_app_container_sid.side_effect = (
+            lambda profile: PACKAGE if profile == 'profile' else other_package)
+        self.descriptors[GRANTED] = f'D:PAI(A;OICI;FRFX;;;{PACKAGE})'
+        self.descriptors[STATE] += f'(A;OICI;0x1301BF;;;{other_package})'
+        return {'workspaces': {
+            windows_state.workspace_key(WORKSPACE): windows_state.ledger_entry(
+                WORKSPACE, 'profile', [windows_state.Grant(GRANTED, self.READ, 'user'),
+                                       windows_state.Grant(STATE, self.READ_WRITE, 'state')]),
+            windows_state.workspace_key(other): {
+                **windows_state.ledger_entry(other, 'other-profile', [
+                    windows_state.Grant(STATE, self.READ_WRITE, 'state')]), 'pending': True}}}
+
+    def test_independent_pending_recovery_keeps_the_complete_shared_inventory(self):
+        ledger = self.independent_pending_ledger()
+        checks = windows_verify.verify_workspace(ledger, WORKSPACE)
+        self.assertTrue(all(check.status == 'pass' for check in checks), checks)
+        self.assertEqual(windows_state.state_writer_sids(ledger), {PACKAGE, 'S-1-15-2-9-8-7'})
+        self.assertTrue(ledger['workspaces'][windows_state.workspace_key('other-workspace')]['pending'])
+
+    def test_affected_pending_workspace_is_still_refused(self):
+        ledger = self.independent_pending_ledger()
+        with mock.patch.object(windows_verify, 'verify_container') as inventory:
+            checks = windows_verify.verify_workspace(ledger, 'other-workspace')
+        self.assertEqual(checks[0].status, 'fail')
+        inventory.assert_not_called()
+
+    def test_pending_alias_under_another_key_is_still_refused(self):
+        ledger = self.independent_pending_ledger()
+        ledger['workspaces'][windows_state.workspace_key('other-workspace')]['workspace'] = 'alias'
+        identify = windows_state.workspace_key
+        with mock.patch.object(windows_state, 'workspace_key', side_effect=(
+                lambda path: identify(WORKSPACE) if path == 'alias' else identify(path))):
+            checks = windows_verify.verify_workspace(ledger, WORKSPACE)
+        self.assertEqual(checks[0].name, 'ledger')
+        self.assertEqual(checks[0].status, 'fail')
+
+    def test_unidentifiable_recovery_is_not_assumed_independent(self):
+        ledger = self.independent_pending_ledger()
+        identify = windows_state.workspace_key
+
+        def missing(path):
+            if path == 'other-workspace':
+                raise windows_api.WindowsApiError('cannot identify recovery workspace')
+            return identify(path)
+
+        with mock.patch.object(windows_state, 'workspace_key', side_effect=missing):
+            checks = windows_verify.verify_workspace(ledger, WORKSPACE)
+        self.assertEqual(checks[0].status, 'fail')
+
+    def _assert_pending_does_not_bypass_inventory(self, path, label, descriptor):
+        ledger = self.independent_pending_ledger()
+        self.descriptors[path] = descriptor
+        checks = {check.name: check for check in windows_verify.verify_workspace(ledger, WORKSPACE)}
+        self.assertEqual(checks[label].status, 'fail', checks)
+
+    def test_pending_other_workspace_does_not_bypass_state_privacy(self):
+        self._assert_pending_does_not_bypass_inventory(
+            STATE, 'state', f'D:P(A;OICI;FA;;;{PACKAGE})(A;OICI;FW;;;WD)')
+
+    def test_pending_other_workspace_does_not_bypass_credential_privacy(self):
+        self._assert_pending_does_not_bypass_inventory(
+            CREDENTIALS, 'credentials', f'D:P(A;OICI;FRFX;;;{PACKAGE})')
+
+    def test_pending_other_workspace_does_not_bypass_configuration_read_only(self):
+        self._assert_pending_does_not_bypass_inventory(
+            CONFIG, 'config', f'D:P(A;OICI;0x1301BF;;;{PACKAGE})')
+
     def test_read_write_grant_and_clean_trees_pass(self):
         self.descriptors[GRANTED] = (
             f"D:PAI(A;OICI;0x1301BF;;;{PACKAGE})(A;OICI;0x1301BF;;;{windows_state.tool_role_sid(PACKAGE)})")

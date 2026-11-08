@@ -1257,6 +1257,7 @@ def pseudoconsole_release(hpc) -> None:
 
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 258
+WAIT_ABANDONED = 0x80
 INFINITE = 0xffffffff
 
 
@@ -1265,6 +1266,34 @@ def wait_for_single_object(handle, milliseconds: int) -> int:
     wait = bind("kernel32", "WaitForSingleObject", wintypes.DWORD,
                 ctypes.c_void_p, wintypes.DWORD)
     return wait(handle, milliseconds)
+
+
+@contextmanager
+def named_mutex(name, *, security_descriptor):
+    """Own one non-inheritable mutex handle and its acquired thread ownership."""
+    create = bind('kernel32', 'CreateMutexW', ctypes.c_void_p,
+                  ctypes.POINTER(SecurityAttributes), wintypes.BOOL, wintypes.LPCWSTR)
+    release = bind('kernel32', 'ReleaseMutex', wintypes.BOOL, ctypes.c_void_p)
+    handle = None
+    acquired = False
+    try:
+        with _converted_security_descriptor(security_descriptor) as descriptor:
+            attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+            handle = create(ctypes.byref(attributes), False, name)
+            if not handle:
+                raise WindowsApiError('Could not create setup coordination mutex', status=ctypes.get_last_error())
+        status = wait_for_single_object(handle, INFINITE)
+        if status not in [WAIT_OBJECT_0, WAIT_ABANDONED]:
+            raise WindowsApiError('Could not acquire setup coordination mutex', status=status)
+        acquired = True
+        yield
+    finally:
+        try:
+            if acquired and not release(handle):
+                raise WindowsApiError('Could not release setup coordination mutex', status=ctypes.get_last_error())
+        finally:
+            if handle:
+                close_handle(handle)
 
 
 def get_exit_code_process(handle) -> int:

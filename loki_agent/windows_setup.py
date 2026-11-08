@@ -43,6 +43,7 @@ Two rules this module enforces rather than documents:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import sys
 
@@ -68,6 +69,7 @@ from .windows_state import (
     ledger_path,
     load_ledger,
     remove_package_aces,
+    recovery_keys_for,
     save_ledger,
     setup_files,
     state_objects,
@@ -86,6 +88,19 @@ class WindowsBackend:
         self.ledger = ledger
 
     # -- helpers --
+    @contextmanager
+    def _transaction(self):
+        # Distinct XDG roots still edit the same installation DACLs. The global
+        # user-scoped mutex also covers this account's other logon sessions;
+        # it grants no capability to a contained runtime or tool.
+        user = windows_api.current_user_sid()
+        with windows_api.named_mutex('Global\\Loki.Setup.' + user,
+                                     security_descriptor=private_dacl_sddl(user)):
+            latest = load_ledger()
+            self.ledger.clear()
+            self.ledger.update(latest)
+            yield
+
     def _ensure_profile(self, name: str) -> str:
         """Create the profile, or derive the SID when it already exists.
 
@@ -223,14 +238,25 @@ class WindowsBackend:
 
     # -- Backend --
     def apply(self, plan: Plan, definition: Definition) -> list[Check]:
-        key = workspace_key(definition.workspace)
-        previous = self.ledger.get("workspaces", {}).get(key)
-        checked_plan = build_plan(definition, previous)
-        if not checked_plan.applicable or plan.profile != checked_plan.profile:
-            return [Check("plan", "fail", "; ".join(checked_plan.errors)
-                          or "profile does not match workspace")]
+        try:
+            with self._transaction():
+                return self._apply(plan, definition)
+        except (windows_api.WindowsApiError, OSError, ValueError) as error:
+            return [Check('apply', 'fail', str(error))]
+
+    def _apply(self, plan: Plan, definition: Definition) -> list[Check]:
         checks: list[Check] = []
         try:
+            key = workspace_key(definition.workspace)
+            previous = self.ledger.get("workspaces", {}).get(key)
+            checked_plan = build_plan(definition, previous)
+            if not checked_plan.applicable or plan.profile != checked_plan.profile:
+                return [Check("plan", "fail", "; ".join(checked_plan.errors)
+                              or "profile does not match workspace")]
+            # Retry this key without discarding a second recovery record for
+            # the same object. Independent workspaces retain all their grants.
+            if any(other != key for other in recovery_keys_for(self.ledger, key)):
+                return [Check('plan', 'fail', 'Finish or remove incomplete workspace setup first')]
             user = windows_api.current_user_sid()
             # Configuration is user-owned and shared by workspace profiles.
             # Preserve its DACL so configuring one workspace cannot revoke the
@@ -294,8 +320,19 @@ class WindowsBackend:
         return windows_verify.verify_workspace(self.ledger, definition.workspace)
 
     def uninstall(self, blob: dict) -> list[Check]:
+        requested = list(blob.get('workspaces', {}))
+        try:
+            with self._transaction():
+                return self._uninstall(requested)
+        except (windows_api.WindowsApiError, OSError, ValueError) as error:
+            return [Check('uninstall', 'fail', str(error))]
+
+    def _uninstall(self, requested) -> list[Check]:
         checks: list[Check] = []
-        for key, entry in sorted(list(blob.get("workspaces", {}).items())):
+        for key in sorted(requested):
+            entry = self.ledger.get('workspaces', {}).get(key)
+            if entry is None:
+                continue
             profile = str(entry.get("profile", ""))
             try:
                 # Revocation is retryable. Keep all paths until every removal

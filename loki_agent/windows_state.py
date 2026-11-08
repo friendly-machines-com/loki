@@ -412,6 +412,29 @@ def workspace_key(workspace: str) -> str:
     return _directory_identity(workspace)
 
 
+def recovery_keys_for(ledger, key):
+    """Pending records which cannot be proved independent of this workspace.
+
+    Setup may retry its exact key; startup must refuse it. Both must also
+    detect a stale key naming the same native object, not compare spellings.
+    This replaces their global pending checks, not the shared ACL inventory:
+    every recorded writer and recovery grant remains owned by the ledger.
+    """
+    for recorded, entry in ledger.get('workspaces', {}).items():
+        if not isinstance(entry, dict):
+            yield recorded
+            continue
+        if not entry.get('pending'):
+            continue
+        try:
+            relevant = recorded == key or workspace_key(entry['workspace']) == key
+        except (KeyError, TypeError, ValueError, OSError, windows_api.WindowsApiError):
+            # An unreadable recovery operand is not a proven other workspace.
+            relevant = True
+        if relevant:
+            yield recorded
+
+
 def ledger_entry(workspace: str, profile: str,
                  grants: list[Grant]) -> dict:
     return {

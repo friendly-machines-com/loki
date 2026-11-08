@@ -296,6 +296,108 @@ class CreationSecurityTests(unittest.TestCase):
                 self.assertEqual(freed, [88])
 
 
+class NamedMutexTests(unittest.TestCase):
+    def test_scope_owns_only_acquired_mutexes_and_releases_every_created_handle(self):
+        for outcome in ['success', 'abandoned', 'body-error', 'create-error',
+                        'wait-error', 'release-error', 'descriptor-error']:
+            with self.subTest(outcome=outcome):
+                events = []
+
+                @contextlib.contextmanager
+                def descriptor(text):
+                    self.assertEqual(text, 'private permissions')
+                    try:
+                        yield ctypes.c_void_p(88)
+                    finally:
+                        events.append('descriptor freed')
+                        if outcome == 'descriptor-error':
+                            raise RuntimeError('descriptor failure')
+
+                def create(attributes, owned, name):
+                    self.assertEqual(name, 'selected mutex')
+                    self.assertFalse(owned)
+                    self.assertEqual(attributes._obj.lpSecurityDescriptor, 88)
+                    self.assertFalse(attributes._obj.bInheritHandle)
+                    events.append('create')
+                    return None if outcome == 'create-error' else 17
+
+                release = mock.Mock(return_value=outcome != 'release-error')
+                functions = {'CreateMutexW': create, 'ReleaseMutex': release}
+                status = (windows_api.WAIT_ABANDONED if outcome == 'abandoned'
+                          else 0xffffffff if outcome == 'wait-error' else windows_api.WAIT_OBJECT_0)
+                with mock.patch.object(windows_api, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]), \
+                        mock.patch.object(windows_api, '_converted_security_descriptor', new=descriptor), \
+                        mock.patch.object(windows_api, 'wait_for_single_object', return_value=status) as wait, \
+                        mock.patch.object(windows_api, 'close_handle') as close, \
+                        mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+                    messages = {'body-error': 'body failure', 'create-error': 'create setup',
+                                'wait-error': 'acquire setup', 'release-error': 'release setup',
+                                'descriptor-error': 'descriptor failure'}
+                    expected = (self.assertRaisesRegex(RuntimeError, messages[outcome])
+                                if outcome in messages else contextlib.nullcontext())
+                    with expected:
+                        with windows_api.named_mutex('selected mutex', security_descriptor='private permissions'):
+                            self.assertIn('descriptor freed', events)
+                            if outcome == 'body-error':
+                                raise RuntimeError('body failure')
+                    if outcome in ['create-error', 'descriptor-error']:
+                        wait.assert_not_called()
+                    else:
+                        wait.assert_called_once_with(17, windows_api.INFINITE)
+                    if outcome in ['success', 'abandoned', 'body-error', 'release-error']:
+                        release.assert_called_once_with(17)
+                    else:
+                        release.assert_not_called()
+                    self.assertEqual(close.call_args_list, [] if outcome == 'create-error' else [mock.call(17)])
+
+    @unittest.skipUnless(sys.platform == 'win32', 'native Windows named mutex')
+    def test_native_private_mutex_excludes_another_thread_until_exception_release(self):
+        import secrets
+        import threading
+        from loki_agent.windows_acl import private_dacl_sddl
+
+        name = 'Global\\Loki.MutexTest.' + secrets.token_hex(12)
+        permissions = private_dacl_sddl(windows_api.current_user_sid())
+        probed, released = threading.Event(), threading.Event()
+        statuses, errors = [], []
+        create = windows_api.bind('kernel32', 'CreateMutexW', ctypes.c_void_p,
+                                  ctypes.POINTER(windows_api.SecurityAttributes), wintypes.BOOL, wintypes.LPCWSTR)
+        release = windows_api.bind('kernel32', 'ReleaseMutex', wintypes.BOOL, ctypes.c_void_p)
+
+        def contender():
+            handle = None
+            try:
+                handle = create(None, False, name)
+                self.assertTrue(handle)
+                statuses.append(windows_api.wait_for_single_object(handle, 0))
+                probed.set()
+                released.wait()
+                statuses.append(windows_api.wait_for_single_object(handle, 0))
+                if statuses[-1] in [windows_api.WAIT_OBJECT_0, windows_api.WAIT_ABANDONED]:
+                    self.assertTrue(release(handle))
+            except BaseException as error:
+                errors.append(repr(error))
+            finally:
+                probed.set()
+                if handle:
+                    windows_api.close_handle(handle)
+
+        worker = threading.Thread(target=contender)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'body failure'):
+                with windows_api.named_mutex(name, security_descriptor=permissions):
+                    worker.start()
+                    probed.wait()
+                    self.assertEqual(statuses, [windows_api.WAIT_TIMEOUT], errors)
+                    raise RuntimeError('body failure')
+        finally:
+            released.set()
+            if worker.ident is not None:
+                worker.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(statuses, [windows_api.WAIT_TIMEOUT, windows_api.WAIT_OBJECT_0])
+
+
 class GuidTests(unittest.TestCase):
     def test_documented_guid_parses_to_its_documented_fields(self):
         guid = windows_api.guid_from_text(windows_api.FOLDERID_LOCAL_APP_DATA)
