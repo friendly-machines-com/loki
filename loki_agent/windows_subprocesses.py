@@ -262,6 +262,7 @@ class Process(streams.Process):
     """The subprocess surface used by ACP, file-backed jobs and streamed hooks."""
 
     def __init__(self, transport, protocol):
+        self._family = None
         super().__init__(transport, protocol)
 
     async def wait(self):
@@ -291,8 +292,28 @@ class Process(streams.Process):
                                         errors.callback(raw.raise_close_error)
             await finish_cleanup(retired())
 
+    def close_family(self):
+        family, self._family = self._family, None
+        if family is not None:
+            family.close_family()
+
+    def __del__(self):
+        self.close_family()
+
+    def family_exists(self):
+        return (self.returncode is None if self._family is None
+                else windows_runtime.job_has_processes(self._family.job))
+
     def __repr__(self):
         return f'<{self.__class__.__name__} {self.pid}>'
+
+    def terminate(self):
+        if self._family is not None:
+            windows_runtime.terminate_job(self._family.job)
+        else:
+            self._transport.terminate()
+
+    kill = terminate
 
 
 # -- Loki's contained worker ---------------------------------------------
@@ -383,7 +404,7 @@ class LocalProcessTransport(ContainedWorkerTransport):
 
     def _release(self):
         if self._proc is not None:
-            self._proc.close()
+            self._proc.release_leader()
 
     def _start(self, args, shell, stdin, stdout, stderr, bufsize, **kwargs):
         parent_pipes = {}
@@ -447,7 +468,7 @@ async def create_local_process(*command, stdin=None, stdout=None, stderr=None,
                 before_resume()
             api.resume_thread(native.information.hThread)
 
-        return await _complete_creation(transport, protocol, waiter, resume)
+        return await _complete_creation(transport, protocol, waiter, resume, native)
     except BaseException as error:
         if transport is None:
             await windows_runtime.retire_local(native, preserve_failure=True)
@@ -458,12 +479,15 @@ async def create_local_process(*command, stdin=None, stdout=None, stderr=None,
         raise
 
 
-async def _complete_creation(transport, protocol, waiter, ready=None):
+async def _complete_creation(transport, protocol, waiter, ready=None, family=None):
     try:
         await waiter
         process = Process(transport, protocol)
         if ready is not None:
             ready()
+        # The factory owns family control through every pre-publication failure;
+        # a provisional Process destructor must not release a still-live family.
+        process._family = family
         return process
     except BaseException:
         async def finish():
@@ -501,7 +525,11 @@ async def _complete_creation(transport, protocol, waiter, ready=None):
                                         if raw is not None:
                                             errors.callback(raw.raise_close_error)
 
-        await finish_cleanup(finish(), preserve_failure=True)
+        try:
+            await finish_cleanup(finish(), preserve_failure=True)
+        finally:
+            if family is not None and family.returncode is not None:
+                family.close_family()
         raise
 
 

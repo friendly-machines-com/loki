@@ -5,6 +5,7 @@ calls are replaced in portable tests so shutdown races are exercised on Linux
 as well as by the real Windows PTY tests.
 """
 
+import asyncio
 import contextlib
 import ctypes
 import sys
@@ -14,6 +15,7 @@ from ctypes import wintypes
 from unittest import mock
 
 from loki_agent import handle_reader
+from process_lifecycle_fixtures import observe_fixture
 
 if sys.platform == "win32":
     from loki_agent import host_terminal_windows
@@ -48,6 +50,8 @@ class ControlBytesTests(unittest.TestCase):
 
 
 class _FakeQueue:
+    maxsize = 0
+
     def __init__(self):
         self.items = []
 
@@ -62,9 +66,70 @@ class _InlineLoop:
         callback(*args)
 
 
-class ReaderThreadTests(unittest.TestCase):
-    @contextlib.contextmanager
-    def source(self):
+class ReaderBackpressureTests(unittest.IsolatedAsyncioTestCase):
+    @contextlib.asynccontextmanager
+    async def blocked_delivery(self):
+        entered, finished = asyncio.Event(), asyncio.Event()
+
+        class Queue(asyncio.Queue):
+            async def put(self, item):
+                entered.set()
+                await super().put(item)
+
+        queue = Queue(maxsize=1)
+        queue.put_nowait(b'accepted')
+        loop = asyncio.get_running_loop()
+        reader = handle_reader.HandleReader(7, loop, queue)
+        reader._accepting = True
+        reader._cancel_thread = handle_reader.Future()
+        reader._cancel_thread.set_result(None)
+
+        def produce():
+            reader._post(b'pending')
+            loop.call_soon_threadsafe(finished.set)
+
+        reader.thread = threading.Thread(target=produce)
+        with mock.patch.object(loop, 'call_exception_handler') as reported:
+            reader.thread.start()
+            joined = asyncio.create_task(reader.wait_closed())
+            try:
+                await observe_fixture(entered.wait(), joined)
+                yield reader, queue, finished, joined
+                reported.assert_not_called()
+            finally:
+                await reader.aclose()
+                await asyncio.gather(joined, return_exceptions=True)
+
+    async def test_bounded_queue_stops_native_read_ahead_until_consumed(self):
+        async with self.blocked_delivery() as (reader, queue, finished, joined):
+            self.assertEqual(queue.qsize(), 1)
+            self.assertFalse(finished.is_set())
+            self.assertEqual(queue.get_nowait(), b'accepted')
+            self.assertEqual(await queue.get(), b'pending')
+            await joined
+            self.assertTrue(finished.is_set())
+            self.assertTrue(reader.closed)
+
+    async def test_stop_joins_a_producer_waiting_for_queue_space(self):
+        async with self.blocked_delivery() as (reader, queue, finished, joined):
+            await reader.aclose()
+            await joined
+            self.assertTrue(finished.is_set())
+            self.assertTrue(reader.closed)
+            self.assertEqual(queue.get_nowait(), b'accepted')
+            self.assertTrue(queue.empty())
+
+
+class ReaderThreadTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # These authored handles test thread ownership, not native console
+        # records; notification/byte ordering has its own cases below.
+        patch = mock.patch.object(handle_reader.windows_api, 'discard_console_notification', return_value=False)
+        self.notifications = patch.start()
+        self.addCleanup(patch.stop)
+
+    @contextlib.asynccontextmanager
+    async def source(self):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(handle_reader.sys, 'platform', 'win32'))
             calls = stack.enter_context(mock.patch.multiple(
@@ -88,15 +153,48 @@ class ReaderThreadTests(unittest.TestCase):
             try:
                 yield reader, calls
             finally:
-                reader.stop()
+                await reader.aclose()
 
-    def test_acquisition_failure_prevents_read_and_propagates_from_start(self):
+    async def test_notifications_are_consumed_without_reading_and_keys_keep_the_byte_path(self):
+        self.notifications.side_effect = [True, True, False]
+
+        def read(handle, buffer, size, count, overlapped):
+            ctypes.memmove(buffer, b'key', 3)
+            count._obj.value = 3
+            return True
+
+        async with self.source() as (reader, calls):
+            calls['_WaitForMultipleObjects'].side_effect = [
+                handle_reader.WAIT_OBJECT_0 + 1, handle_reader.WAIT_OBJECT_0 + 1,
+                handle_reader.WAIT_OBJECT_0 + 1, handle_reader.WAIT_OBJECT_0]
+            calls['_ReadFile'].side_effect = read
+            reader.start()
+            reader.thread.join()
+            self.assertEqual(reader.queue.items, [b'key'])
+            self.assertEqual(calls['_ReadFile'].call_count, 1)
+            self.assertEqual(self.notifications.call_count, 3)
+
+    async def test_console_query_and_byte_read_errors_wake_the_consumer(self):
+        for outcome in ['notification', 'read']:
+            async with self.source() as (reader, calls):
+                self.notifications.side_effect = (handle_reader.windows_api.WindowsApiError('query failed', status=5)
+                                                  if outcome == 'notification' else None)
+                calls['_WaitForMultipleObjects'].return_value = handle_reader.WAIT_OBJECT_0 + 1
+                reader.start()
+                reader.thread.join()
+                self.assertEqual(len(reader.queue.items), 1)
+                self.assertIsInstance(reader.queue.items[0], OSError)
+                self.assertEqual(reader.queue.items[0].errno, 5)
+                self.assertEqual(calls['_ReadFile'].call_count, 0 if outcome == 'notification' else 1)
+
+    async def test_acquisition_failure_prevents_read_and_propagates_from_start(self):
         failure = OSError('cannot acquire private thread')
-        with self.source() as (reader, calls):
+        async with self.source() as (reader, calls):
             calls['_DuplicateCurrentThread'].side_effect = failure
             with self.assertRaises(OSError) as caught:
                 reader.start()
             self.assertIs(caught.exception, failure)
+            await reader.wait_closed()
             calls['_ReadFile'].assert_not_called()
             calls['_CancelSynchronousIo'].assert_not_called()
             self.assertIsNone(reader.thread)
@@ -104,23 +202,24 @@ class ReaderThreadTests(unittest.TestCase):
             self.assertIsNone(reader._cancel_thread)
             self.assertEqual(calls['_CloseHandle'].call_args_list, [mock.call(2)])
 
-    def test_failed_stop_retains_the_same_cancellation_capability_for_retry(self):
-        entered, release = threading.Event(), threading.Event()
+    async def test_failed_stop_retains_the_same_cancellation_capability_for_retry(self):
+        entered, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
 
         def read(*args):
-            entered.set()
+            loop.call_soon_threadsafe(entered.set)
             release.wait()
             return False
 
-        with self.source() as (reader, calls):
+        async with self.source() as (reader, calls):
             calls['_WaitForMultipleObjects'].return_value = handle_reader.WAIT_OBJECT_0 + 1
             calls['_ReadFile'].side_effect = read
             reader.start()
             try:
-                entered.wait()
+                await entered.wait()
                 calls['_CancelSynchronousIo'].return_value = False
                 with self.assertRaises(OSError):
-                    reader.stop()
+                    await reader.aclose()
                 self.assertTrue(reader.thread.is_alive())
                 self.assertIsNotNone(reader.stop_event)
                 self.assertEqual(reader._cancel_thread.result(), 77)
@@ -130,27 +229,26 @@ class ReaderThreadTests(unittest.TestCase):
             finally:
                 release.set()
                 calls['_CancelSynchronousIo'].return_value = True
-                reader.stop()
+                await reader.aclose()
             calls['_DuplicateCurrentThread'].assert_called_once_with()
             self.assertEqual(calls['_CloseHandle'].call_args_list, [mock.call(77), mock.call(2)])
 
-    def test_close_failure_keeps_handle_ownership_without_reopening_the_thread(self):
-        with self.source() as (reader, calls):
+    async def test_close_failure_consumes_handles_without_retry_or_thread_reopen(self):
+        async with self.source() as (reader, calls):
             reader.start()
             reader.thread.join()
-            calls['_CloseHandle'].side_effect = [False, True, True]
+            calls['_CloseHandle'].side_effect = [False, True]
             with self.assertRaises(OSError):
-                reader.stop()
+                await reader.aclose()
             self.assertIsNone(reader.thread)
             self.assertIsNone(reader.stop_event)
-            self.assertEqual(reader._cancel_thread.result(), 77)
-            reader.stop()
             self.assertIsNone(reader._cancel_thread)
+            self.assertTrue(reader.closed)
+            await reader.aclose()
             calls['_DuplicateCurrentThread'].assert_called_once_with()
-            self.assertEqual(calls['_CloseHandle'].call_args_list,
-                             [mock.call(77), mock.call(2), mock.call(77)])
+            self.assertEqual(calls['_CloseHandle'].call_args_list, [mock.call(77), mock.call(2)])
 
-    def test_interrupted_start_retains_a_handle_published_after_failed_rollback(self):
+    async def test_interrupted_start_retains_a_handle_published_after_failed_rollback(self):
         acquiring, release = threading.Event(), threading.Event()
         thread_class = threading.Thread
 
@@ -170,26 +268,29 @@ class ReaderThreadTests(unittest.TestCase):
             thread.start = interrupted
             return thread
 
-        with self.source() as (reader, calls):
+        async with self.source() as (reader, calls):
             calls['_DuplicateCurrentThread'].side_effect = duplicate
+            closing = None
             try:
-                with mock.patch.object(handle_reader.threading, 'Thread', side_effect=make_thread), \
-                        mock.patch.object(handle_reader.time, 'monotonic', side_effect=[0, 3]):
-                    with self.assertRaisesRegex(RuntimeError, 'did not stop') as caught:
+                with mock.patch.object(handle_reader.threading, 'Thread', side_effect=make_thread):
+                    with self.assertRaisesRegex(KeyboardInterrupt, 'interrupted native startup'):
                         reader.start()
-                self.assertIsInstance(caught.exception.__context__, KeyboardInterrupt)
                 self.assertFalse(reader._cancel_thread.done())
                 self.assertIsNotNone(reader.stop_event)
+                closing = asyncio.create_task(reader.aclose())
+                await asyncio.sleep(0)
+                self.assertFalse(closing.done())
                 calls['_CloseHandle'].assert_not_called()
             finally:
                 release.set()
-                if reader.thread is not None:
-                    reader.thread.join()
-                reader.stop()
+                if closing is not None:
+                    await closing
+                else:
+                    await reader.aclose()
             calls['_ReadFile'].assert_not_called()
             self.assertEqual(calls['_CloseHandle'].call_args_list, [mock.call(77), mock.call(2)])
 
-    def test_a_signalled_read_is_posted_then_the_stop_event_ends_the_thread(self):
+    async def test_a_signalled_read_is_posted_then_the_stop_event_ends_the_thread(self):
         queue = _FakeQueue()
         waits = iter([handle_reader.WAIT_OBJECT_0 + 1, handle_reader.WAIT_OBJECT_0])
 
@@ -219,38 +320,46 @@ class ReaderThreadTests(unittest.TestCase):
             reader.start()
             reader.thread.join()
             self.assertFalse(reader.thread.is_alive())
-            reader.stop()
+            await reader.aclose()
 
         self.assertEqual(queue.items, [b"abc"])
 
-    def test_stop_does_not_close_the_event_under_a_live_thread(self):
-        waits = iter([handle_reader.WAIT_OBJECT_0])
+    async def test_stop_does_not_close_the_event_under_a_live_thread(self):
+        entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
 
-        def wait_for_objects(count, handles, wait_all, timeout):
-            return next(waits)
+        def read(*args):
+            loop.call_soon_threadsafe(entered.set)
+            release.wait()
+            return False
 
-        with mock.patch.object(handle_reader.sys, 'platform', 'win32'), \
-                mock.patch.object(handle_reader, '_GetFileType', return_value=2), \
-                mock.patch.object(handle_reader, "_handle",
-                                  return_value=1), \
-                mock.patch.object(handle_reader, "_CreateEventW",
-                                  return_value=2), \
-                mock.patch.object(handle_reader,
-                                  "_WaitForMultipleObjects",
-                                  side_effect=wait_for_objects), \
-                mock.patch.object(handle_reader, "_SetEvent"), \
-                mock.patch.object(handle_reader, "_DuplicateCurrentThread", return_value=77), \
-                mock.patch.object(handle_reader, "_CloseHandle"):
-            reader = handle_reader.HandleReader(
-                7, _InlineLoop(), _FakeQueue())
+        async with self.source() as (reader, calls):
+            calls['_WaitForMultipleObjects'].return_value = handle_reader.WAIT_OBJECT_0 + 1
+            calls['_ReadFile'].side_effect = read
             reader.start()
-            reader.thread.join()
-            reader.stop()
+            closing = []
+            try:
+                await entered.wait()
+                closing = [asyncio.create_task(reader.aclose()) for _ in range(2)]
+                responsive = loop.create_future()
+                loop.call_soon(responsive.set_result, None)
+                await responsive
+                self.assertTrue(reader.thread.is_alive())
+                self.assertTrue(all(not task.done() for task in closing))
+                calls['_CloseHandle'].assert_not_called()
+            finally:
+                release.set()
+                await asyncio.gather(*closing)
+                await reader.aclose()
+            self.assertIsNone(reader.stop_event)
+            self.assertTrue(reader.closed)
+            self.assertEqual(calls['_CloseHandle'].call_args_list, [mock.call(77), mock.call(2)])
 
-        self.assertIsNone(reader.stop_event)
-
-    def test_stop_retries_cancellation_when_the_read_enters_after_first_cancel(self):
-        announced, allow_read, pending, cancelled = [threading.Event() for _ in range(4)]
+    async def test_stop_retries_cancellation_when_the_read_enters_after_first_cancel(self):
+        announced = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        allow_read, pending, cancelled = [threading.Event() for _ in range(3)]
         calls = []
         acquired_on = []
 
@@ -259,7 +368,7 @@ class ReaderThreadTests(unittest.TestCase):
             return 77
 
         def read_file(*arguments):
-            announced.set()
+            loop.call_soon_threadsafe(announced.set)
             allow_read.wait()
             pending.set()
             cancelled.wait()
@@ -272,7 +381,8 @@ class ReaderThreadTests(unittest.TestCase):
                 # not a promise that the reader cannot block immediately next.
                 allow_read.set()
                 return False
-            pending.wait()
+            if not pending.is_set():
+                return False
             cancelled.set()
             return True
 
@@ -293,9 +403,9 @@ class ReaderThreadTests(unittest.TestCase):
             reader = handle_reader.HandleReader(7, _InlineLoop(), _FakeQueue())
             reader.start()
             try:
-                announced.wait()
+                await announced.wait()
                 native_id = reader.thread.native_id
-                reader.stop()
+                await reader.aclose()
                 self.assertIsNone(reader.thread)
                 self.assertIsNone(reader.stop_event)
                 self.assertIsNone(reader._cancel_thread)
@@ -307,7 +417,7 @@ class ReaderThreadTests(unittest.TestCase):
             finally:
                 allow_read.set()
                 cancelled.set()
-                reader.stop()
+                await reader.aclose()
 
 
 class DuplicateThreadHandleTests(unittest.TestCase):
@@ -323,7 +433,7 @@ class DuplicateThreadHandleTests(unittest.TestCase):
             return {'GetCurrentThread': lambda: -2, 'DuplicateHandle': duplicate}[name]
 
         with mock.patch.object(handle_reader.windows_api, 'current_process_handle', return_value=10), \
-                mock.patch.object(handle_reader, '_call', side_effect=bind):
+                mock.patch.object(handle_reader.windows_api, 'bind', side_effect=bind):
             self.assertEqual(handle_reader._DuplicateCurrentThread(), 77)
         self.assertEqual(seen, [[10, -2, 10, handle_reader.windows_api.ThreadAccess.THREAD_TERMINATE, False, 0]])
 
@@ -332,7 +442,7 @@ class DuplicateThreadHandleTests(unittest.TestCase):
             return {'GetCurrentThread': lambda: -2, 'DuplicateHandle': lambda *args: False}[name]
 
         with mock.patch.object(handle_reader.windows_api, 'current_process_handle', return_value=10), \
-                mock.patch.object(handle_reader, '_call', side_effect=bind), \
+                mock.patch.object(handle_reader.windows_api, 'bind', side_effect=bind), \
                 mock.patch.object(handle_reader.ctypes, 'get_last_error', return_value=5, create=True):
             with self.assertRaises(OSError):
                 handle_reader._DuplicateCurrentThread()

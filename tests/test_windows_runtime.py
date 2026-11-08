@@ -469,10 +469,39 @@ class LocalLaunchTests(unittest.TestCase):
         info = api.ProcessInformation(101, 102, 103, 104)
         seen = {'sets': [], 'closed': [], 'job_events': [], 'ui_flags': 0}
 
+        def job_call(library, name, *signature):
+            if name == 'CreateJobObjectW':
+                return lambda *args: 88
+            if name == 'AssignProcessToJobObject':
+                def assign(job, process):
+                    seen['job_events'].append(['assign', job, process])
+                    if seen.get('fail_assignment'):
+                        raise OSError('assignment refused')
+                    return 1
+                return assign
+            if name == 'SetInformationJobObject':
+                def restrict(job, kind, value, size):
+                    seen['ui_flags'] = ctypes.cast(value, ctypes.POINTER(ctypes.c_uint32))[0]
+                    seen['job_events'].append(['restrict', job, kind, seen['ui_flags']])
+                    return 1
+                return restrict
+            if name == 'QueryInformationJobObject':
+                def query(job, kind, output, size, length):
+                    ctypes.cast(output, ctypes.POINTER(ctypes.c_uint32))[0] = seen.get('reported_ui_flags', seen['ui_flags'])
+                    return 1
+                return query
+            if name == 'IsProcessInJob':
+                def member(process, job, output):
+                    ctypes.cast(output, ctypes.POINTER(ctypes.c_int32))[0] = process == 101 or seen.get('writer_in_leaf', False)
+                    return 1
+                return member
+            raise AssertionError('unexpected native call: ' + name)
+
         role = runtime.state.tool_role_sid('S-1-15-2-1')
         original_sids = [['S-1-5-21-2', 0]]
         filtered_sids = [*original_sids, [role, 7]]
         values = {
+            'bind': job_call,
             'current_process_handle': lambda: 99,
             'open_process_token': mock.Mock(side_effect=[44, 55, 66]),
             'current_user_sid': lambda: 'S-1-5-21-1',
@@ -605,6 +634,42 @@ class FamilyAccountingTests(unittest.TestCase):
 
     def test_thread_close_failure_still_attempts_process_release_once(self):
         self._close_failure(72)
+
+    def test_leader_release_retains_the_original_family_and_cached_result(self):
+        owner = runtime.ContainedProcess(api.ProcessInformation(71, 72, 73, 0), job=88)
+        owner.returncode = 2
+        with mock.patch.object(api, 'close_handle') as close:
+            owner.release_leader()
+            self.assertEqual(owner.job, 88)
+            self.assertEqual(owner.returncode, 2)
+            self.assertFalse(owner.information.hProcess)
+            self.assertFalse(owner.information.hThread)
+            owner.close_family()
+            owner.close()
+        self.assertEqual(close.call_args_list, [mock.call(72), mock.call(71), mock.call(88)])
+
+    def test_family_release_does_not_close_a_live_leader(self):
+        owner = runtime.ContainedProcess(api.ProcessInformation(71, 72, 73, 0), job=88)
+        with mock.patch.object(api, 'close_handle') as close:
+            owner.close_family()
+        close.assert_called_once_with(88)
+        self.assertIsNone(owner.job)
+        self.assertIsNone(owner.returncode)
+        self.assertEqual([owner.information.hProcess, owner.information.hThread], [71, 72])
+
+    def test_active_membership_not_leader_exit_determines_liveness(self):
+        def query(job, kind, output, size, length):
+            self.assertEqual([job, kind, size], [88, 1, 48])
+            output._obj.active = active
+            return True
+
+        for active in [0, 2]:
+            with self.subTest(active=active), mock.patch.object(api, 'bind', return_value=query):
+                self.assertEqual(runtime.job_has_processes(88), bool(active))
+        with mock.patch.object(api, 'bind', return_value=lambda *args: False), \
+                mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+            with self.assertRaises(api.WindowsApiError):
+                runtime.job_has_processes(88)  # Query denial is not family absence.
 
 
 class LocalRetirementTests(unittest.IsolatedAsyncioTestCase):

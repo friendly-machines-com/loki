@@ -4,25 +4,28 @@
 These input handles are synchronous; consoles cannot supply overlapped reads
 for the proactor, and ``add_reader`` is selector-only. The existing reader
 thread waits on *{stop event, handle}*, reads with ``ReadFile``, and posts with
-``call_soon_threadsafe``. Console readiness can mean non-byte events, so shutdown
-also cancels synchronous I/O rather than depending on another key arriving.
+``call_soon_threadsafe``. Console readiness also includes non-key notifications:
+consume those before ReadFile, leaving keyboard/VT translation with Windows.
+Shutdown still cancels an entered synchronous read without needing another key.
 
 Concurrency rules. A one-shot startup future transfers the native capability;
 the byte path otherwise uses loop ownership instead of shared-state locks:
 
 1. The loop thread owns the byte queue and everything the bytes feed into.
-   A non-pipe worker publishes its cancellation handle once through a
-   thread-safe startup future before it can enter a blocking read.
+   Every worker publishes startup once through a thread-safe future before
+   reading; a console worker also transfers its exact cancellation handle.
 2. The input handle, pipe/console choice, stop event, loop reference and startup
    future are fixed before the thread starts. Once published, the real thread
    handle belongs to the loop thread; the reader never uses or closes it.
 3. Bytes reach the loop only through ``loop.call_soon_threadsafe``, so
    ``queue.put_nowait`` always runs on the loop thread -- a single-producer,
    single-consumer queue with no lock.
-4. Teardown order is fixed: set the stop event, join the thread, and only then
-   close the event.  No handle is closed while the thread could still use it.
-5. If the thread does not stop within the join timeout, raise.  A worker
-   holding a closed event handle is worse than a failed shutdown.
+4. Teardown requests stop, awaits actual thread exit without blocking the
+   event loop, then closes owned handles. A live thread never loses its event.
+5. No elapsed budget establishes completion. Cancellation failure retains a
+   live reader's exact capabilities instead of reopening a thread by ID. After
+   observed exit, each native close consumes its slot once and reports failure;
+   a possibly invalid numeric handle must not be retried by outer cleanup.
 6. A post that races a closing loop raises ``RuntimeError`` inside
    ``call_soon_threadsafe``; that one is ignored, because it means teardown is
    already running.
@@ -37,22 +40,23 @@ Windows caller reaches.
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import sys
 import threading
-import time
-from concurrent.futures import Future
+from concurrent.futures import CancelledError as FutureCancelledError, Future
 from ctypes import wintypes
 
 from . import windows_api
 from .windows_api import FILE_TYPE_PIPE, INFINITE, WAIT_OBJECT_0
+from .lifetimes import finish_cleanup
 
 
 class HandleReader:
     """One thread reading one handle for one byte consumer."""
 
-    def __init__(self, fd: int | None, loop, queue,
-                 eof_sentinel: bool = False, handle=None):
+    def __init__(self, fd: int, loop, queue,
+                 eof_sentinel: bool = False):
         self.fd = fd
         self.loop = loop
         self.queue = queue
@@ -60,16 +64,13 @@ class HandleReader:
         # for an empty post when the read loop ends, so it does not wait for
         # input that will never come.
         self.eof_sentinel = eof_sentinel
-        # A caller holding a raw Windows HANDLE (an anonymous pipe from
-        # ``CreatePipe``) has no C descriptor to convert, so it passes the
-        # handle directly and ``fd`` is None.
-        self._explicit_handle = handle
         self.handle = None
         self.stop_event = None
         self.thread = None
         self._pipe = False
         self._cancel_thread = None
         self._accepting = False
+        self._delivery_task = None
 
     def start(self) -> None:
         if sys.platform != "win32":
@@ -77,31 +78,24 @@ class HandleReader:
                 "the handle reader is available on Windows only")
         if self.stop_event is not None or self.thread is not None or self._cancel_thread is not None:
             raise RuntimeError("handle reader still owns resources")
-        if self._explicit_handle is not None:
-            self.handle = self._explicit_handle
-        else:
-            self.handle = _handle(self.fd)
+        self.handle = _handle(self.fd)
         try:
             self._pipe = _GetFileType(self.handle) == FILE_TYPE_PIPE
             event = _CreateEventW(None, True, False, None)
             if not event:
                 raise OSError(ctypes.get_last_error(), "CreateEventW")
             self.stop_event = event
-            if not self._pipe:
-                # Thread.start exposes an ID, not the creator's native handle.
-                # A private thread DACL can deny reopening even inside this
-                # process. This local startup handoff covers only native handle
-                # acquisition, never input/network I/O. An asyncio callback
-                # cannot serve it while this synchronous resource owner waits.
-                # Keep the result in the future: interrupted startup must not
-                # lose a handle published later. This future is never cancelled.
-                self._cancel_thread = Future()
+            # Publish startup even for pipes: an interrupted Thread.start is
+            # not proof that its worker cannot still enter. Console readers
+            # additionally transfer their exact native cancellation capability;
+            # Thread.start supplies no handle and a private DACL can deny reopen.
+            # This local handoff covers acquisition, never input/network I/O.
+            self._cancel_thread = Future()
             self.thread = threading.Thread(
                 target=self._run, name="loki-handle-reader", daemon=True)
             self._accepting = True
             self.thread.start()
-            if self._cancel_thread is not None:
-                self._cancel_thread.result()
+            self._cancel_thread.result()
         except BaseException as error:
             if (isinstance(error, RuntimeError) and self.thread is not None
                     and self.thread.ident is None):
@@ -116,17 +110,12 @@ class HandleReader:
         cancellation = self._cancel_thread
         try:
             buffer = ctypes.create_string_buffer(4096)
-            if cancellation is not None:
-                handle = _DuplicateCurrentThread()
+            handle = None if self._pipe else _DuplicateCurrentThread()
         except BaseException as error:
-            if cancellation is None:
-                raise
-            # No blocking read has begun. start() receives the actual failure
-            # and can join this worker without a cancellation capability.
+            # No blocking read has begun. The owner still joins actual exit.
             cancellation.set_exception(error)
             return
-        if cancellation is not None:
-            cancellation.set_result(handle)
+        cancellation.set_result(handle)
         if self._pipe:
             self._read_pipe(buffer)
         else:
@@ -145,13 +134,21 @@ class HandleReader:
             if _WaitForMultipleObjects(2, waited, False, INFINITE) != WAIT_OBJECT_0 + 1:
                 # The stop event, or a wait failure nothing here can act on.
                 break
+            try:
+                if windows_api.discard_console_notification(self.handle):
+                    continue
+            except windows_api.WindowsApiError as error:
+                self._post(OSError(error.status, str(error)))
+                break
             read = wintypes.DWORD()
             if not _ReadFile(self.handle, buffer, len(buffer),
                              ctypes.byref(read), None):
+                self._post(OSError(ctypes.get_last_error(), 'ReadFile'))
                 break
             if not read.value:
                 break
-            self._post(buffer.raw[:read.value])
+            if not self._post(buffer.raw[:read.value]):
+                return
 
     def _read_pipe(self, buffer) -> None:
         """A pipe: it must never block in ``ReadFile``.
@@ -178,15 +175,42 @@ class HandleReader:
             size = min(len(buffer), available.value)
             if not _ReadFile(self.handle, buffer, size, ctypes.byref(read), None):
                 return
-            if read.value:
-                self._post(buffer.raw[:read.value])
+            if read.value and not self._post(buffer.raw[:read.value]):
+                return
 
-    def _post(self, data: bytes) -> None:
+    def _post(self, data: bytes | Exception) -> bool:
+        # ACP's bounded queue must backpressure this existing native thread,
+        # not accumulate call_soon callbacks or drop already accepted bytes.
+        # Unbounded terminal queues retain their direct callback delivery.
+        if self.queue.maxsize > 0:
+            delivery = self._deliver_bounded(data)
+            try:
+                acknowledged = asyncio.run_coroutine_threadsafe(delivery, self.loop)
+            except RuntimeError:
+                delivery.close()
+                return False
+            try:
+                return acknowledged.result()
+            except FutureCancelledError:
+                return False
         try:
             self.loop.call_soon_threadsafe(self._deliver, data)
+            return True
         except RuntimeError:
             # The loop is closed; teardown is already in progress.
-            pass
+            return False
+
+    async def _deliver_bounded(self, data):
+        # This task/acceptance decision belongs only to the loop. If stop wins
+        # before its first step, it must never enqueue or strand the producer.
+        if not self._accepting:
+            return False
+        self._delivery_task = asyncio.current_task()
+        try:
+            await self.queue.put(data)
+            return True
+        finally:
+            self._delivery_task = None
 
     def _deliver(self, data: bytes) -> None:
         # Runs on the owning loop. A post queued before stop() must not deliver
@@ -194,66 +218,82 @@ class HandleReader:
         if self._accepting:
             self.queue.put_nowait(data)
 
-    def _join_synchronous_reader(self):
-        if not self.thread.is_alive():
-            self.thread.join()
-            return
-        cancellation = self._cancel_thread
-        if cancellation is None:
-            raise RuntimeError("reader cancellation handoff is missing")
-        deadline = time.monotonic() + 2  # Preserve the existing join budget.
-        while self.thread.is_alive():
-            # An interrupted start can reach stop() before publication. Never
-            # discard that future or wait beyond the existing teardown budget.
-            # Acquisition failure means the worker exits before reading.
-            if cancellation.done() and cancellation.exception() is None:
-                if not _CancelSynchronousIo(cancellation.result()):
-                    error = ctypes.get_last_error()
-                    if error != windows_api.ERROR_NOT_FOUND:
-                        raise OSError(error, "CancelSynchronousIo")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            # A single cancellation can precede ReadFile and miss it. Retry
-            # after yielding to the reader; never close its input/event under it.
-            self.thread.join(timeout=min(0.01, remaining))
-
     def stop(self) -> None:
+        """Revoke delivery and request stop; completion is asynchronous."""
         self._accepting = False
-        try:
-            if self.stop_event and not _SetEvent(self.stop_event):
-                raise OSError(ctypes.get_last_error(), "SetEvent")
-        finally:
-            try:
-                if self.thread is not None:
-                    try:
-                        if self._pipe:
-                            self.thread.join(timeout=2)
-                        else:
-                            self._join_synchronous_reader()
-                    finally:
-                        if self.thread.ident is not None and not self.thread.is_alive():
-                            self.thread = None
-                    if self.thread is not None:
-                        raise RuntimeError("handle reader thread did not stop")
-            finally:
+        if self._delivery_task is not None:
+            self._delivery_task.cancel()
+        if self.stop_event and not _SetEvent(self.stop_event):
+            raise OSError(ctypes.get_last_error(), "SetEvent")
+        cancellation = self._cancel_thread
+        if (self.thread is not None and self.thread.is_alive() and cancellation is not None
+                and cancellation.done() and cancellation.exception() is None):
+            handle = cancellation.result()
+            if handle is not None and not _CancelSynchronousIo(handle):
+                error = ctypes.get_last_error()
+                if error != windows_api.ERROR_NOT_FOUND:
+                    raise OSError(error, "CancelSynchronousIo")
+
+    def wait_closed(self):
+        """Capture and join this thread generation without blocking the loop.
+
+        A pending startup handoff is not proof of an unstarted/exited worker.
+        Capture before yielding so concurrent closers cannot consume a later
+        start's resources. Cancel/read-entry races retain the same live-thread
+        capability. Only after actual exit do native release attempts consume
+        their records, including on reported close failure.
+        """
+        thread = self.thread
+        startup = self._cancel_thread
+
+        async def joined():
+            while thread is not None:
+                if startup is None:
+                    raise RuntimeError('reader startup ownership is missing')
+                if startup.done():
+                    if not thread.is_alive():
+                        break
+                    if not self._accepting:
+                        self.stop()
                 try:
-                    # A failed join still needs this exact capability on the
-                    # next stop(). Closing it now would force a forbidden TID
-                    # reopen, and interrupted startup can publish it late.
-                    if self.thread is None and self._cancel_thread is not None:
-                        cancellation = self._cancel_thread
-                        if cancellation.done() and cancellation.exception() is None:
-                            if not _CloseHandle(cancellation.result()):
-                                raise OSError(ctypes.get_last_error(), "CloseHandle(thread)")
-                        self._cancel_thread = None
-                finally:
-                    # No event is closed under a live thread. A failed close
-                    # retains ownership so a retry cannot close a reused number.
-                    if self.thread is None and self.stop_event:
-                        if not _CloseHandle(self.stop_event):
-                            raise OSError(ctypes.get_last_error(), "CloseHandle")
-                        self.stop_event = None
+                    await asyncio.sleep(.01)
+                except asyncio.CancelledError:
+                    if self._accepting:
+                        raise
+            if self._cancel_thread is not startup or (self.thread is not None and self.thread is not thread):
+                return
+            if thread is not None:
+                thread.join()  # Actual exit is established; this cannot wait for I/O.
+                self.thread = None
+            self._cancel_thread = None
+            try:
+                if startup is not None and startup.done() and startup.exception() is None:
+                    handle = startup.result()
+                    if handle is not None and not _CloseHandle(handle):
+                        raise OSError(ctypes.get_last_error(), "CloseHandle(thread)")
+            finally:
+                event, self.stop_event = self.stop_event, None
+                if event and not _CloseHandle(event):
+                    raise OSError(ctypes.get_last_error(), "CloseHandle")
+
+        return joined()
+
+    @property
+    def closed(self):
+        """No live reader or owned release attempt remains.
+
+        Failed native closes still raise; consumed records are not proof of
+        physical release and must not trigger a retry on a possibly reused value.
+        """
+        return self.thread is None and self.stop_event is None and self._cancel_thread is None
+
+    async def aclose(self):
+        try:
+            self.stop()
+        except BaseException:
+            await finish_cleanup(self.wait_closed(), preserve_failure=True)
+            raise
+        await finish_cleanup(self.wait_closed())
 
 
 # The calls are declared once through ``windows_api.bind`` (one binding per
@@ -265,41 +305,30 @@ def _handle(fd: int):
     return wintypes.HANDLE(msvcrt.get_osfhandle(fd))
 
 
-_calls = {}
-
-
-def _call(library, symbol, restype, *argtypes):
-    key = (library, symbol)
-    bound = _calls.get(key)
-    if bound is None:
-        bound = _calls[key] = windows_api.bind(
-            library, symbol, restype, *argtypes)
-    return bound
-
-
 def _ReadFile(handle, buffer, size, read, overlapped):
-    return _call("kernel32", "ReadFile", wintypes.BOOL, ctypes.c_void_p,
-                 ctypes.c_void_p, wintypes.DWORD,
-                 ctypes.POINTER(wintypes.DWORD),
-                 ctypes.c_void_p)(handle, buffer, size, read, overlapped)
+    return windows_api.bind(
+        "kernel32", "ReadFile", wintypes.BOOL, ctypes.c_void_p,
+        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p)(handle, buffer, size, read, overlapped)
 
 
 def _WaitForMultipleObjects(count, handles, wait_all, timeout):
-    return _call("kernel32", "WaitForMultipleObjects", wintypes.DWORD,
-                 wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
-                 wintypes.BOOL, wintypes.DWORD)(count, handles, wait_all,
-                                                timeout)
+    return windows_api.bind(
+        "kernel32", "WaitForMultipleObjects", wintypes.DWORD,
+        wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
+        wintypes.BOOL, wintypes.DWORD)(count, handles, wait_all, timeout)
 
 
 def _CreateEventW(attributes, manual_reset, initial, name):
-    return _call("kernel32", "CreateEventW", ctypes.c_void_p,
-                 ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL,
-                 wintypes.LPCWSTR)(attributes, manual_reset, initial, name)
+    return windows_api.bind(
+        "kernel32", "CreateEventW", ctypes.c_void_p,
+        ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL,
+        wintypes.LPCWSTR)(attributes, manual_reset, initial, name)
 
 
 def _SetEvent(handle):
-    return _call("kernel32", "SetEvent", wintypes.BOOL,
-                 ctypes.c_void_p)(handle)
+    return windows_api.bind("kernel32", "SetEvent", wintypes.BOOL,
+                            ctypes.c_void_p)(handle)
 
 
 def _DuplicateCurrentThread():
@@ -307,9 +336,9 @@ def _DuplicateCurrentThread():
     # caller. Duplicate it before ReadFile, requesting only cancellation rights
     # and no inheritance. This does not broaden the thread's private DACL.
     process = windows_api.current_process_handle()
-    thread = _call("kernel32", "GetCurrentThread", ctypes.c_void_p)()
+    thread = windows_api.bind("kernel32", "GetCurrentThread", ctypes.c_void_p)()
     result = ctypes.c_void_p()
-    duplicate = _call(
+    duplicate = windows_api.bind(
         "kernel32", "DuplicateHandle", wintypes.BOOL,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_void_p), wintypes.DWORD,
@@ -324,29 +353,28 @@ def _DuplicateCurrentThread():
 
 def _CancelSynchronousIo(thread):
     # https://learn.microsoft.com/en-us/windows/win32/fileio/cancelsynchronousio-func
-    return _call("kernel32", "CancelSynchronousIo", wintypes.BOOL,
-                 ctypes.c_void_p)(thread)
+    return windows_api.bind("kernel32", "CancelSynchronousIo", wintypes.BOOL,
+                            ctypes.c_void_p)(thread)
 
 
 def _CloseHandle(handle):
-    return _call("kernel32", "CloseHandle", wintypes.BOOL,
-                 ctypes.c_void_p)(handle)
+    return windows_api.bind("kernel32", "CloseHandle", wintypes.BOOL,
+                            ctypes.c_void_p)(handle)
 
 
 def _GetFileType(handle):
-    return _call("kernel32", "GetFileType", wintypes.DWORD,
-                 ctypes.c_void_p)(handle)
+    return windows_api.bind("kernel32", "GetFileType", wintypes.DWORD,
+                            ctypes.c_void_p)(handle)
 
 
 def _PeekNamedPipe(handle, buffer, size, read, available, left):
-    return _call("kernel32", "PeekNamedPipe", wintypes.BOOL,
-                 ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
-                 ctypes.POINTER(wintypes.DWORD),
-                 ctypes.POINTER(wintypes.DWORD),
-                 ctypes.POINTER(wintypes.DWORD))(handle, buffer, size, read,
-                                                 available, left)
+    return windows_api.bind(
+        "kernel32", "PeekNamedPipe", wintypes.BOOL,
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD))(handle, buffer, size, read, available, left)
 
 
 def _WaitForSingleObject(handle, timeout):
-    return _call("kernel32", "WaitForSingleObject", wintypes.DWORD,
-                 ctypes.c_void_p, wintypes.DWORD)(handle, timeout)
+    return windows_api.bind("kernel32", "WaitForSingleObject", wintypes.DWORD,
+                            ctypes.c_void_p, wintypes.DWORD)(handle, timeout)

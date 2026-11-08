@@ -398,6 +398,47 @@ class NamedMutexTests(unittest.TestCase):
         self.assertEqual(statuses, [windows_api.WAIT_TIMEOUT, windows_api.WAIT_OBJECT_0])
 
 
+class ConsoleInputTests(unittest.TestCase):
+    def test_input_record_has_the_native_size_and_payload_alignment(self):
+        self.assertEqual(ctypes.sizeof(windows_api.ConsoleInputRecord), 20)
+        self.assertEqual(windows_api.ConsoleInputRecord.event_data.offset, 4)
+
+    def test_only_non_key_console_notifications_are_consumed(self):
+        for outcome in ['file', 'empty', 'key', 'notification', 'peek-error', 'consume-error']:
+            with self.subTest(outcome=outcome):
+                events = []
+
+                def mode(handle, output):
+                    self.assertEqual(handle, 17)
+                    events.append('mode')
+                    return outcome != 'file'
+
+                def peek(handle, record, length, count):
+                    self.assertEqual([handle, length], [17, 1])
+                    record._obj.event_type = windows_api.KEY_EVENT if outcome == 'key' else 4
+                    count._obj.value = 0 if outcome == 'empty' else 1
+                    events.append('peek')
+                    return outcome != 'peek-error'
+
+                def consume(handle, record, length, count):
+                    self.assertEqual([handle, length, record._obj.event_type], [17, 1, 4])
+                    events.append('consume')
+                    return outcome != 'consume-error'
+
+                functions = {'GetConsoleMode': mode, 'PeekConsoleInputW': peek, 'ReadConsoleInputW': consume}
+                with mock.patch.object(windows_api, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]), \
+                        mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+                    if outcome in ['peek-error', 'consume-error']:
+                        with self.assertRaises(windows_api.WindowsApiError) as caught:
+                            windows_api.discard_console_notification(17)
+                        self.assertEqual(caught.exception.status, 5)
+                    else:
+                        self.assertEqual(windows_api.discard_console_notification(17), outcome == 'notification')
+                expected = (['mode'] if outcome == 'file' else ['mode', 'peek']
+                            if outcome in ['empty', 'key', 'peek-error'] else ['mode', 'peek', 'consume'])
+                self.assertEqual(events, expected)
+
+
 class GuidTests(unittest.TestCase):
     def test_documented_guid_parses_to_its_documented_fields(self):
         guid = windows_api.guid_from_text(windows_api.FOLDERID_LOCAL_APP_DATA)

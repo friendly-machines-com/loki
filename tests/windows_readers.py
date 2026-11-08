@@ -108,7 +108,7 @@ async def _child(path):
                 break
             await asyncio.sleep(.005)
         result['pending_read'] = True
-        reader.stop()
+        await reader.aclose()
         allowed = {api.canonical_sid(sid) for sid in [api.current_user_sid(), 'SY', 'BA']}
         actual = {api.canonical_sid(sid) for sid in windows_acl.allow_trustees(result['thread_dacl'])}
         result['default_unchanged'] = default_dacl_snapshot(token)['bytes'] == original['bytes']
@@ -129,7 +129,7 @@ async def _child(path):
             if query.value:
                 cleanup.callback(api.close_handle, query)
             if reader is not None:
-                reader.stop()
+                await reader.aclose()
     return 0 if result['status'] == 'passed' else 1
 
 

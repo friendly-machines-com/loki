@@ -310,12 +310,34 @@ def _checked(result, operation):
     return result
 
 
-class ContainedProcess:
-    """Own a native child and, for supervised runtimes, its lifetime job.
+class _BasicAccounting(ctypes.Structure):
+    _fields_ = [('times', ctypes.c_int64 * 4), ('faults', ctypes.c_uint32),
+                ('total', ctypes.c_uint32), ('active', ctypes.c_uint32),
+                ('terminated', ctypes.c_uint32)]
 
-    Local launches retain the existing enclosing job rather than introducing a
-    second descendant lifecycle. Their root handles release after exit; runtime
-    supervisors/worker transports retain job ownership until explicit close.
+
+def job_has_processes(job):
+    query = api.bind('kernel32', 'QueryInformationJobObject', wintypes.BOOL,
+                     ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                     ctypes.POINTER(wintypes.DWORD))
+    accounting = _BasicAccounting()
+    _checked(query(job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None),
+             'QueryInformationJobObject(accounting)')
+    return accounting.active != 0
+
+
+def terminate_job(job):
+    terminate = api.bind('kernel32', 'TerminateJobObject', wintypes.BOOL,
+                         ctypes.c_void_p, wintypes.UINT)
+    _checked(terminate(job, 1), 'TerminateJobObject')
+
+
+class ContainedProcess:
+    """Own a child and its runtime-lifetime or ordinary-tool family job.
+
+    A tool's family job has no kill-on-close limit; the enclosing runtime job
+    still owns root shutdown. Runtime owners
+    keep their existing kill-on-close lifetime. No job handle crosses to tools.
     """
 
     def __init__(self, information, job=None):
@@ -336,13 +358,13 @@ class ContainedProcess:
                 await asyncio.sleep(0.02)
             else:
                 raise api.WindowsApiError(f"WaitForSingleObject: {result}")
+        if self.job is None:
+            self.close()
         return self.returncode
 
     def terminate(self):
         if self.job is not None:
-            terminate = api.bind("kernel32", "TerminateJobObject", wintypes.BOOL,
-                                 ctypes.c_void_p, wintypes.UINT)
-            _checked(terminate(self.job, 1), "TerminateJobObject")
+            terminate_job(self.job)
         elif self.information is not None and self.information.hProcess:
             try:
                 api.terminate_process(self.information.hProcess)
@@ -358,17 +380,28 @@ class ContainedProcess:
 
     def close(self):
         try:
-            job, self.job = self.job, None
-            if job is not None:
-                api.close_handle(job)
+            self.close_family()
         finally:
-            if self.information is not None:
-                with ExitStack() as cleanup:
-                    for field in ['hProcess', 'hThread']:
-                        handle = getattr(self.information, field)
-                        setattr(self.information, field, None)
-                        if handle:
-                            cleanup.callback(api.close_handle, handle)
+            self.release_leader()
+
+    def close_family(self):
+        # Ordinary family jobs deliberately lack kill-on-close. Only the
+        # runtime's enclosing job supplies root-shutdown lifetime; releasing
+        # this control reference must not terminate surviving descendants.
+        job, self.job = self.job, None
+        if job is not None:
+            api.close_handle(job)
+
+    def release_leader(self):
+        # Local transport retirement must retain the original family owner for
+        # later descendant control. Keep the cached exit result after release.
+        if self.information is not None:
+            with ExitStack() as cleanup:
+                for field in ['hProcess', 'hThread']:
+                    handle = getattr(self.information, field)
+                    setattr(self.information, field, None)
+                    if handle:
+                        cleanup.callback(api.close_handle, handle)
 
 
 def duplicate_standard_handle(value, fd):
@@ -388,6 +421,41 @@ def duplicate_handle(handle, *, inheritable):
     _checked(duplicate(process, handle, process,
                        ctypes.byref(result), 0, inheritable, 2), 'DuplicateHandle')
     return result.value
+
+
+def _prepare_local_job(process):
+    """Own this launch's family without changing its UI restrictions."""
+    create = api.bind('kernel32', 'CreateJobObjectW', ctypes.c_void_p,
+                      ctypes.c_void_p, wintypes.LPCWSTR)
+    assign = api.bind('kernel32', 'AssignProcessToJobObject', wintypes.BOOL,
+                      ctypes.c_void_p, ctypes.c_void_p)
+    query = api.bind('kernel32', 'QueryInformationJobObject', wintypes.BOOL,
+                     ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                     ctypes.POINTER(wintypes.DWORD))
+    member = api.bind('kernel32', 'IsProcessInJob', wintypes.BOOL,
+                      ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL))
+    with ExitStack() as cleanup:
+        job = _checked(create(None, None), 'CreateJobObjectW')
+        cleanup.callback(api.close_handle, job)
+        # Assignment to an additional job requires no UI limits on that destination.
+        # The child remains suspended throughout assignment and checks;
+        # this is not the obsolete run-then-restrict readiness-file construction.
+        _checked(assign(job, process.information.hProcess), 'AssignProcessToJobObject')
+        limits = ctypes.c_uint32(0)
+        actual = ctypes.c_uint32()
+        _checked(query(job, 4, ctypes.byref(actual), ctypes.sizeof(actual), None),
+                 'QueryInformationJobObject(UI)')
+        child, owner = wintypes.BOOL(), wintypes.BOOL()
+        _checked(member(process.information.hProcess, job, ctypes.byref(child)),
+                 'IsProcessInJob(child)')
+        _checked(member(api.current_process_handle(), job, ctypes.byref(owner)),
+                 'IsProcessInJob(owner)')
+        if actual.value != limits.value or not child.value or owner.value:
+            raise api.WindowsApiError('suspended child family boundary mismatch')
+        # Transfer only a verified assignment. Otherwise retirement must kill
+        # the child directly: terminating an empty, unassigned job cannot do it.
+        process.job = job
+        cleanup.pop_all()
 
 
 def prepare_local(process, command, environment, current_directory, handles, standard_handles, *,
@@ -470,6 +538,7 @@ def prepare_local(process, command, environment, current_directory, handles, sta
         elif api.token_default_dacl(child) != expected_default:
             # This checks the child construction, not readback of a token we set.
             raise api.WindowsApiError('suspended child creation ACL mismatch')
+        _prepare_local_job(process)
 
 
 async def retire_local(process, *, preserve_failure=False):

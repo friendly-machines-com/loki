@@ -11,7 +11,7 @@ Ownership is read from the owner's own state instead.
 """
 
 import asyncio
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, suppress
 import os
 import sys
 import tempfile
@@ -25,6 +25,135 @@ from loki_agent.credentials import CredentialStore
 
 if os.name == 'nt':
     from loki_agent.windows_subprocesses import BaseSubprocessTransport
+
+
+async def observe_fixture(observation, owner, *finished):
+    """Own a fixture observation, borrowing the operations that can invalidate it.
+
+    ACP, terminal and launch fixtures wait for events, socket membership or file
+    replies while the producer is deliberately paused. Joining that producer
+    cannot establish readiness; a deadline cannot establish failure. Race the
+    actual observation against its owners, and retire only our observer task.
+    Real-process lifecycle witnesses below separately own their exit waiters.
+    """
+    owners = [owner, *finished]
+    waiting = asyncio.create_task(observation)
+    try:
+        await asyncio.wait([waiting, *owners], return_when=asyncio.FIRST_COMPLETED)
+        if waiting.done():
+            return waiting.result()
+        for owner in owners:
+            if owner.done():
+                raise AssertionError(
+                    f'operation ended before expected fixture event: {owner.result()!r}')
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+
+
+@asynccontextmanager
+async def running_fixture_task(awaitable):
+    """Own one created actor; observe_fixture instead borrows its actors.
+
+    Assert expected errors/cancellation inside the scope, before retirement
+    consumes the outcome. Callers retain their own release and channel order.
+    """
+    task = asyncio.create_task(awaitable)
+    try:
+        yield task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def close_fixture_connection(task, writer):
+    """Retire accepted work, including cancellation before its first step.
+
+    asyncio.Server owns listeners, not handler tasks or their streams. The
+    accepting fixture registers this with its existing AsyncExitStack before
+    yielding to the handler; an observer which only borrows tasks cannot own
+    this release. Inspect task and stream failures instead of caching errors
+    inside a handler whose final close can itself fail.
+    """
+    try:
+        writer.close()
+    finally:
+        if not task.done():
+            task.cancel()
+        try:
+            outcome, = await asyncio.gather(task, return_exceptions=True)
+            if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+        finally:
+            # Abort can race peer reset. A handler's own close failure remains
+            # its task outcome; unrelated late close failures still propagate.
+            with suppress(ConnectionError):
+                await writer.wait_closed()
+
+
+async def observe_fixture_state(condition, owner, *finished):
+    """Observe synchronous fixture state through the same borrowed owners.
+
+    Immediate-input and loopback-server fixtures acknowledge admission inline,
+    not through an awaitable event. Poll that existing state rather than add a
+    second acknowledgement channel; observe_fixture owns the polling task and
+    observes producer failure without cancelling the borrowed operations.
+    """
+    async def observed():
+        while not condition():
+            await asyncio.sleep(0)
+    await observe_fixture(observed(), owner, *finished)
+
+
+def observe_process_exit(case, pid):
+    """Hold the live kernel object; PID reuse/zombie presence is not liveness."""
+    if sys.platform == 'win32':
+        import ctypes
+        from ctypes import wintypes
+        from loki_agent import windows_api
+        opening = windows_api.bind('kernel32', 'OpenProcess', ctypes.c_void_p,
+                                   wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        handle = opening(0x00100000, False, pid)
+        case.assertTrue(handle, f'cannot observe live process {pid}: {ctypes.get_last_error()}')
+        case.addCleanup(windows_api.close_handle, handle)
+
+        def exited():
+            return windows_api.wait_for_single_object(handle, 0) == 0
+    elif sys.platform.startswith('linux'):
+        import select
+        if hasattr(os, 'pidfd_open'):
+            fd = os.pidfd_open(pid)
+        else:
+            import ctypes
+            # PyPy lacks this binding; retain the same kernel identity via libc.
+            opening = ctypes.CDLL(None, use_errno=True).pidfd_open
+            opening.argtypes, opening.restype = [ctypes.c_int, ctypes.c_uint], ctypes.c_int
+            fd = opening(pid, 0)
+            if fd < 0:
+                raise OSError(ctypes.get_errno(), 'pidfd_open failed', pid)
+        case.addCleanup(os.close, fd)
+        poll = select.poll()
+        poll.register(fd, select.POLLIN)
+
+        def exited():
+            return bool(poll.poll(0))
+    else:
+        import select
+        queue = select.kqueue()
+        case.addCleanup(queue.close)
+        queue.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                     flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                     fflags=select.KQ_NOTE_EXIT)], 0, 0)
+        ended = False
+
+        def exited():
+            nonlocal ended
+            # kqueue delivers the exit once; retain that terminal observation.
+            ended = ended or bool(queue.control(None, 1, 0))
+            return ended
+    case.assertFalse(exited(), f'process {pid} was already dead')
+    return exited
 
 
 class ProcessResources:
@@ -57,8 +186,7 @@ class ProcessResources:
             case.assertTrue(self.transport._exit_task.done())
             case.assertFalse(self.transport._exit_task.cancelled())
             if self.native is not None:
-                # This retirement scope still owns both the leader and its job.
-                case.assertIsNone(self.native.job)
+                # Leader retirement does not imply local family-Job release.
                 case.assertFalse(self.native.information.hProcess)
                 case.assertFalse(self.native.information.hThread)
         else:
@@ -93,6 +221,20 @@ class LifecycleObservations:
         self.processes.append(ProcessResources(process))
         return process
 
+    async def wait_until_ready(self, original_wait):
+        readiness = asyncio.create_task(self.ready.wait())
+        exited = asyncio.create_task(original_wait())
+        try:
+            await asyncio.wait([readiness, exited], return_when=asyncio.FIRST_COMPLETED)
+            if exited.done():
+                code = await exited
+                raise AssertionError(f'runtime exited with {code} before the credential-handshake witness')
+        finally:
+            for task in [readiness, exited]:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(readiness, exited, return_exceptions=True)
+
     async def assert_released(self, case):
         # Let already-scheduled pipe connection_lost callbacks finish.
         await asyncio.sleep(0)
@@ -106,17 +248,17 @@ class LifecycleObservations:
             case.assertIsNone(delegation.credential_child)
             server = delegation.credential_server
             case.assertTrue(server._reader_task.done())
-            case.assertIsNotNone(server._writer_close_task)
-            case.assertTrue(server._writer_close_task.done())
-            case.assertFalse(server._writer_close_task.cancelled())
-            case.assertIsNone(server._writer_close_task.exception())
+            case.assertIsNotNone(server._close_task)
+            case.assertTrue(server._close_task.done())
+            case.assertFalse(server._close_task.cancelled())
+            case.assertIsNone(server._close_task.exception())
+            case.assertTrue(server.closed)
+            case.assertTrue(server._writer.is_closing())
             if os.name == 'nt':
                 case.assertEqual(server._writer._endpoint.handles(), [])
                 for operation in [server._writer._reading, server._writer._writing]:
                     if operation is not None:
                         case.assertTrue(operation.done())
-            else:
-                case.assertTrue(server._writer.is_closing())
         pending = asyncio.all_tasks() - self.tasks_before
         case.assertFalse(pending, f'shutdown left pending tasks: {pending}')
 
@@ -154,9 +296,10 @@ async def process_lifecycle(name):
             from loki_agent import windows_runtime, windows_subprocesses
             stack.enter_context(mock.patch.object(windows_runtime, 'sys', identity))
             stack.enter_context(mock.patch.object(windows_subprocesses, 'sys', identity))
+        storage = stack.enter_context(closing(
+            credential_storages.JsonCredentialStorage(paths.credential_directory())))
         supervisor = credential_supervisors.CredentialSupervisor(
-            CredentialStore(environment),
-            credential_storages.JsonCredentialStorage(paths.credential_directory()))
+            CredentialStore(environment), storage)
         observations = LifecycleObservations(supervisor, workspace, launcher)
         delegate = supervisor.delegate
 
@@ -177,12 +320,10 @@ async def process_lifecycle(name):
         try:
             yield observations
         finally:
-            try:
-                for delegation in observations.delegations:
-                    await delegation.close()
-            finally:
-                try:
-                    for resources in observations.processes:
-                        await resources.cleanup()
-                finally:
-                    supervisor.storage.close()
+            # One failed revocation/retirement must not skip the other owners.
+            # The outer stack closes storage only after every async release.
+            async with AsyncExitStack() as cleanup:
+                for resources in reversed(observations.processes):
+                    cleanup.push_async_callback(resources.cleanup)
+                for delegation in reversed(observations.delegations):
+                    cleanup.push_async_callback(delegation.close)

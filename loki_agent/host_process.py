@@ -14,17 +14,22 @@ The Windows notes here are not translations of the POSIX calls:
   delivered to an arbitrary process.
 * ``SIGKILL`` does not exist.  Callers request a forced stop with ``FORCE``;
   the seam maps it to ``SIGKILL`` on POSIX and to a terminate on Windows.
-* ``terminate()`` reaches the direct child only.  Killing grandchildren needs a
-  Job Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``, which is not
-  implemented here yet.
+* Native local creation retains a non-inheritable Job Object reference beyond
+  leader/stream completion. It owns later family stops, not normal-completion
+  shutdown; the local job has no kill-on-close limit.
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import signal
 import subprocess
+import sys
+
+from .lifetimes import finish_cleanup
+from . import streams
 
 # ``signal.SIGKILL`` is absent on Windows, so a forced stop is named here and
 # mapped per platform instead of being spelled with a signal number.
@@ -34,20 +39,112 @@ FORCE = "force"
 def label(signum) -> str:
     """Human-readable name for a stop request, without naming a value Windows lacks."""
     if signum == FORCE:
-        return "SIGKILL" if os.name == "posix" else "terminate"
+        return "SIGKILL" if sys.platform != "win32" else "terminate"
     return signum.name
 
 
 async def create_exec(*command, owning=False, before_resume=None, **kwargs):
     """Preserve the caller's image/cwd; only trusted callers select authority."""
-    if os.name == 'nt':
+    if sys.platform == 'win32':
         from . import windows_subprocesses
         return await windows_subprocesses.create_local_process(
             *command, owning=owning, before_resume=before_resume, **kwargs)
-    return await asyncio.create_subprocess_exec(*command, **kwargs)
+    # POSIX cannot defer execution until admission is checked. Refuse early,
+    # then recheck after startup inside the existing unpublished-child rollback.
+    if before_resume is not None:
+        before_resume()
+    return await create_posix_process(*command, before_publish=before_resume, **kwargs)
 
 
-if os.name == "posix":
+def release_group(process):
+    """Release family signalling ownership without terminating descendants."""
+    if sys.platform == 'win32' and process is not None:
+        close = getattr(process, 'close_family', None)
+        if close is not None:
+            close()
+
+
+async def create_posix_process(*command, on_cancel=None, after_spawn=None,
+                               before_publish=None, stdin=None, stdout=None, stderr=None,
+                               limit=64 * 1024, **options):
+    """Own creation through optional startup checks, until the caller takes over.
+
+    Runtime delegation needs immediate revocation on cancellation; jobs and
+    hooks need startup/publication checks on the same process owner, not
+    separate pipe-draining retirement implementations. Local
+    Session/Job admission runs synchronously after these awaits: rejection must
+    retire the unpublished child here, not hand it to a revoked caller.
+    """
+    loop = asyncio.get_running_loop()
+
+    async def create():
+        # close_fds still preserves inherited stdio slots. A None Python stream
+        # does not mean its fd stayed closed: PyPy/libffi imports were observed
+        # reusing stdout's slot for an inheritable library file, making the child
+        # fail when it flushed that read-only file as stdout. Clear inheritance,
+        # not the fd itself: the importing library still owns the parent's fd.
+        # Explicitly supplied child stdio must remain untouched.
+        for fd, selected, stream in [
+                [0, stdin, sys.stdin], [1, stdout, sys.stdout],
+                [2, stderr, sys.stderr]]:
+            if selected is None and stream is None:
+                try:
+                    os.set_inheritable(fd, False)
+                except OSError as error:
+                    if error.errno != errno.EBADF:
+                        raise
+        transport, protocol = await loop.subprocess_exec(
+            lambda: streams.ProcessProtocol(limit=limit),
+            # The loop API defaults to pipes; the public subprocess helper
+            # inherits missing streams. Terminal runtimes require the latter.
+            *command, stdin=stdin, stdout=stdout, stderr=stderr, **options)
+        return streams.Process(transport, protocol)
+
+    creation = asyncio.create_task(create())
+    process = None
+    try:
+        process = await asyncio.shield(creation)
+        if after_spawn is not None:
+            await after_spawn(process)
+        if before_publish is not None:
+            before_publish()
+        return process
+    except BaseException as error:
+        try:
+            if isinstance(error, asyncio.CancelledError):
+                try:
+                    if on_cancel is not None:
+                        on_cancel()
+                finally:
+                    creation.cancel()
+        finally:
+            async def retire():
+                selected_process = process
+                if selected_process is None:
+                    try:
+                        selected_process = await creation
+                    except (asyncio.CancelledError, Exception):
+                        return
+                try:
+                    # The target may already have execed and forked before
+                    # startup publication. Only a group created by this launch
+                    # is ours to retire; hooks otherwise keep their direct-child
+                    # lifetime contract.
+                    if options.get('start_new_session'):
+                        try:
+                            os.killpg(selected_process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    # Close our pipe ends, then reap. Waiting for pipe EOF
+                    # would let a surviving writer stall cancellation forever.
+                    await selected_process.aclose()
+
+            await finish_cleanup(retire(), preserve_failure=True)
+        raise
+
+
+if sys.platform != "win32":
     def spawn_kwargs():
         """Put the child in its own session, with its signal mask unblocked."""
         return {"start_new_session": True,
@@ -89,8 +186,8 @@ else:
         return pid
 
     def group_exists(proc, pgid):
-        # This seam only owns the direct child on Windows, not a Job Object.
-        return proc.returncode is None
+        family_exists = getattr(proc, 'family_exists', None)
+        return family_exists() if family_exists is not None else proc.returncode is None
 
     def signal_group(proc, pgid, signum):
         """Stop the child; Windows has no signals.
@@ -99,9 +196,9 @@ else:
         stop with ``CTRL_BREAK_EVENT``, falling back to terminating it when the
         child cannot be reached that way.
         """
-        if proc.returncode is not None:
-            raise ProcessLookupError("child has exited")
-        if signum == FORCE:
+        if not group_exists(proc, pgid):
+            raise ProcessLookupError("child family has exited")
+        if signum == FORCE or proc.returncode is not None:
             _terminate(proc)
             return
         try:
@@ -118,6 +215,6 @@ else:
         except ProcessLookupError:
             raise
         except OSError as error:
-            if proc.returncode is not None:
+            if not group_exists(proc, None):
                 raise ProcessLookupError(error.errno) from error
             raise

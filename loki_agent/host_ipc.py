@@ -40,7 +40,6 @@ import ctypes
 from ctypes import wintypes
 import os
 import socket
-import secrets
 import sys
 import uuid
 import warnings
@@ -183,64 +182,6 @@ class PipeHandle:
 
     def __exit__(self, exc_type, exc, traceback):
         self.close()
-
-
-_PAIR_CONFIRM_BYTES = 32
-_PAIR_CONFIRM_TIMEOUT = 5.0
-
-
-class PairConfirmationError(RuntimeError):
-    """The two channel ends are not two halves of one connection."""
-
-
-def _receive_exactly(end, count: int) -> bytes:
-    received = bytearray()
-    while len(received) < count:
-        chunk = end.recv(count - len(received))
-        if not chunk:
-            raise PairConfirmationError(
-                "a channel end closed before it confirmed the pair")
-        received.extend(chunk)
-    return bytes(received)
-
-
-def confirm_pair(first, second) -> None:
-    """Prove ``first`` and ``second`` are connected to each other.
-
-    One direction suffices: a nonce sent on ``second`` must arrive on
-    ``first``.  If it does not -- because a racing process was accepted in
-    place of our own connect -- the two ends are not a pair, and this closes
-    both and raises rather than letting a mismatched channel be handed to a
-    child.  Both platforms run it: POSIX ``socketpair()`` cannot be
-    substituted, but the contract is the same, and this host is the only place
-    the check itself can be tested.
-    """
-    nonce = secrets.token_bytes(_PAIR_CONFIRM_BYTES)
-    first_timeout = first.gettimeout()
-    second_timeout = second.gettimeout()
-    first.settimeout(_PAIR_CONFIRM_TIMEOUT)
-    second.settimeout(_PAIR_CONFIRM_TIMEOUT)
-    try:
-        second.sendall(nonce)
-        received = _receive_exactly(first, len(nonce))
-        if received != nonce:
-            raise PairConfirmationError(
-                "the channel ends are not connected to each other")
-    except OSError as error:
-        first.close()
-        second.close()
-        raise PairConfirmationError(
-            "the channel ends did not confirm the pair") from error
-    except PairConfirmationError:
-        first.close()
-        second.close()
-        raise
-    finally:
-        # The caller owns both ends afterwards; leave their modes as found.
-        # A closed end accepts no timeout and raises OSError, suppressed here.
-        for end, timeout in ((first, first_timeout), (second, second_timeout)):
-            with contextlib.suppress(OSError):
-                end.settimeout(timeout)
 
 
 def pipe_policy(*, duplex=False):
@@ -612,9 +553,7 @@ if sys.platform != "win32":
 
     def socket_pair():
         """The kernel creates both connected ends; there is no rendezvous."""
-        pair = socket.socketpair()
-        confirm_pair(*pair)
-        return pair
+        return socket.socketpair()
 
     def prepare_child_socket(end):
         """Transfer an owned child copy without occupying a standard stream."""

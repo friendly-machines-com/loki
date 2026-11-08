@@ -14,6 +14,7 @@ contained topology is covered natively in ``test_windows_appcontainers.py``.
 """
 
 import asyncio
+from contextlib import AsyncExitStack
 import os
 import subprocess
 import sys
@@ -23,8 +24,8 @@ from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
-from loki_agent import host_ipc
-from loki_agent import jobs as job_runtime
+from job_fixtures import job_manager, managed_jobs
+from loki_agent import executables, host_ipc
 
 
 # Reads stdin to EOF and prints the byte count.  Real child, real reads: the
@@ -64,13 +65,10 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = job_runtime.JobManager(str(root / "jobs"))
-            try:
+            async with managed_jobs(str(root / "jobs")) as manager:
                 job, status, stdout, stderr = await manager.run_exec(
                     [sys.executable, "-c", _REPORTS_EOF],
                     description="noninteractive stdin", cwd=str(workspace))
-            finally:
-                await manager.aclose()
             self.assertEqual(status, "completed", stderr)
             self.assertEqual(job.status, "exited", stderr)
             self.assertEqual(job.exit_code, 0, stderr)
@@ -89,21 +87,24 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            # A real file, so the shell command is one program invocation and
-            # the shell is still Loki's Bash branch doing the spawning.
-            script = root / "report_eof.py"
-            script.write_text(_REPORTS_EOF, encoding="utf-8")
-            manager = job_runtime.JobManager(str(root / "jobs"))
-            try:
+            if sys.platform == "win32":
+                # This control tests the shell launch arm's stdin, not MSYS
+                # startup. Native Python accepts the same -c interface; cmd.exe
+                # does not. Product Bash selection is unchanged.
+                shell = sys.executable
+                command = _REPORTS_EOF
+            else:
+                shell = executables.BASH
+                script = root / "report_eof.py"
+                script.write_text(_REPORTS_EOF, encoding="utf-8")
+                command = '"%s" "%s"' % (sys.executable, script)
+            async with managed_jobs(str(root / "jobs")) as manager:
                 # run_shell renders the job result, so read the text it
                 # returns rather than the intermediate tuple run_foreground
                 # produces; the stdout it carries is the child's report.
-                rendered = await manager.run_shell(
-                    '"%s" "%s"' % (sys.executable, script),
-                    description="shell stdin",
-                    cwd=str(workspace))
-            finally:
-                await manager.aclose()
+                with mock.patch.object(executables, "BASH", shell):
+                    rendered = await manager.run_shell(
+                        command, timeout=None, description="shell stdin", cwd=str(workspace))
             job, = manager.jobs.values()
             self.assertEqual(job.status, "exited", rendered)
             self.assertEqual(job.exit_code, 0, rendered)
@@ -122,14 +123,11 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = job_runtime.JobManager(str(root / "jobs"))
-            try:
+            async with managed_jobs(str(root / "jobs")) as manager:
                 job, status, stdout, stderr = await manager.run_exec(
                     [sys.executable, "-c", _REPORTS_EOF,
                      "--color=never", "--", "marker"],
                     description="search child stdin", cwd=str(workspace))
-            finally:
-                await manager.aclose()
             self.assertEqual(status, "completed", stderr)
             self.assertEqual(job.exit_code, 0, stderr)
             self.assertEqual(
@@ -147,14 +145,11 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = job_runtime.JobManager(str(root / "jobs"))
-            try:
+            async with managed_jobs(str(root / "jobs")) as manager:
                 job, status, stdout, stderr = await manager.run_exec(
                     [sys.executable, "-c", _REPORTS_EOF],
                     description="subagent stdin", cwd=str(workspace),
                     session_owned=True, subagent=True)
-            finally:
-                await manager.aclose()
             self.assertEqual(status, "completed", stderr)
             self.assertEqual(job.exit_code, 0, stderr)
             self.assertEqual(
@@ -171,14 +166,11 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = job_runtime.JobManager(str(root / "jobs"))
-            try:
+            async with managed_jobs(str(root / "jobs")) as manager:
                 job = await manager.run_background_exec(
                     [sys.executable, "-c", _REPORTS_EOF],
                     description="background stdin", cwd=str(workspace))
                 await manager._monitor_background_job(job)
-            finally:
-                await manager.aclose()
             self.assertEqual(job.status, "exited")
             self.assertEqual(job.exit_code, 0)
             self.assertEqual(
@@ -198,7 +190,8 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
         by a deadline.  No timeout is set anywhere here: a run that has to be
         cut short by one is telling us nothing about stdin.
         """
-        with tempfile.TemporaryDirectory() as directory:
+        async with AsyncExitStack() as job_scope:
+            directory = job_scope.enter_context(tempfile.TemporaryDirectory())
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
@@ -209,7 +202,8 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                 _REPORTS_EOF + _BLOCKS_UNTIL_RELEASED
                 % (str(ready), str(release)),
                 encoding="utf-8")
-            manager = job_runtime.JobManager(str(root / "jobs"))
+            manager = job_manager(str(root / "jobs"), cleanup=job_scope.callback,
+                                  async_cleanup=job_scope.push_async_callback)
             cancel = asyncio.Event()
             try:
                 task = asyncio.create_task(manager.run_exec(
@@ -272,8 +266,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = job_runtime.JobManager(str(root / "jobs"))
-            try:
+            async with managed_jobs(str(root / "jobs")) as manager:
                 await manager.run_exec(
                     [sys.executable, "-c", _REPORTS_EOF],
                     description="stdin ownership", cwd=str(workspace))
@@ -281,8 +274,6 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                 stdin = getattr(job.process, "stdin", None)
                 self.assertIsNone(
                     stdin, "a completed job still owns its stdin end")
-            finally:
-                await manager.aclose()
 
     async def test_a_failed_launch_releases_the_stdin_it_acquired(self):
         """Launch failure must not strand a stdin pipe end.
@@ -296,8 +287,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = job_runtime.JobManager(str(root / "jobs"))
-            try:
+            async with managed_jobs(str(root / "jobs")) as manager:
                 with self.assertRaises(FileNotFoundError):
                     await manager.run_exec(
                         ["definitely-not-a-real-program"],
@@ -306,8 +296,6 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(
                         getattr(job.process, "stdin", None),
                         "a failed launch retained its stdin end")
-            finally:
-                await manager.aclose()
 
 
 class WindowsStdinAdapterTests(unittest.TestCase):

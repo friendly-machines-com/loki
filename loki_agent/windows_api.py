@@ -1964,6 +1964,38 @@ class LockFlags(enum.IntFlag):
 ERROR_LOCK_VIOLATION = 33
 
 
+class ConsoleInputRecord(ctypes.Structure):
+    # INPUT_RECORD: aligned native storage; keyboard/VT translation stays in
+    # ReadFile rather than being reimplemented from the opaque event payload.
+    _fields_ = [('event_type', ctypes.c_uint16), ('event_data', ctypes.c_uint32 * 4)]
+
+
+def discard_console_notification(handle):
+    """Consume one non-key notification on the caller's borrowed input stream."""
+    mode = wintypes.DWORD()
+    query = bind('kernel32', 'GetConsoleMode', wintypes.BOOL,
+                 ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD))
+    if not query(handle, ctypes.byref(mode)):
+        return False  # Ordinary synchronous files keep their existing byte path.
+    record, count = ConsoleInputRecord(), wintypes.DWORD()
+    peek = bind('kernel32', 'PeekConsoleInputW', wintypes.BOOL,
+                ctypes.c_void_p, ctypes.POINTER(ConsoleInputRecord), wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD))
+    if not peek(handle, ctypes.byref(record), 1, ctypes.byref(count)):
+        raise WindowsApiError('Could not inspect console input', status=ctypes.get_last_error())
+    if not count.value or record.event_type == KEY_EVENT:
+        return False
+    consume = bind('kernel32', 'ReadConsoleInputW', wintypes.BOOL,
+                   ctypes.c_void_p, ctypes.POINTER(ConsoleInputRecord), wintypes.DWORD,
+                   ctypes.POINTER(wintypes.DWORD))
+    if not consume(handle, ctypes.byref(record), 1, ctypes.byref(count)):
+        raise WindowsApiError('Could not consume console notification', status=ctypes.get_last_error())
+    return True
+
+
+KEY_EVENT = 0x0001
+
+
 class Overlapped(ctypes.Structure):
     """One native overlapped operation, including its byte offset/event slot."""
 

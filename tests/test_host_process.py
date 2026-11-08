@@ -7,6 +7,7 @@ stops it by terminating (``FORCE``) or, where a console is shared, by
 ``CTRL_BREAK_EVENT``.
 """
 
+import asyncio
 import errno
 import os
 import signal
@@ -16,7 +17,48 @@ import types
 import unittest
 from unittest import mock
 
-from loki_agent import host_process
+from loki_agent import host_process, streams
+from process_lifecycle_fixtures import observe_fixture
+
+
+class ProcessRetirementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pipe_close_failure_still_closes_siblings_and_joins_transport(self):
+        failure = OSError('stdin close failed')
+        entered = asyncio.Event()
+        calls = []
+        pipes = {fd: mock.Mock() for fd in [0, 1, 2]}
+        for fd, pipe in pipes.items():
+            pipe.is_closing.return_value = False
+            pipe.close.side_effect = lambda fd=fd: calls.append(fd)
+
+        def abort():
+            calls.append(0)
+            raise failure
+
+        def close_transport():
+            calls.append('process')
+            entered.set()
+
+        pipes[0].abort.side_effect = abort
+        transport = mock.Mock()
+        transport.get_pipe_transport.side_effect = pipes.get
+        transport.close.side_effect = close_transport
+        protocol = streams.ProcessProtocol()
+        protocol.connection_made(transport)
+        process = streams.Process(transport, protocol)
+        closing = asyncio.create_task(process.aclose())
+        try:
+            await observe_fixture(entered.wait(), closing)
+            self.assertEqual(calls, [0, 1, 2, 'process'])
+            self.assertFalse(closing.done())
+            protocol.connection_lost(None)
+            with self.assertRaises(OSError) as caught:
+                await closing
+            self.assertIs(caught.exception, failure)
+            transport.close.assert_called_once_with()
+        finally:
+            protocol.connection_lost(None)
+            await asyncio.gather(closing, return_exceptions=True)
 
 
 class PosixSpawnTests(unittest.TestCase):
@@ -79,8 +121,10 @@ class SignalTests(unittest.TestCase):
     def _running_child(self):
         kwargs = ({"start_new_session": True} if os.name == "posix"
                   else host_process.spawn_kwargs())
+        # These signal tests own termination; the actor cannot self-exit while
+        # the controller is descheduled. Cleanup kills and joins the same child.
         proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+            [sys.executable, "-c", "import threading; threading.Event().wait()"], **kwargs)
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
         return proc
@@ -92,11 +136,11 @@ class SignalTests(unittest.TestCase):
         if os.name != "posix":
             # No signals; a forced stop terminates the process.
             host_process.signal_group(proc, group, host_process.FORCE)
-            self.assertEqual(proc.wait(timeout=5), 1)
+            self.assertEqual(proc.wait(), 1)
             return
         host_process.signal_group(proc, group, signal.SIGKILL)
 
-        self.assertEqual(proc.wait(timeout=5), -signal.SIGKILL)
+        self.assertEqual(proc.wait(), -signal.SIGKILL)
 
     def test_a_forced_stop_maps_to_sigkill_without_naming_it(self):
         proc = self._running_child()
@@ -105,9 +149,9 @@ class SignalTests(unittest.TestCase):
             proc, host_process.process_group(proc, proc.pid), host_process.FORCE)
 
         if os.name != "posix":
-            self.assertEqual(proc.wait(timeout=5), 1)
+            self.assertEqual(proc.wait(), 1)
             return
-        self.assertEqual(proc.wait(timeout=5), -signal.SIGKILL)
+        self.assertEqual(proc.wait(), -signal.SIGKILL)
 
 
 if __name__ == "__main__":

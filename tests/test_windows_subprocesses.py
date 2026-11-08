@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from loki_agent import windows_subprocesses as workers
+from process_lifecycle_fixtures import observe_fixture
 
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows named-pipe allocator ABI')
@@ -280,6 +281,8 @@ class WorkerCleanupTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(workers, transport_class.__name__, side_effect=transport),
             mock.patch.object(workers.windows_runtime, 'ContainedProcess', return_value=native),
             mock.patch.object(workers.windows_runtime, 'prepare_local') as prepare,
+            mock.patch.object(workers.windows_runtime, 'job_has_processes', return_value=True) as family_exists,
+            mock.patch.object(workers.windows_runtime, 'terminate_job') as stop_family,
             mock.patch.object(workers.api, 'resume_thread') as resume,
             mock.patch.object(loop, 'connect_write_pipe',
                               side_effect=connect_write),
@@ -302,7 +305,7 @@ class WorkerCleanupTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(operation)
             if termination_error:
                 try:
-                    await stopping.wait()
+                    await observe_fixture(stopping.wait(), task)
                     self.assertEqual(native.job, 44, 'lost family control before observed exit')
                     self.assertFalse(transports[0]._exit_task.done())
                     self.assertFalse(task.done())
@@ -357,6 +360,15 @@ class WorkerCleanupTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(process.returncode, 1)
                 with self.assertRaises(ProcessLookupError):
                     transports[0].send_signal(1)
+            if local and failure is None and not revoke:
+                self.assertIs(process._family, native)
+                self.assertEqual(native.job, 44)
+                self.assertTrue(process.family_exists(), 'leader/stream exit lost the surviving family')
+                family_exists.assert_called_once_with(44)
+                process.terminate()
+                stop_family.assert_called_once_with(44)
+                process.close_family()
+                process.close_family()
             self.assertIsNone(native.job)
             expected = [11, 12, 13, 14, 16, 17] if local else [11, 12, 13, 14]
             self.assertCountEqual(closed_handles, [*expected, 44])
@@ -401,3 +413,6 @@ class WorkerCleanupTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_revocation_after_attachment_reaps_without_resume(self):
         await self.exercise(local=True, revoke=True)
+
+    async def test_failed_termination_retains_family_control_until_actual_exit(self):
+        await self.exercise(local=True, failure=1, termination_error=True)
