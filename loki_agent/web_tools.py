@@ -2,6 +2,8 @@
 
 Inference is supplied by the runtime; this module owns no conversation or
 credential authority. The caller supplies the process-lifetime fetch cache.
+Operation failures raise into the existing tool-result boundary: neither
+remote page text nor a model's answer can reliably encode execution status.
 """
 
 import asyncio
@@ -190,9 +192,9 @@ async def run_webfetch_async(
         *, cache, complete,
         cancel_event: asyncio.Event | None = None) -> str:
     if not url:
-        return "Error: url is required"
+        raise ValueError('url is required')
     if not prompt:
-        return "Error: prompt is required"
+        raise ValueError('prompt is required')
     now = time.time()
     cached = cache.get(url)
     if cached and now - cached[0] < WEBFETCH_CACHE_TTL:
@@ -204,7 +206,12 @@ async def run_webfetch_async(
             cancel_check=(
                 cancel_event.is_set if cancel_event is not None else None))
         if response.get('error'):
-            return f"Error: {response['error']}"
+            raise RuntimeError(response['error'])
+        # HTTP failures are failed fetches, not page material to cache or ask
+        # a model to summarize. In particular, the advertised refusal of
+        # authenticated/private URLs must not turn a 401/403 page into an answer.
+        if response['status'] >= 400:
+            raise RuntimeError(f"web fetch request failed: HTTP {response['status']} {response['finalUrl']}")
         if response.get('redirectUrl'):
             return "\n".join([
                 f"WebFetch redirect: HTTP {response['status']}",
@@ -250,13 +257,13 @@ async def run_websearch_async(query: str, allowed_domains: list | None = None,
                               blocked_domains: list | None = None,
                               cancel_event: asyncio.Event | None = None) -> str:
     if not query or len(query) < 2:
-        return "Error: query must be at least 2 characters"
+        raise ValueError('query must be at least 2 characters')
     if allowed_domains and blocked_domains:
-        return "Error: allowed_domains and blocked_domains cannot both be specified"
+        raise ValueError('allowed_domains and blocked_domains cannot both be specified')
     if allowed_domains and len(allowed_domains) > 20:
-        return "Error: allowed_domains max 20 entries"
+        raise ValueError('allowed_domains max 20 entries')
     if blocked_domains and len(blocked_domains) > 20:
-        return "Error: blocked_domains max 20 entries"
+        raise ValueError('blocked_domains max 20 entries')
 
     form = urllib.parse.urlencode({'q': query, 'b': '', 'kl': 'us-en'})
     try:
@@ -275,11 +282,11 @@ async def run_websearch_async(query: str, allowed_domains: list | None = None,
             cancel_check=(
                 cancel_event.is_set if cancel_event is not None else None),
         )
-        if response.status >= 400:
-            return f"Error: web search request failed: HTTP {response.status} {response.reason}"
-        html = http_client.decode_text(response.body, response.headers)
-    except Exception as e:
-        return f"Error: web search request failed: {e}"
+    except Exception as error:
+        raise RuntimeError(f'web search request failed: {error}') from error
+    if response.status >= 400:
+        raise RuntimeError(f'web search request failed: HTTP {response.status} {response.reason}')
+    html = http_client.decode_text(response.body, response.headers)
 
     results = []
     for result in _parse_duckduckgo_results(html):

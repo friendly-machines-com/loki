@@ -1034,7 +1034,7 @@ class JobManager:
     def job_status(self, job_id: str, tail_chars: int = tool_contracts.JOB_TAIL_CHARS, *, structured=False):
         job = self._get_job(job_id)
         if job is None:
-            return f"Error: unknown job id {job_id!r}"
+            raise ValueError(f'unknown job id {job_id!r}')
         stdout = self._spool_tail(job, 'stdout.log', tail_chars)
         stderr = self._spool_tail(job, 'stderr.log', tail_chars)
         parts = [
@@ -1053,14 +1053,16 @@ class JobManager:
         output = process_outputs.ProcessOutput(
             "\n".join(parts), stdout, stderr, shell=job.shell, tail=True)
         text = output.render()
-        if structured and job.shell:
-            return tool_runtime.tool_result(True, text, process_output=output.to_dict())
+        if structured:
+            # JobStatus reports an inspection, not success of the inspected
+            # child. Agent/non-shell jobs need the same explicit success flag.
+            return tool_runtime.tool_result(True, text, process_output=output.to_dict() if job.shell else None)
         return text
 
     def stop_job(self, job_id: str, force: bool = False) -> str:
         job = self._get_job(job_id)
         if job is None:
-            return f"Error: unknown job id {job_id!r}"
+            raise ValueError(f'unknown job id {job_id!r}')
         # This whole transition contains no await, so the event-loop reaper
         # cannot run between signal dispatch and the new state being recorded.
         if job.status not in ["running", "stopping", "monitor_error"]:

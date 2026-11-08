@@ -22,7 +22,7 @@ from settings_fixtures import write_user_settings
 
 from loki_agent import formats, settings
 from loki_agent import tool_runtime
-from loki_agent import loki
+from loki_agent import loki, model_requests, protocols, web_tools
 
 
 def load_hooks(file):
@@ -44,6 +44,72 @@ ARRAY_SCHEMA = {
     "required": ["values"],
     "additionalProperties": False,
 }
+
+
+class ExplicitToolResultTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_status_is_independent_of_content(self):
+        for ok, content in [[True, 'Error: quoted successful data'],
+                            [True, 'Failed is a word in the answer'],
+                            [False, 'No interactive user is available']]:
+            async def operation():
+                return tool_runtime.tool_result(ok, content)
+
+            with self.subTest(ok=ok, content=content):
+                result = await loki.with_exception_to_tool_result_async('test', operation)
+                self.assertEqual(result, {'ok': ok, 'content': content})
+
+    async def test_bare_handler_output_is_not_a_status_contract(self):
+        async def operation():
+            return 'apparently successful prose'
+
+        result = await loki.with_exception_to_tool_result_async('test', operation)
+        self.assertFalse(result['ok'], result)
+        self.assertIn('explicit tool result', result['content'])
+
+    async def test_unavailable_ask_is_an_explicit_failure(self):
+        result = await loki.dispatch_tool_async('Ask', {
+            'question': 'Choose?',
+            'options': [{'label': 'one'}, {'label': 'two'}],
+        })
+        self.assertFalse(result['ok'], result)
+        self.assertIn('no interactive', result['content'])
+
+    async def assert_http_fetch_failure(self, status):
+        url = 'https://result-test.invalid/denied'
+        response = {'content': 'ordinary prose without error markers',
+                    'contentType': 'text/plain', 'status': status,
+                    'finalUrl': url, 'error': None}
+        cache = loki.LruCache(1)
+        with mock.patch.object(loki, '_webfetch_cache', cache), \
+                mock.patch.object(web_tools, '_fetch_url_async', new=mock.AsyncMock(return_value=response)), \
+                mock.patch.object(loki, 'run_toolless_completion_async',
+                                  new=mock.AsyncMock(return_value='must not process an error page')) as processing:
+            result = await loki.dispatch_tool_async('WebFetch', {'url': url, 'prompt': 'Explain'})
+        self.assertFalse(result['ok'], result)
+        self.assertIn(f'HTTP {status}', result['content'])
+        processing.assert_not_awaited()
+        self.assertIsNone(cache.get(url))
+
+    async def test_webfetch_authentication_denial_is_not_an_answer(self):
+        await self.assert_http_fetch_failure(403)
+
+    async def test_webfetch_server_failure_is_not_an_answer(self):
+        await self.assert_http_fetch_failure(503)
+
+    async def test_webfetch_processing_failure_is_not_an_answer(self):
+        response = {'content': 'fetched page', 'contentType': 'text/plain',
+                    'status': 200, 'finalUrl': 'https://result-test.invalid/',
+                    'error': None}
+        with mock.patch.object(loki, '_webfetch_cache', loki.LruCache(1)), \
+                mock.patch.object(web_tools, '_fetch_url_async',
+                                  new=mock.AsyncMock(return_value=response)), \
+                mock.patch.object(loki, 'async_chat_completion', new=mock.AsyncMock(
+                    side_effect=protocols.ProtocolError('controlled provider failure'))):
+            result = await loki.dispatch_tool_async('WebFetch', {
+                'url': response['finalUrl'], 'prompt': 'Explain the page',
+            }, extra_context={'thinking': model_requests.TurnThinkingSettings()})
+        self.assertFalse(result['ok'], result)
+        self.assertIn('controlled provider failure', result['content'])
 
 
 class StructuredValidationTests(unittest.TestCase):

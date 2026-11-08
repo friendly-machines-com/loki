@@ -678,39 +678,42 @@ class Worker:
         return {"configOptions": self.config_options()}
 
     def _replay_transcript(self) -> None:
-        blocks = replays.classify_transcript(
-            self.session.transcript_items, show_reasoning=self.session.reasoning_traces == "on")
         replay_call = 0
         previous_kind = None
-        for kind, text, key in blocks:
-            if kind == "thought" and previous_kind == "thought":
-                text = "\n\n" + text
-            previous_kind = kind
-            if kind == "user":
-                update = {
-                    "sessionUpdate": "user_message_chunk",
-                    "content": {"type": "text", "text": text},
-                }
-            elif kind == "tool":
-                replay_call += 1
-                title, call_id = text, key
-                update = {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": str(
-                        call_id or f"replay-{replay_call}"),
-                    "title": title.split("\n")[0][:120],
-                    "kind": "other",
-                    "status": "completed",
-                }
-            else:
-                update = {
-                    "sessionUpdate": "agent_thought_chunk" if kind == "thought" else "agent_message_chunk",
-                    "content": {"type": "text", "text": text},
-                }
-            self.write(acps.notification("session/update", {
-                "sessionId": self.session_id,
-                "update": update,
-            }))
+        # Keep each canonical event available while rendering its blocks: the
+        # flat text projection loses is_error. Replay must use that existing
+        # flag, just like live updates, not infer status from a formatted title.
+        for event in self.session.transcript_items:
+            blocks = replays.classify_event(
+                event, show_reasoning=self.session.reasoning_traces == 'on')
+            for kind, text, key in blocks:
+                if kind == 'thought' and previous_kind == 'thought':
+                    text = '\n\n' + text
+                previous_kind = kind
+                if kind == 'user':
+                    update = {
+                        'sessionUpdate': 'user_message_chunk',
+                        'content': {'type': 'text', 'text': text},
+                    }
+                elif kind == 'tool':
+                    replay_call += 1
+                    title, call_id = text, key
+                    update = {
+                        'sessionUpdate': 'tool_call',
+                        'toolCallId': str(call_id or f'replay-{replay_call}'),
+                        'title': title.split('\n')[0][:120],
+                        'kind': 'other',
+                        'status': 'failed' if event.get('type') == 'tool_result' and event.get('is_error') else 'completed',
+                    }
+                else:
+                    update = {
+                        'sessionUpdate': 'agent_thought_chunk' if kind == 'thought' else 'agent_message_chunk',
+                        'content': {'type': 'text', 'text': text},
+                    }
+                self.write(acps.notification('session/update', {
+                    'sessionId': self.session_id,
+                    'update': update,
+                }))
 
     # -- asking the user through the front --------------------------------
 

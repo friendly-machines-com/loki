@@ -1375,8 +1375,7 @@ async def async_main(args, configuration: settings.Settings) -> int:
             print("Configuration error: model missing; set LOKI_MODEL.",
                   file=sys.stderr)
             return 2
-        await subagents.run_cli_async(toolset or "Explore", prompt_arg)
-        return 0
+        return await subagents.run_cli_async(toolset or 'Explore', prompt_arg)
 
     ui_settings = configuration
     log_filename = None
@@ -1901,6 +1900,13 @@ async def _run_frontend(args) -> int:
     status = argument_preflight(args)
     if status is not None:
         return status
+    # The existing overlay/output-mode owner serves the interactive frontend,
+    # not headless answer stdout: native Windows emits its VT setup even into
+    # pipes. Keep common save/job cleanup, but acquire/restore no UI state in
+    # headless mode. Use the existing grammar, not membership in raw args: a
+    # prompt's text may itself be '--headless'.
+    options, _positional = parse_cli_args(args)
+    headless = any(name == '--headless' for name, _value in options)
     try:
         configuration = await settings.load_settings(
             strict=True, on_error=lambda warning: _print_text_line(
@@ -1939,8 +1945,9 @@ async def _run_frontend(args) -> int:
         cleanup_done = True
         if current_chat_log_path() is not None:
             clean_up_step(save_chat_log)
-        clean_up_step(
-            lambda: restore_terminal_overlay(terminal, clean_up_step))
+        if not headless:
+            clean_up_step(
+                lambda: restore_terminal_overlay(terminal, clean_up_step))
 
     def clean_up_and_exit(*args, **kwargs):
         clean_up(*args, **kwargs)
@@ -1961,12 +1968,13 @@ async def _run_frontend(args) -> int:
             state.begin_close()
 
     exit_status = 1
-    output_settings = terminal_output_mode()
+    output_settings = contextlib.nullcontext() if headless else terminal_output_mode()
     with output_settings:
         try:
             # Output mode must outlive InputSession: overlay restoration emits
             # VT sequences too. A partial setup still needs that restoration.
-            initialize_terminal_overlay(terminal)
+            if not headless:
+                initialize_terminal_overlay(terminal)
             exit_status = await run_with_session_cleanup()
         finally:
             clean_up()

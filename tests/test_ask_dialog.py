@@ -371,7 +371,7 @@ class AskHeaderTests(unittest.TestCase):
 
 
 class AskHandlerTests(unittest.IsolatedAsyncioTestCase):
-    """The outcome-to-text renderer every Ask path funnels through."""
+    """Every Ask path carries its explicit outcome as well as rendered text."""
 
     async def _run(self, args, outcome):
         self.last = {}
@@ -397,8 +397,9 @@ class AskHandlerTests(unittest.IsolatedAsyncioTestCase):
         return args
 
     async def test_no_seam_answers_without_invoking_the_user(self):
-        self.assertIn("not available", await loki._handle_ask_async(
-            self._args(), None))
+        result = await loki._handle_ask_async(self._args(), None)
+        self.assertFalse(result['ok'])
+        self.assertIn('not available', result['content'])
 
     async def test_malformed_inputs_are_rejected_before_asking(self):
         cases = [
@@ -422,15 +423,17 @@ class AskHandlerTests(unittest.IsolatedAsyncioTestCase):
                 async def ask_user(question, options, *, multi_select=False):
                     called.append(question)
 
-                text = await loki._handle_ask_async(
-                    args, {"ask_user": ask_user})
-                self.assertIn(pattern, text)
+                result = await loki._handle_ask_async(args, {'ask_user': ask_user})
+                self.assertFalse(result['ok'])
+                self.assertIn(pattern, result['content'])
                 self.assertEqual(called, [])
 
     async def test_answer_is_rendered_with_its_question_and_note(self):
-        text = await self._run(
+        result = await self._run(
             self._args(),
-            {"action": "answered", "answer": "Remote", "custom": "via VPN"})
+            {'action': 'answered', 'answer': 'Remote', 'custom': 'via VPN'})
+        self.assertTrue(result['ok'])
+        text = result['content']
         self.assertIn('"Which storage?"', text)
         self.assertIn('"Remote"', text)
         self.assertIn("via VPN", text)
@@ -439,20 +442,25 @@ class AskHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.last["multi_select"])
 
     async def test_decline_and_dismiss_are_distinct(self):
-        self.assertIn("declined", await self._run(
-            self._args(), {"action": "declined"}))
-        self.assertIn("dismissed", await self._run(
-            self._args(), {"action": "cancelled"}))
+        declined = await self._run(self._args(), {'action': 'declined'})
+        dismissed = await self._run(self._args(), {'action': 'cancelled'})
+        self.assertTrue(declined['ok'])
+        self.assertTrue(dismissed['ok'])
+        self.assertIn('declined', declined['content'])
+        self.assertIn('dismissed', dismissed['content'])
 
     async def test_multi_select_answer_is_rendered_as_a_quoted_list(self):
-        text = await self._run(
-            self._args(), {"action": "answered", "answer": ["Legs", "Roof"]})
+        result = await self._run(
+            self._args(), {'action': 'answered', 'answer': ['Legs', 'Roof']})
+        self.assertTrue(result['ok'])
+        text = result['content']
         self.assertIn('"Legs"', text)
         self.assertIn('"Roof"', text)
 
     async def test_a_non_dict_outcome_is_a_delivery_failure(self):
-        self.assertIn("could not be delivered", await self._run(
-            self._args(), None))
+        result = await self._run(self._args(), None)
+        self.assertFalse(result['ok'])
+        self.assertIn('could not be delivered', result['content'])
 
 
 if __name__ == "__main__":

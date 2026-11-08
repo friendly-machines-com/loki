@@ -14,14 +14,13 @@ import tempfile
 import types
 import unittest
 from unittest import mock
-from loki_agent import private_files
-from loki_entrypoints import loki_command
-from settings_fixtures import write_user_settings, write_user_settings_at
-from loki_entrypoints import child_environment, configure_container, entrypoint
+from loki_entrypoints import (
+    child_environment, configure_container, entrypoint, loki_command)
 from job_fixtures import job_manager, managed_jobs
 from process_lifecycle_fixtures import observe_fixture
 from response_header_fixtures import isolated_response_headers, setUpModule as set_up_response_headers
-from settings_fixtures import setUpModule as set_up_default_settings
+from settings_fixtures import (
+    setUpModule as set_up_default_settings, write_user_settings, write_user_settings_at)
 from config_fixtures import setUpModule as set_up_config
 
 
@@ -39,7 +38,7 @@ from loki_agent import openai_models
 from loki_agent import protocols
 from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialInventory, CredentialStore
-from loki_agent import savefiles, settings
+from loki_agent import private_files, savefiles, settings
 from loki_agent import terminals
 from loki_agent import connections, tool_contracts, tool_runtime
 from loki_agent import files as file_operations
@@ -2848,7 +2847,149 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self._workflow(stream=True, approve=False)
 
 
+class HeadlessRequestOutcomeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.enterContext(isolated_response_headers())
+
+    async def request(self, *, error=None, answer=''):
+        output, diagnostics = io.StringIO(), io.StringIO()
+        completion = mock.AsyncMock(side_effect=error) if error is not None else mock.AsyncMock(
+            return_value=[formats.message_item('assistant', answer)])
+        with mock.patch.object(loki.current_session(), 'agent_mode', 'normal'), \
+                mock.patch.object(loki, 'async_chat_completion', new=completion), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(diagnostics):
+            status = await subagents.run_cli_async(
+                'Explore', 'inspect', thinking=model_requests.TurnThinkingSettings())
+        return [status, output.getvalue(), diagnostics.getvalue()]
+
+    async def test_network_failure_has_failed_status_and_no_answer(self):
+        status, output, diagnostics = await self.request(error=OSError('controlled unreachable provider'))
+        self.assertEqual(status, 1)
+        self.assertEqual(output, '')
+        self.assertIn('controlled unreachable provider', diagnostics)
+
+    async def test_protocol_failure_is_not_a_configuration_error(self):
+        status, output, diagnostics = await self.request(
+            error=protocols.ProtocolError('controlled provider protocol failure'))
+        self.assertEqual(status, 1)
+        self.assertEqual(output, '')
+        self.assertIn('controlled provider protocol failure', diagnostics)
+
+    async def test_empty_answer_is_successful(self):
+        self.assertEqual(await self.request(), [0, '', ''])
+
+    async def test_error_looking_answer_is_successful_output(self):
+        text = 'Error: this is answer content, not request status'
+        self.assertEqual(await self.request(answer=text), [0, text + '\n', ''])
+
+    async def test_headless_frontend_propagates_the_request_exit_status(self):
+        with mock.patch.object(terminal_frontend, 'build_config_from_env'), \
+                mock.patch.object(terminal_frontend, 'apply_runtime_config'), \
+                mock.patch.object(terminal_frontend, 'current_model', return_value='configured'), \
+                mock.patch.object(subagents, 'run_cli_async', new=mock.AsyncMock(return_value=1)):
+            status = await terminal_frontend.async_main(
+                ['--headless', '--prompt', 'inspect'], settings.Settings())
+        self.assertEqual(status, 1)
+
+
+class FrontendOutputOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # A POSIX non-tty can suppress the overlay bytes and hide the native
+        # Windows failure. Observe the UI owners directly, while retaining the
+        # real frontend's common session/save cleanup; real children run below.
+        self.enterContext(isolated_response_headers())
+        self.session = loki.current_session()
+        self.manager = loki.current_job_manager()
+        self.addAsyncCleanup(self.session.close_state)
+        self.close_jobs = self.enterContext(mock.patch.object(
+            self.manager, 'close_session_owned', wraps=self.manager.close_session_owned))
+        self.enterContext(mock.patch.object(terminal_frontend, 'configure_tool_hook_pipeline'))
+        self.enterContext(mock.patch.object(terminal_frontend.signal, 'signal'))
+        self.enterContext(mock.patch.object(
+            terminal_frontend.signal, 'pthread_sigmask', create=True))
+        self.enterContext(mock.patch.object(
+            terminal_frontend, 'current_chat_log_path', return_value='owned-chat'))
+        self.save = self.enterContext(mock.patch.object(terminal_frontend, 'save_chat_log'))
+        self.mode = self.enterContext(mock.patch.object(
+            terminal_frontend, 'terminal_output_mode',
+            return_value=contextlib.nullcontext()))
+        self.initialize = self.enterContext(mock.patch.object(
+            terminal_frontend, 'initialize_terminal_overlay'))
+        self.restore = self.enterContext(mock.patch.object(
+            terminal_frontend, 'restore_terminal_overlay'))
+
+    def _assert_headless_cleanup(self):
+        self.close_jobs.assert_not_awaited()
+        self.assertFalse(self.session.active)
+        self.assertIsNotNone(self.session.response_headers.directory_handle)
+        self.save.assert_called_once_with()
+        self.mode.assert_not_called()
+        self.initialize.assert_not_called()
+        self.restore.assert_not_called()
+
+    async def _headless_status(self, status):
+        with mock.patch.object(
+                terminal_frontend, 'async_main', new=mock.AsyncMock(return_value=status)):
+            result = await terminal_frontend._run_frontend(['--headless', '--prompt', 'inspect'])
+        self.assertEqual(result, status)
+        self._assert_headless_cleanup()
+
+    async def test_headless_success_does_not_acquire_terminal_state(self):
+        await self._headless_status(0)
+
+    async def test_headless_failed_request_does_not_acquire_terminal_state(self):
+        await self._headless_status(1)
+
+    async def test_headless_exception_still_closes_common_session_state(self):
+        with mock.patch.object(
+                terminal_frontend, 'async_main',
+                new=mock.AsyncMock(side_effect=OSError('request failed'))):
+            with self.assertRaisesRegex(OSError, 'request failed'):
+                await terminal_frontend._run_frontend(['--headless'])
+        self._assert_headless_cleanup()
+
+    async def test_headless_prompt_text_is_not_the_headless_option(self):
+        with mock.patch.object(
+                terminal_frontend, 'async_main', new=mock.AsyncMock(return_value=0)):
+            self.assertEqual(await terminal_frontend._run_frontend(['--prompt', '--headless']), 0)
+        self.close_jobs.assert_not_awaited()
+        self.assertFalse(self.session.active)
+        self.assertIsNotNone(self.session.response_headers.directory_handle)
+        self.save.assert_called_once_with()
+        self.mode.assert_called_once_with()
+        self.initialize.assert_called_once_with(terminal_frontend.terminal)
+        self.restore.assert_called_once()
+
+
 class ExitStatusTests(unittest.TestCase):
+    # These real frontend probes need the existing caller-selected command
+    # vector: entrypoint() alone cannot execute a source script on Windows.
+    # subprocess.run still owns the child and drains/joins it before cleanup.
+    def test_real_headless_request_failure_has_failed_exit_and_no_answer(self):
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as endpoint:
+            # Keep the port bound but not listening: connection refusal is a
+            # real request failure without relying on an external service or a
+            # timing cutoff, and no other process can claim the chosen port.
+            endpoint.bind(('127.0.0.1', 0))
+            env = child_environment(
+                HOME=directory, PATH=os.environ.get('PATH', ''), TERM='dumb',
+                XDG_CONFIG_HOME=os.path.join(directory, 'config'),
+                XDG_STATE_HOME=os.path.join(directory, 'state'),
+                LOKI_API_BASE=f'http://127.0.0.1:{endpoint.getsockname()[1]}/v1',
+                LOKI_PROVIDER=protocols.OPENAI_CHAT, LOKI_MODEL='headless-check',
+                LOKI_STREAM='0',
+            )
+            workspace = os.path.join(directory, 'workspace')
+            os.makedirs(workspace)
+            configure_container(env, workspace)
+            result = subprocess.run(
+                [*loki_command(), '--headless', '--prompt', 'inspect'],
+                cwd=workspace, env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('Request failed:', result.stderr)
+
     def test_executable_entry_point_propagates_headless_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             env = child_environment(
@@ -2862,13 +3003,12 @@ class ExitStatusTests(unittest.TestCase):
             os.makedirs(workspace)
             configure_container(env, workspace)
             result = subprocess.run(
-                [entrypoint("loki"), "--headless"],
+                [*loki_command(), "--headless"],
                 cwd=workspace,
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=10,
             )
 
         self.assertEqual(result.returncode, 2)
@@ -2878,11 +3018,10 @@ class ExitStatusTests(unittest.TestCase):
         )
 
     def test_cleanup_failure_changes_only_successful_status(self):
-        old_credentials = loki.CREDENTIALS
         stderr = io.StringIO()
-        try:
+        with mock.patch.object(loki, 'CREDENTIALS', loki.CREDENTIALS):
             for async_status, expected_status in ((0, 1), (2, 2)):
-                with self.subTest(async_status=async_status), mock.patch(
+                with self.subTest(async_status=async_status), isolated_response_headers(), mock.patch(
                             "loki_agent.terminal_frontend.signal.signal"), mock.patch(
                                 "loki_agent.terminal_frontend.signal.pthread_sigmask",
                                 create=True,
@@ -2904,8 +3043,6 @@ class ExitStatusTests(unittest.TestCase):
                         terminal_frontend._run_frontend([]))
 
                 self.assertEqual(status, expected_status)
-        finally:
-            loki.CREDENTIALS = old_credentials
 
         self.assertIn("Cleanup error: OSError: restore failed",
                       stderr.getvalue())
@@ -3045,7 +3182,8 @@ class StatusTextTests(unittest.TestCase):
         todo = {"content": "Done", "status": "completed", "priority": "high"}
         loki.run_todowrite([todo])
         self.assertIn("/todo:1/1, /queue", terminal_frontend.status_text())
-        self.assertIn("Error:", loki.run_todowrite([{**todo, "status": "invalid"}]))
+        with self.assertRaisesRegex(ValueError, 'invalid status'):
+            loki.run_todowrite([{**todo, 'status': 'invalid'}])
         self.assertIn("/todo:1/1, /queue", terminal_frontend.status_text())
         loki.run_todowrite([])
         self.assertIn("/todo:0/0, /queue", terminal_frontend.status_text())
@@ -3272,7 +3410,7 @@ class TerminalJobStatusTtyTests(unittest.IsolatedAsyncioTestCase):
                 LOKI_DUMMY_TOOL_CALL=json.dumps({
                     "name": "Bash", "arguments": {
                         "command": "while test ! -e job-release; do sleep 0.01; done",
-                        "run_in_background": background}}))
+                        "timeout": None, "run_in_background": background}}))
             try:
                 process = await asyncio.create_subprocess_exec(
                     entrypoint("loki"), "--dangerously-skip-permissions",
@@ -4752,6 +4890,61 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatLogPathTests(unittest.TestCase):
+    def test_real_terminal_resume_validates_opened_files_before_prompting(self):
+        """Startup must use the regular-file reader, not bypass it with a blocking open."""
+        with tempfile.TemporaryDirectory() as workspace, \
+                tempfile.TemporaryDirectory() as config, \
+                tempfile.TemporaryDirectory() as state:
+            environment = child_environment(
+                PATH=os.environ.get('PATH', ''), TERM='dumb', HOME=config, USERPROFILE=config,
+                XDG_CONFIG_HOME=config, XDG_STATE_HOME=state,
+                LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1', LOKI_MODEL='dummy')
+            regular = os.path.join(workspace, 'regular.json')
+            with open(regular, 'w', encoding='utf-8') as stream:
+                stream.write(savefiles.serialize_chat_log([], [], {'shell_cwd': workspace}))
+            directory = os.path.join(workspace, 'directory.json')
+            os.mkdir(directory)
+            deep = os.path.join(workspace, 'deep.json')
+            nesting = sys.getrecursionlimit() + 100
+            with open(deep, 'w', encoding='utf-8') as stream:
+                stream.write('[' * nesting + ']' * nesting)
+            invalid = [directory, deep]
+            valid = [regular]
+            if os.name == 'posix':
+                fifo = os.path.join(workspace, 'pipe.json')
+                os.mkfifo(fifo)
+                invalid.append(fifo)
+                alias = os.path.join(workspace, 'alias.json')
+                os.symlink(regular, alias)
+                valid.append(alias)
+            configure_container(environment, workspace)
+            try:
+                for operand in invalid:
+                    with self.subTest(operand=operand):
+                        before = os.lstat(operand).st_mode
+                        result = subprocess.run(
+                            [entrypoint('loki'), '--resume=' + operand], cwd=workspace,
+                            env=environment, input='/quit\n', capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn('Could not resume chat:', result.stderr)
+                        self.assertNotIn('Traceback', result.stderr)
+                        self.assertEqual(os.lstat(operand).st_mode, before)
+                for operand in valid:
+                    with self.subTest(operand=operand):
+                        result = subprocess.run(
+                            [entrypoint('loki'), '--resume=' + operand], cwd=workspace,
+                            env=environment, input='/quit\n', capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                if os.name == 'posix':
+                    self.assertTrue(os.path.islink(alias))
+            finally:
+                # This test's relocated ledger owns only its disposable profile.
+                # Do not leave setup grants behind on the Windows test account.
+                if os.name == 'nt':
+                    cleanup = subprocess.run(
+                        [entrypoint('loki-setup'), '--uninstall'], cwd=workspace,
+                        env=environment, capture_output=True, text=True)
+                    self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
 
     def test_bare_resume_names_resolve_to_local_loki_chat_directory(self):
         self.assertEqual(
@@ -5554,8 +5747,9 @@ class SubagentLaunchTests(unittest.TestCase):
         session.subagent_depth = tool_contracts.MAX_SUBAGENT_DEPTH
         captured = {}
 
-        async def fake_loop(messages, allowed, *, thinking, on_event=None):
+        async def fake_loop(messages, allowed, *, thinking, on_event):
             self.assertEqual(thinking.traces, 'off')
+            self.assertTrue(callable(on_event))
             captured["messages"] = messages
             captured["allowed"] = allowed
             return "done"
@@ -5568,8 +5762,8 @@ class SubagentLaunchTests(unittest.TestCase):
         with mock.patch.object(
                 loki, "current_job_manager",
                 return_value=manager):
-            denied = asyncio.run(loki.run_agent_async('nested', 'inspect'))
-            self.assertIn('maximum subagent depth', denied)
+            with self.assertRaisesRegex(ValueError, 'maximum subagent depth'):
+                asyncio.run(loki.run_agent_async('nested', 'inspect'))
 
         self.assertEqual(result, "done")
         self.assertNotIn("Agent", captured["allowed"])
@@ -5586,8 +5780,9 @@ class SubagentLaunchTests(unittest.TestCase):
         session.subagent_depth = tool_contracts.MAX_SUBAGENT_DEPTH - 1
         captured = {}
 
-        async def fake_loop(messages, allowed, *, thinking, on_event=None):
+        async def fake_loop(messages, allowed, *, thinking, on_event):
             self.assertEqual(thinking.traces, 'off')
+            self.assertTrue(callable(on_event))
             captured["messages"] = messages
             captured["allowed"] = allowed
             return "done"

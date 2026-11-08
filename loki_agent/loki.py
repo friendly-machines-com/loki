@@ -840,29 +840,34 @@ def run_ps(argument: str = "") -> str:
             listing += "\nfailed = job setup/launch failure, not command exit code."
         return (listing + "\n/ps all - history; /ps ID - tail; "
                 "/ps stop ID - stop; /ps kill ID - force termination")
-    if len(parts) == 1 and parts[0].isdecimal():
-        return run_job_status(parts[0])
-    if (len(parts) == 2 and parts[0] in ["stop", "kill"]
-            and parts[1].isdecimal()):
-        return run_job_stop(parts[1], force=parts[0] == "kill")
+    # /ps renders user-command diagnostics, not tool status. Keep that text
+    # boundary here; model tools use the explicit result/exception boundary.
+    try:
+        if len(parts) == 1 and parts[0].isdecimal():
+            return run_job_status(parts[0])
+        if (len(parts) == 2 and parts[0] in ['stop', 'kill']
+                and parts[1].isdecimal()):
+            return run_job_stop(parts[1], force=parts[0] == 'kill')
+    except ValueError as error:
+        return f'Error: {error}'
     return "usage: /ps [all | ID | stop ID | kill ID]"
 
 
 def run_job_status(job_id: str, tail_chars: int = tool_contracts.JOB_TAIL_CHARS, *, structured=False):
     if not job_id:
-        return "Error: job_id is required"
+        raise ValueError('job_id is required')
     try:
         tail_chars = int(tail_chars)
-    except (TypeError, ValueError) as e:
-        return f"Error: invalid tail_chars: {e}"
+    except (TypeError, ValueError) as error:
+        raise ValueError(f'invalid tail_chars: {error}') from error
     if tail_chars < 0:
-        return "Error: tail_chars must be non-negative"
+        raise ValueError('tail_chars must be non-negative')
     return current_job_manager().job_status(job_id, tail_chars=tail_chars, structured=structured)
 
 
 def run_job_stop(job_id: str, force: bool = False) -> str:
     if not job_id:
-        return "Error: job_id is required"
+        raise ValueError('job_id is required')
     return current_job_manager().stop_job(job_id, force=bool(force))
 
 
@@ -883,12 +888,6 @@ def run_edit(file_path: str, old_string: str, new_string: str,
                           cwd=cwd if cwd is not None else current_shell_cwd(), observations=current_session().file_observations)
 
 
-def run_glob(pattern: str, path: str | None = None, *,
-             hidden: bool = False, no_ignore: bool = False) -> str:
-    return asyncio.run(run_glob_async(
-        pattern, path, hidden=hidden, no_ignore=no_ignore))
-
-
 async def run_glob_async(pattern: str, path: str | None = None,
                          cancel_event: asyncio.Event | None = None, *,
                          hidden: bool = False, no_ignore: bool = False, cwd=None) -> str:
@@ -896,11 +895,6 @@ async def run_glob_async(pattern: str, path: str | None = None,
     return await files.run_glob_async(
         pattern, path, cancel_event, hidden=hidden, no_ignore=no_ignore, cwd=cwd,
         run_exec=partial(current_job_manager().run_exec, cwd=cwd))
-
-
-def run_grep(pattern: str, path: str | None = None, glob: str | None = None,
-             output_mode: str = "files_with_matches", **kwargs) -> str:
-    return asyncio.run(run_grep_async(pattern, path, glob, output_mode, **kwargs))
 
 
 async def run_grep_async(pattern: str, path: str | None = None, glob: str | None = None,
@@ -923,23 +917,23 @@ def run_todoread() -> str:
 
 def run_todowrite(todos: list) -> str:
     if not isinstance(todos, list):
-        return "Error: todos must be an array"
+        raise ValueError('todos must be an array')
     if len(todos) > TODO_MAX_TODOS:
-        return f"Error: too many todos (max {TODO_MAX_TODOS})"
+        raise ValueError(f'too many todos (max {TODO_MAX_TODOS})')
     in_progress = sum(1 for t in todos if t.get('status') == 'in_progress')
     if in_progress > 1:
-        return "Error: At most one todo can be in_progress at a time"
+        raise ValueError('At most one todo can be in_progress at a time')
     cleaned = []
     for t in todos:
         content = (t.get('content') or '').strip()
         status = t.get('status')
         priority = t.get('priority')
         if not content:
-            return "Error: each todo requires non-empty content"
+            raise ValueError('each todo requires non-empty content')
         if status not in ['pending', 'in_progress', 'completed']:
-            return f"Error: invalid status {status!r}"
+            raise ValueError(f'invalid status {status!r}')
         if priority not in ['high', 'medium', 'low']:
-            return f"Error: invalid priority {priority!r}"
+            raise ValueError(f'invalid priority {priority!r}')
         cleaned.append({'content': content, 'status': status, 'priority': priority})
     current_session().session_todos = cleaned
     mark_chat_log_dirty()
@@ -947,10 +941,6 @@ def run_todowrite(todos: list) -> str:
                'in_progress': in_progress,
                'completed': sum(1 for t in cleaned if t['status'] == 'completed')}
     return f"Updated todos: {summary}"
-
-
-def _handle_bash(args: dict):
-    return asyncio.run(_handle_bash_async(args))
 
 
 async def _handle_bash_async(args: dict, extra_context=None):
@@ -969,88 +959,65 @@ def _handle_read(args: dict):
                     structured=True)
 
 
-def _handle_write(args: dict) -> str:
-    return run_write(args["file_path"], args["content"])
+# These adapters are the tool-result boundary. The underlying operations also
+# serve text-only commands such as /ps and /todo: successful text stays text,
+# but failures raise into the existing exception boundary below. No caller has
+# to infer success from a message, a captured stream, or a rendered exit header.
+def _handle_write(args: dict) -> dict:
+    return tool_runtime.tool_result(True, run_write(args['file_path'], args['content']))
 
 
-def _handle_edit(args: dict) -> str:
-    return run_edit(args["file_path"], args["old_string"],
-                    args["new_string"], replace_all=args.get("replace_all", False))
+def _handle_edit(args: dict) -> dict:
+    return tool_runtime.tool_result(True, run_edit(
+        args['file_path'], args['old_string'], args['new_string'],
+        replace_all=args.get('replace_all', False)))
 
 
-def _handle_glob(args: dict) -> str:
-    return run_glob(args["pattern"], args.get("path"),
-                    hidden=args.get("hidden", False),
-                    no_ignore=args.get("no_ignore", False))
+async def _handle_glob_async(args: dict, extra_context=None) -> dict:
+    return tool_runtime.tool_result(True, await run_glob_async(
+        args['pattern'], args.get('path'),
+        cancel_event=(extra_context or {}).get('cancel_event'),
+        hidden=args.get('hidden', False), no_ignore=args.get('no_ignore', False)))
 
 
-async def _handle_glob_async(args: dict, extra_context=None) -> str:
-    return await run_glob_async(
-        args["pattern"], args.get("path"),
-        cancel_event=(extra_context or {}).get("cancel_event"),
-        hidden=args.get("hidden", False),
-        no_ignore=args.get("no_ignore", False))
-
-
-def _handle_grep(args: dict) -> str:
-    return run_grep(args["pattern"],
-                    path=args.get("path"),
-                    glob=args.get("glob"),
-                    output_mode=args.get("output_mode", "files_with_matches"),
-                    **{k: v for k, v in args.items()
-                       if k in ["-B", "-A", "-C", "context", "-n", "-i", "-o",
-                                "type", "head_limit", "offset", "multiline"]})
-
-
-async def _handle_grep_async(args: dict, extra_context=None) -> str:
+async def _handle_grep_async(args: dict, extra_context=None) -> dict:
     extra = {k: v for k, v in args.items()
-             if k not in ["pattern", "path", "glob", "output_mode"]}
-    return await run_grep_async(args["pattern"],
-                                path=args.get("path"),
-                                glob=args.get("glob"),
-                                output_mode=args.get("output_mode", "files_with_matches"),
-                                cancel_event=(extra_context or {}).get(
-                                    "cancel_event"),
-                                **extra)
+             if k not in ['pattern', 'path', 'glob', 'output_mode']}
+    return tool_runtime.tool_result(True, await run_grep_async(
+        args['pattern'], path=args.get('path'), glob=args.get('glob'),
+        output_mode=args.get('output_mode', 'files_with_matches'),
+        cancel_event=(extra_context or {}).get('cancel_event'), **extra))
 
 
-def _handle_jobs(args: dict) -> str:
-    return run_jobs()
+def _handle_jobs(args: dict) -> dict:
+    # Inspecting a list containing failed jobs is still a successful listing.
+    return tool_runtime.tool_result(True, run_jobs())
 
 
-def _handle_job_status(args: dict):
-    return run_job_status(args["job_id"], args.get("tail_chars", tool_contracts.JOB_TAIL_CHARS), structured=True)
+def _handle_job_status(args: dict) -> dict:
+    return run_job_status(args['job_id'], args.get('tail_chars', tool_contracts.JOB_TAIL_CHARS), structured=True)
 
 
-def _handle_job_stop(args: dict) -> str:
-    return run_job_stop(args["job_id"], args.get("force", False))
+def _handle_job_stop(args: dict) -> dict:
+    return tool_runtime.tool_result(True, run_job_stop(args['job_id'], args.get('force', False)))
 
 
-def _handle_todoread(args: dict) -> str:
-    return run_todoread()
+def _handle_todoread(args: dict) -> dict:
+    return tool_runtime.tool_result(True, run_todoread())
 
 
-def _handle_todowrite(args: dict) -> str:
-    return run_todowrite(args["todos"])
+def _handle_todowrite(args: dict) -> dict:
+    return tool_runtime.tool_result(True, run_todowrite(args['todos']))
 
 
-def _handle_agent(args: dict) -> str:
-    return run_agent(args["description"],
-                     args["prompt"],
-                     run_in_background=args.get("run_in_background", False),
-                     subagent_type=args.get("subagent_type", "Explore"))
-
-
-async def _handle_agent_async(args: dict, extra_context=None) -> str:
+async def _handle_agent_async(args: dict, extra_context=None) -> dict:
     context = extra_context or {}
-    return await run_agent_async(args.get("description", ""),
-                                 args["prompt"],
-                                 args.get("run_in_background", False),
-                                 args.get("subagent_type", "Explore"),
-                                 cancel_event=context.get("cancel_event"),
-                                 reasoning_effort=context.get(
-                                     "reasoning_effort", _UNSET),
-                                 thinking=context.get("thinking"))
+    return tool_runtime.tool_result(True, await run_agent_async(
+        args.get('description', ''), args['prompt'],
+        args.get('run_in_background', False), args.get('subagent_type', 'Explore'),
+        cancel_event=context.get('cancel_event'),
+        reasoning_effort=context.get('reasoning_effort', _UNSET),
+        thinking=context.get('thinking')))
 
 
 def _handle_skill(args: dict) -> dict:
@@ -1060,98 +1027,99 @@ def _handle_skill(args: dict) -> dict:
     return tool_runtime.tool_result(True, content, process_output=output.to_dict())
 
 
-async def _handle_webfetch_async(args: dict, extra_context=None) -> str:
+async def _handle_webfetch_async(args: dict, extra_context=None) -> dict:
     context = extra_context or {}
-    return await run_webfetch_async(
-        args["url"], args["prompt"],
-        cancel_event=context.get("cancel_event"),
-        reasoning_effort=context.get("reasoning_effort", _UNSET),
-        thinking=context.get("thinking"))
+    return tool_runtime.tool_result(True, await run_webfetch_async(
+        args['url'], args['prompt'], cancel_event=context.get('cancel_event'),
+        reasoning_effort=context.get('reasoning_effort', _UNSET),
+        thinking=context.get('thinking')))
 
 
-async def _handle_websearch_async(args: dict, extra_context=None) -> str:
-    return await web_tools.run_websearch_async(
-        args["query"], allowed_domains=args.get("allowed_domains"),
-        blocked_domains=args.get("blocked_domains"),
-        cancel_event=(extra_context or {}).get("cancel_event"))
+async def _handle_websearch_async(args: dict, extra_context=None) -> dict:
+    return tool_runtime.tool_result(True, await web_tools.run_websearch_async(
+        args['query'], allowed_domains=args.get('allowed_domains'),
+        blocked_domains=args.get('blocked_domains'),
+        cancel_event=(extra_context or {}).get('cancel_event')))
 
 
-async def _handle_ask_async(args: dict, extra_context=None) -> str:
-    asker = (extra_context or {}).get("ask_user")
+async def _handle_ask_async(args: dict, extra_context=None) -> dict:
+    asker = (extra_context or {}).get('ask_user')
     if asker is None:
-        return (
-            "Ask is not available in this session: it has no interactive "
-            "user who could answer.")
-    options = args.get("options")
+        return tool_runtime.tool_result(
+            False, 'Ask is not available in this session: it has no interactive user who could answer.')
+    options = args.get('options')
     if not isinstance(options, list) or len(options) < 2:
-        return "Ask requires at least two options."
+        return tool_runtime.tool_result(False, 'Ask requires at least two options.')
     labels = []
     for option in options:
         if not isinstance(option, dict):
-            return "Ask options must be objects with a label."
-        label = option.get("label")
+            return tool_runtime.tool_result(False, 'Ask options must be objects with a label.')
+        label = option.get('label')
         if not isinstance(label, str) or not label.strip():
-            return "Ask option labels must be nonempty strings."
+            return tool_runtime.tool_result(False, 'Ask option labels must be nonempty strings.')
         labels.append(label)
     if len(set(labels)) != len(labels):
-        return "Ask option labels must be unique so an answer is unambiguous."
-    question = args.get("question")
+        return tool_runtime.tool_result(False, 'Ask option labels must be unique so an answer is unambiguous.')
+    question = args.get('question')
     if not isinstance(question, str) or not question.strip():
-        return "Ask requires a nonempty question."
+        return tool_runtime.tool_result(False, 'Ask requires a nonempty question.')
     outcome = await asker(
         question,
-        [(option["label"], option.get("description")) for option in options],
-        multi_select=bool(args.get("multi_select", False)),
+        [(option['label'], option.get('description')) for option in options],
+        multi_select=bool(args.get('multi_select', False)),
     )
     if not isinstance(outcome, dict):
-        return "The question could not be delivered to the user."
-    action = outcome.get("action")
-    if action == "declined":
+        return tool_runtime.tool_result(False, 'The question could not be delivered to the user.')
+    action = outcome.get('action')
+    if action == 'declined':
         # A refusal is information, not an error: the turn continues.
-        return "The user declined to answer the question."
-    if action != "answered":
-        return "The user dismissed the question without answering."
-    answer = outcome.get("answer")
+        return tool_runtime.tool_result(True, 'The user declined to answer the question.')
+    if action != 'answered':
+        return tool_runtime.tool_result(True, 'The user dismissed the question without answering.')
+    answer = outcome.get('answer')
     if isinstance(answer, list):
-        rendered = ", ".join(f'"{item}"' for item in answer)
+        rendered = ', '.join(f'"{item}"' for item in answer)
     else:
         rendered = f'"{answer}"'
-    note = outcome.get("custom")
+    note = outcome.get('custom')
     if note:
-        return (f'The user answered "{question}" with {rendered}. '
-                f'The user also noted: {note}')
-    return f'The user answered "{question}" with {rendered}.'
-
-
-def _looks_like_tool_error(content: str) -> bool:
-    return content.startswith("Error: ") or content.startswith("Failed")
+        return tool_runtime.tool_result(
+            True, f'The user answered "{question}" with {rendered}. The user also noted: {note}')
+    return tool_runtime.tool_result(True, f'The user answered "{question}" with {rendered}.')
 
 
 async def with_exception_to_tool_result_async(context: str, thunk) -> dict:
+    # Tool payloads and captured streams are arbitrary data, not a status
+    # protocol. Every maintained handler supplies the existing envelope; raised
+    # operation failures use this boundary instead of being flattened to prose.
     try:
-        content = await thunk()
+        result = await thunk()
+        if not (isinstance(result, dict)
+                and {'ok', 'content'} <= set(result) <= {'ok', 'content', 'process_output'}
+                and isinstance(result['ok'], bool)):
+            raise TypeError('tool handler must return an explicit tool result')
+        return tool_runtime.tool_result(
+            result['ok'], result['content'], process_output=result.get('process_output'))
     except (KeyboardInterrupt, SystemExit):
         raise
     except FileNotFoundError as e:
-        return tool_runtime.tool_result(False, f"Error while {context}: file not found: {e}")
+        return tool_runtime.tool_result(False, f'Error: File not found: {e}')
     except PermissionError as e:
         return tool_runtime.tool_result(False, f"Error while {context}: permission denied: {e}")
     except TimeoutError as e:
         return tool_runtime.tool_result(False, f"Error while {context}: timed out: {e}")
     except OSError as e:
-        return tool_runtime.tool_result(False, f"Error while {context}: OS error: {e}")
+        return tool_runtime.tool_result(False, f'Error: {e}')
+    except model_requests.ApiError as e:
+        return tool_runtime.tool_result(False, e.formatted())
+    except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
+        # A nested processing request can fail independently of tool input.
+        # Preserve its provider/protocol diagnostic, not an invalid-value label.
+        return tool_runtime.tool_result(False, str(e))
     except ValueError as e:
         return tool_runtime.tool_result(False, f"Error while {context}: invalid value: {e}")
     except Exception as e:
         return tool_runtime.tool_result(False, f"Failed while {context}: {type(e).__name__}: {e}")
-
-    if (isinstance(content, dict)
-            and {"ok", "content"} <= set(content) <= {"ok", "content", "process_output"}
-            and isinstance(content["ok"], bool)):
-        return tool_runtime.tool_result(
-            content["ok"], content["content"], process_output=content.get("process_output"))
-    text = str(content)
-    return tool_runtime.tool_result(not _looks_like_tool_error(text), text)
 
 
 def _refused_tool_hint(fn_name, args, allowed):
@@ -2015,22 +1983,15 @@ async def run_toolless_completion_async(
     thinking = replace(thinking, traces="off")
     if reasoning_effort is _UNSET:
         reasoning_effort = thinking.effort
-    try:
-        kwargs = {}
-        if cancel_check is not None:
-            kwargs["cancel_check"] = cancel_check
-        response_items = await async_chat_completion(
-            transcript_items,
-            tools=[],
-            codex_turn_state=codex_turn_state,
-            reasoning_effort=reasoning_effort,
-            thinking=thinking,
-            **kwargs,
-        )
-    except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
-        return f"Transcript render error: {e}"
-    except model_requests.ApiError as e:
-        return e.formatted()
+    kwargs = {}
+    if cancel_check is not None:
+        kwargs['cancel_check'] = cancel_check
+    # WebFetch's processing request is part of that tool operation. Returning
+    # an exception's prose here would turn the failed request into page content;
+    # let the existing outer tool exception boundary carry its failed status.
+    response_items = await async_chat_completion(
+        transcript_items, tools=[], codex_turn_state=codex_turn_state,
+        reasoning_effort=reasoning_effort, thinking=thinking, **kwargs)
     turn = formats.coerce_decoded_turn(response_items)
     if not turn:
         return ""
@@ -2257,18 +2218,6 @@ def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
     ]
 
 
-def run_agent(description: str, prompt: str, run_in_background: bool = False,
-              subagent_type: str = "Explore",
-              reasoning_effort=_UNSET) -> str:
-    return asyncio.run(run_agent_async(
-        description,
-        prompt,
-        run_in_background,
-        subagent_type,
-        reasoning_effort=reasoning_effort,
-    ))
-
-
 async def run_agent_async(description: str, prompt: str, run_in_background: bool = False,
                           subagent_type: str = "Explore",
                           cancel_event: asyncio.Event | None = None,
@@ -2276,13 +2225,10 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
                           thinking: model_requests.TurnThinkingSettings | None = None) -> str:
     agent_type = subagent_type or "Explore"
     if not prompt:
-        return "Error: prompt is required"
-    if agent_type != "Explore":
-        return f"Error: unknown subagent_type {agent_type!r} (only 'Explore' is supported)"
-    try:
-        argv = _subagent_argv(agent_type, prompt)
-    except ValueError as error:
-        return f"Error: {error}"
+        raise ValueError('prompt is required')
+    if agent_type != 'Explore':
+        raise ValueError(f"unknown subagent_type {agent_type!r} (only 'Explore' is supported)")
+    argv = _subagent_argv(agent_type, prompt)
     if thinking is None:
         thinking = capture_turn_settings()
     manager = current_job_manager()
@@ -2298,38 +2244,27 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
             environment["LOKI_API_BASE"], environment["LOKI_PROVIDER"])
         destinations = [chat_url]
     if run_in_background:
-        try:
-            job = await manager.run_background_exec(
-                argv,
-                description=description or "subagent task",
-                env=environment,
-                cwd=os.getcwd(),
-                session_owned=True,
-                credential_refs=references, credential_authority=authority,
-                credential_destinations=destinations,
-                subagent=True)
-        except jobs.SubagentCapacityError as error:
-            return f"Error: {error}"
-        return _format_started_background_job(job, "subagent")
-
-    try:
-        job, status, stdout, stderr = await manager.run_exec(
+        job = await manager.run_background_exec(
             argv,
-            description=description or "subagent task",
-            env=environment, cwd=os.getcwd(),
-            cancel_event=cancel_event,
-            session_owned=True,
+            description=description or 'subagent task',
+            env=environment, cwd=os.getcwd(), session_owned=True,
             credential_refs=references, credential_authority=authority,
-            credential_destinations=destinations,
-            subagent=True)
-    except jobs.SubagentCapacityError as error:
-        return f"Error: {error}"
-    if status == "cancelled":
-        return "Error: subagent was cancelled by the user"
+            credential_destinations=destinations, subagent=True)
+        return _format_started_background_job(job, 'subagent')
+
+    job, status, stdout, stderr = await manager.run_exec(
+        argv,
+        description=description or 'subagent task',
+        env=environment, cwd=os.getcwd(), cancel_event=cancel_event,
+        session_owned=True,
+        credential_refs=references, credential_authority=authority,
+        credential_destinations=destinations, subagent=True)
+    if status == 'cancelled':
+        raise RuntimeError('subagent was cancelled by the user')
     result = _format_subagent_result(agent_type, description, "completed",
                                      job.exit_code, stdout, stderr)
     if job.exit_code != 0:
-        return f"Error: subagent exited with code {job.exit_code}\n{result}"
+        raise RuntimeError(f'subagent exited with code {job.exit_code}\n{result}')
     return result
 
 
@@ -2374,12 +2309,11 @@ TOOL_HANDLERS = {
             ("file_path",): tool_runtime.FILESYSTEM_PATH,
         },
     },
-    "Bash": {"handler": _handle_bash, "async_handler": _handle_bash_async},
+    "Bash": {"async_handler": _handle_bash_async},
     "Jobs": {"handler": _handle_jobs, "explore": True},
     "JobStatus": {"handler": _handle_job_status, "explore": True},
     "JobStop": {"handler": _handle_job_stop},
     "Glob": {
-        "handler": _handle_glob,
         "async_handler": _handle_glob_async,
         "explore": True,
         "semantics": {
@@ -2387,7 +2321,6 @@ TOOL_HANDLERS = {
         },
     },
     "Grep": {
-        "handler": _handle_grep,
         "async_handler": _handle_grep_async,
         "explore": True,
         "semantics": {
@@ -2397,7 +2330,6 @@ TOOL_HANDLERS = {
     "TodoRead": {"handler": _handle_todoread, "explore": True},
     "TodoWrite": {"handler": _handle_todowrite, "plan": True},
     "Agent": {
-        "handler": _handle_agent,
         "async_handler": _handle_agent_async,
         "explore": True,
     },

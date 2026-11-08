@@ -147,7 +147,6 @@ class JobOwnershipContractTests(unittest.IsolatedAsyncioTestCase):
     Product cleanup assertions run before managed_jobs retires fixture resources;
     ordinary-child backstops remain explicit because manager closure is not kill.
     """
-
     async def failed_launch_wait(self, boundary):
         from loki_agent import windows_api, windows_runtime, windows_subprocesses
 

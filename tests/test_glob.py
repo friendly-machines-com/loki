@@ -7,8 +7,9 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from job_fixtures import job_manager
 
+from job_fixtures import job_manager
+from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 from loki_agent import loki
 from loki_agent.sessions import Session
 from loki_agent import files as file_operations
@@ -24,153 +25,154 @@ class GlobTests(unittest.TestCase):
             self.assertIs(prop['default'], False)
             self.assertNotIn(name, definition['parameters']['required'])
 
-        for asynchronous in [False, True]:
-            for options in [{}, {'hidden': False, 'no_ignore': False},
-                            {'hidden': False, 'no_ignore': True},
-                            {'hidden': True, 'no_ignore': False},
-                            {'hidden': True, 'no_ignore': True}]:
-                with self.subTest(asynchronous=asynchronous, options=options), \
-                        tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as job_scope:
-                    workspace = Path(directory) / 'workspace'
-                    workspace.mkdir()
-                    contents = {
-                        '.ignore': '/ignored/\n/.loki/\n',
-                        'visible/artifact.txt': 'visible artifact',
-                        '.hidden/artifact.txt': 'hidden artifact',
-                        'ignored/artifact.txt': 'ignored artifact',
-                        '.loki/chats/artifact.txt': 'hidden ignored artifact',
-                        '.loki/chats/chat.json': '{"artifact":"chat"}',
-                    }
-                    for index, (name, text) in enumerate(contents.items()):
-                        path = workspace / name
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_text(text, encoding='utf-8')
-                        # Independent, distinct times make ordering observable.
-                        stamp = 1_000_000_000 + index
-                        os.utime(path, (stamp, stamp))
-                    manager = job_manager(str(Path(directory) / 'jobs'), cleanup=job_scope.callback)
-                    session = Session(shell_cwd=str(workspace),
-                                      job_manager=manager)
-                    hidden = options.get('hidden', False)
-                    no_ignore = options.get('no_ignore', False)
-                    expected = ['visible/artifact.txt']
+        for options in [{}, {'hidden': False, 'no_ignore': False},
+                        {'hidden': False, 'no_ignore': True},
+                        {'hidden': True, 'no_ignore': False},
+                        {'hidden': True, 'no_ignore': True}]:
+            with self.subTest(options=options), \
+                    tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as job_scope:
+                workspace = Path(directory) / 'workspace'
+                workspace.mkdir()
+                contents = {
+                    '.ignore': '/ignored/\n/.loki/\n',
+                    'visible/artifact.txt': 'visible artifact',
+                    '.hidden/artifact.txt': 'hidden artifact',
+                    'ignored/artifact.txt': 'ignored artifact',
+                    '.loki/chats/artifact.txt': 'hidden ignored artifact',
+                    '.loki/chats/chat.json': '{"artifact":"chat"}',
+                }
+                for index, (name, text) in enumerate(contents.items()):
+                    path = workspace / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(text, encoding='utf-8')
+                    # Independent, distinct times make ordering observable.
+                    stamp = 1_000_000_000 + index
+                    os.utime(path, (stamp, stamp))
+                manager = job_manager(str(Path(directory) / 'jobs'), cleanup=job_scope.callback)
+                session = Session(shell_cwd=str(workspace),
+                                  job_manager=manager)
+                self.addCleanup(session.response_headers.close)
+                hidden = options.get('hidden', False)
+                no_ignore = options.get('no_ignore', False)
+                expected = ['visible/artifact.txt']
+                if hidden:
+                    expected += ['.hidden/artifact.txt']
+                if no_ignore:
+                    expected += ['ignored/artifact.txt']
                     if hidden:
-                        expected += ['.hidden/artifact.txt']
+                        expected += ['.loki/chats/artifact.txt']
+                order = list(contents)
+                expected.sort(key=order.index, reverse=True)
+
+                run_exec = manager.run_exec
+
+                async def external_search(argv, **kwargs):
+                    # Assert Loki's search request, then supply fixture paths
+                    # through a real child. Do not test ripgrep's own traversal.
+                    pattern, search_root = argv[-2:]
+                    flags = ['--hidden'] if hidden else []
                     if no_ignore:
-                        expected += ['ignored/artifact.txt']
-                        if hidden:
-                            expected += ['.loki/chats/artifact.txt']
-                    order = list(contents)
-                    expected.sort(key=order.index, reverse=True)
+                        flags.append('--no-ignore')
+                    self.assertEqual(argv, [
+                        'test-search-program', '--files', '--color=never',
+                        *flags, '--glob', pattern, search_root])
+                    if pattern == '*.txt':
+                        matches = [str(workspace / name) for name in reversed(expected)]
+                    elif pattern == '.loki/**/*':
+                        matches = ([str(workspace / '.loki/chats/artifact.txt'),
+                                    str(workspace / '.loki/chats/chat.json')]
+                                   if hidden and no_ignore else [])
+                    elif pattern == '*.json':
+                        matches = [str(Path(search_root) / 'chat.json')]
+                    else:
+                        self.assertEqual(pattern, 'chat-*.json')
+                        matches = []
+                    return await run_exec([
+                        sys.executable, '-c',
+                        'import sys; sys.stdout.write(sys.argv[1]); '
+                        'sys.exit(0 if sys.argv[1] else 1)',
+                        '\n'.join(matches)], **kwargs)
 
-                    run_exec = manager.run_exec
+                def search(pattern, path=workspace):
+                    arguments = {'pattern': pattern, 'path': str(path),
+                                 **options}
+                    result = asyncio.run(loki.dispatch_tool_async(
+                        'Glob', arguments, extra_context={'cancel_event': asyncio.Event()}))
+                    self.assertTrue(result['ok'], result)
+                    return result['content']
 
-                    async def external_search(argv, **kwargs):
-                        # Assert Loki's search request, then supply fixture paths
-                        # through a real child. Do not test ripgrep's own traversal.
-                        pattern, search_root = argv[-2:]
-                        flags = ['--hidden'] if hidden else []
-                        if no_ignore:
-                            flags.append('--no-ignore')
-                        self.assertEqual(argv, [
-                            'test-search-program', '--files', '--color=never',
-                            *flags, '--glob', pattern, search_root])
-                        if pattern == '*.txt':
-                            matches = [str(workspace / name) for name in reversed(expected)]
-                        elif pattern == '.loki/**/*':
-                            matches = ([str(workspace / '.loki/chats/artifact.txt'),
-                                        str(workspace / '.loki/chats/chat.json')]
-                                       if hidden and no_ignore else [])
-                        elif pattern == '*.json':
-                            matches = [str(Path(search_root) / 'chat.json')]
-                        else:
-                            self.assertEqual(pattern, 'chat-*.json')
-                            matches = []
-                        return await run_exec([
-                            sys.executable, '-c',
-                            'import sys; sys.stdout.write(sys.argv[1]); '
-                            'sys.exit(0 if sys.argv[1] else 1)',
-                            '\n'.join(matches)], **kwargs)
+                with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
+                        mock.patch.object(file_operations.executables, 'RIPGREP', 'test-search-program'), \
+                        mock.patch.object(manager, 'run_exec', external_search):
+                    # Fixture responses exercise option forwarding, ordering
+                    # and Read without depending on an installed search tool.
+                    result = search('*.txt')
+                    lines = result.splitlines()
+                    self.assertEqual(lines[1:4], [
+                        f'num_files: {len(expected)}',
+                        'truncated: false', '[filenames]'])
+                    self.assertEqual(lines[4:],
+                                     [str(workspace / name)
+                                      for name in expected])
+                    for name in expected:
+                        observed = loki.run_read(str(workspace / name))
+                        for line in contents[name].splitlines():
+                            self.assertIn(line, observed)
 
-                    def search(pattern, path=workspace):
-                        arguments = {'pattern': pattern, 'path': str(path),
-                                     **options}
-                        if asynchronous:
-                            return asyncio.run(loki._handle_glob_async(
-                                arguments, {'cancel_event': asyncio.Event()}))
-                        return loki._handle_glob(arguments)
+                    # Exercise empty results and explicit-root requests too.
+                    chat = workspace / '.loki' / 'chats' / 'chat.json'
+                    slash = search('.loki/**/*')
+                    if hidden and no_ignore:
+                        self.assertEqual(slash.splitlines()[4:],
+                                         [str(chat),
+                                          str(chat.parent / 'artifact.txt')])
+                    else:
+                        self.assertTrue(slash.startswith('No files matched'))
+                    explicit = search('*.json', chat.parent)
+                    self.assertEqual(explicit.splitlines()[4:], [str(chat)])
+                    empty = search('chat-*.json', chat.parent)
+                    self.assertTrue(empty.startswith('No files matched'))
+                    self.assertEqual('hidden=true' in empty, not hidden)
+                    self.assertEqual('no_ignore=true' in empty, not no_ignore)
 
-                    with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
-                            mock.patch.object(file_operations.executables, 'RIPGREP', 'test-search-program'), \
-                            mock.patch.object(manager, 'run_exec', external_search):
-                        # Fixture responses exercise option forwarding, ordering
-                        # and Read without depending on an installed search tool.
-                        result = search('*.txt')
-                        lines = result.splitlines()
-                        self.assertEqual(lines[1:4], [
-                            f'num_files: {len(expected)}',
-                            'truncated: false', '[filenames]'])
-                        self.assertEqual(lines[4:],
-                                         [str(workspace / name)
-                                          for name in expected])
-                        for name in expected:
-                            observed = loki.run_read(str(workspace / name))
-                            for line in contents[name].splitlines():
-                                self.assertIn(line, observed)
-
-                        # Exercise empty results and explicit-root requests too.
-                        chat = workspace / '.loki' / 'chats' / 'chat.json'
-                        slash = search('.loki/**/*')
-                        if hidden and no_ignore:
-                            self.assertEqual(slash.splitlines()[4:],
-                                             [str(chat),
-                                              str(chat.parent / 'artifact.txt')])
-                        else:
-                            self.assertTrue(slash.startswith('No files matched'))
-                        explicit = search('*.json', chat.parent)
-                        self.assertEqual(explicit.splitlines()[4:], [str(chat)])
-                        empty = search('chat-*.json', chat.parent)
-                        self.assertTrue(empty.startswith('No files matched'))
-                        self.assertEqual('hidden=true' in empty, not hidden)
-                        self.assertEqual('no_ignore=true' in empty, not no_ignore)
-
-                    self.assertEqual(len(manager.jobs), 4)
-                    for job in manager.jobs.values():
-                        self.assertIsNotNone(job.process)
-                        self.assertIn(job.process.returncode, (0, 1))
-                        self.assertEqual(job.exit_code, job.process.returncode)
-                        self.assertEqual(job.status, 'exited')
-                        metadata = json.loads(
-                            Path(job.metadata_path).read_text(encoding='utf-8'))
-                        self.assertEqual(metadata['exit_code'], job.exit_code)
-                        self.assertEqual(metadata['cwd'], str(workspace))
-                        self.assertEqual(metadata['status'], 'exited')
-                        if os.name == 'posix':
-                            self.assertTrue(job.process._transport.is_closing())
+                self.assertEqual(len(manager.jobs), 4)
+                for job in manager.jobs.values():
+                    self.assertIsNotNone(job.process)
+                    self.assertIn(job.process.returncode, (0, 1))
+                    self.assertEqual(job.exit_code, job.process.returncode)
+                    self.assertEqual(job.status, 'exited')
+                    metadata = json.loads(
+                        Path(job.metadata_path).read_text(encoding='utf-8'))
+                    self.assertEqual(metadata['exit_code'], job.exit_code)
+                    self.assertEqual(metadata['cwd'], str(workspace))
+                    self.assertEqual(metadata['status'], 'exited')
+                    if os.name == 'posix':
+                        self.assertTrue(job.process._transport.is_closing())
 
     def test_missing_search_targets_are_checked_by_the_external_program(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as job_scope:
             target = str(Path(directory) / 'missing')
             manager = job_manager(str(Path(directory) / 'jobs'), cleanup=job_scope.callback)
             session = Session(shell_cwd=directory, job_manager=manager)
-            for name, handler in {'Glob': loki._handle_glob_async,
-                                  'Grep': loki._handle_grep_async}.items():
+            self.addCleanup(session.response_headers.close)
+            for name in ['Glob', 'Grep']:
                 with self.subTest(tool=name):
                     execute = mock.AsyncMock(return_value=[
                         mock.Mock(exit_code=2), 'completed', '', 'target unavailable'])
                     with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
                             mock.patch.object(file_operations.executables, 'RIPGREP', 'test-search-program'), \
                             mock.patch.object(manager, 'run_exec', execute):
-                        result = asyncio.run(handler({'pattern': 'needle', 'path': target}))
+                        result = asyncio.run(loki.dispatch_tool_async(name, {'pattern': 'needle', 'path': target}))
                     execute.assert_awaited_once()
                     self.assertEqual(execute.await_args.args[0][-1], target)
-                    self.assertEqual(result,
-                                     'Error: ripgrep failed with exit code 2\ntarget unavailable')
+                    self.assertFalse(result['ok'], result)
+                    self.assertIn('ripgrep failed with exit code 2\ntarget unavailable', result['content'])
 
     def test_cancel_reaches_a_running_search_and_reaps_its_child(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as job_scope:
             manager = job_manager(str(Path(directory) / 'jobs'), cleanup=job_scope.callback)
             session = Session(shell_cwd=directory, job_manager=manager)
+            self.addCleanup(session.response_headers.close)
 
             async def scenario():
                 cancel = asyncio.Event()
@@ -182,14 +184,14 @@ class GlobTests(unittest.TestCase):
                     # stay real. This makes active cancellation deterministic.
                     return await run_exec([
                         sys.executable, '-u', '-c',
-                        "import time; print('search-ready'); time.sleep(30)"],
+                        "import time\nprint('search-ready')\nwhile True: time.sleep(1)"],
                         **kwargs)
 
                 with mock.patch.object(manager, 'run_exec', gated_search), \
                         mock.patch.object(file_operations.executables, 'RIPGREP', 'test-search-program'):
-                    search = asyncio.create_task(loki._handle_glob_async(
-                        {'pattern': '*.txt', 'path': directory},
-                        {'cancel_event': cancel}))
+                    search = asyncio.create_task(loki.dispatch_tool_async(
+                        'Glob', {'pattern': '*.txt', 'path': directory},
+                        extra_context={'cancel_event': cancel}))
                     try:
                         async def ready():
                             while True:
@@ -199,15 +201,16 @@ class GlobTests(unittest.TestCase):
                                             and 'search-ready' in Path(
                                                 job.stdout_path).read_text()):
                                         return job
+                                self.assertFalse(search.done(), 'search ended before readiness')
                                 await asyncio.sleep(0.01)
 
-                        job = await asyncio.wait_for(ready(), 5)
+                        job = await ready()
                         self.assertIsNone(job.process.returncode)
                         self.assertFalse(search.done())
                         cancel.set()
-                        result = await asyncio.wait_for(search, 6)
-                        self.assertEqual(
-                            result, 'Error: glob search was cancelled by the user')
+                        result = await search
+                        self.assertFalse(result['ok'], result)
+                        self.assertIn('glob search was cancelled by the user', result['content'])
                         self.assertIsNotNone(job.process.returncode)
                         self.assertEqual(job.status, 'cancelled')
                         metadata = json.loads(Path(job.metadata_path).read_text())
@@ -222,7 +225,7 @@ class GlobTests(unittest.TestCase):
                             if job.process is not None:
                                 if job.process.returncode is None:
                                     job.process.kill()
-                                await asyncio.wait_for(job.process.wait(), 3)
+                                await job.process.wait()
 
             with mock.patch.object(loki, '_DEFAULT_SESSION', session):
                 asyncio.run(scenario())

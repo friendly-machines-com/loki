@@ -8,6 +8,7 @@ silence -- and everything the terminal silently skips must be skipped here
 too.
 """
 
+import types
 import unittest
 
 from loki_agent import formats, replays
@@ -118,6 +119,24 @@ class ReplayFidelityTests(unittest.TestCase):
         self.assertEqual(classified[0][0], "tool")
         self.assertIn("Tool error", classified[0][1])
         self.assertIn("boom", classified[0][1])
+
+    def replay_tool_status(self, *, is_error, text):
+        from loki_agent.acp_worker import Worker
+
+        updates = []
+        session = types.SimpleNamespace(reasoning_traces='off', transcript_items=[{
+            'type': 'tool_result', 'call_id': 'result-status', 'name': 'Read',
+            'is_error': is_error, 'content': [{'type': 'text', 'text': text}],
+        }])
+        worker = types.SimpleNamespace(session=session, session_id='replay', write=updates.append)
+        Worker._replay_transcript(worker)
+        return updates[0]['params']['update']['status']
+
+    def test_acp_replay_preserves_canonical_failure_status(self):
+        self.assertEqual(self.replay_tool_status(is_error=True, text='operation refused'), 'failed')
+
+    def test_acp_replay_does_not_guess_from_successful_content(self):
+        self.assertEqual(self.replay_tool_status(is_error=False, text='Error: quoted file text'), 'completed')
 
     def test_provider_tool_call_variant_renders_name(self):
         # Provider-executed tools (execution != "client") still classify as

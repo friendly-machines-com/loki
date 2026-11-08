@@ -471,10 +471,10 @@ async def run_glob_async(
         cancel_event: asyncio.Event | None = None, *,
         hidden: bool = False, no_ignore: bool = False, cwd, run_exec) -> str:
     if not pattern:
-        return "Error: pattern is required"
+        raise ValueError('pattern is required')
     rg = executables.RIPGREP
     if not rg:
-        return "Error: ripgrep binary not found. Install rg."
+        raise FileNotFoundError('ripgrep binary not found. Install rg.')
     root = resolve_path(path, cwd) if path else cwd
     args = [rg, '--files', '--color=never']
     if hidden:
@@ -487,11 +487,11 @@ async def run_glob_async(
         args, description=f"Glob {pattern!r}",
         cancel_event=cancel_event)
     if status == "cancelled":
-        return "Error: glob search was cancelled by the user"
+        raise RuntimeError('glob search was cancelled by the user')
     duration_ms = int((time.perf_counter() - start) * 1000)
     stderr = stderr.strip()
     if job.exit_code not in [0, 1]:
-        return f"Error: ripgrep failed with exit code {job.exit_code}" + (f"\n{stderr}" if stderr else "")
+        raise RuntimeError(f'ripgrep failed with exit code {job.exit_code}' + (f'\n{stderr}' if stderr else ''))
     matches = stdout.splitlines()
     num_files = len(matches)
     truncated = len(matches) > GLOB_MAX_RESULTS
@@ -548,20 +548,20 @@ async def run_grep_async(pattern: str, path: str | None = None, glob: str | None
                          cancel_event: asyncio.Event | None = None,
                          *, cwd, run_exec, **kwargs) -> str:
     if not pattern:
-        return "Error: pattern is required"
+        raise ValueError('pattern is required')
     if output_mode not in ['content', 'files_with_matches', 'count']:
-        return f"Error: invalid output_mode {output_mode!r}"
+        raise ValueError(f'invalid output_mode {output_mode!r}')
     rg = executables.RIPGREP
     if not rg:
-        return "Error: ripgrep binary not found. Install rg."
+        raise FileNotFoundError('ripgrep binary not found. Install rg.')
     root = resolve_path(path, cwd) if path else cwd
 
     head_limit, err = _parse_nonnegative_int(kwargs.get('head_limit'), 'head_limit', GREP_DEFAULT_HEAD_LIMIT)
     if err:
-        return err
+        raise ValueError(err)
     offset_n, err = _parse_nonnegative_int(kwargs.get('offset'), 'offset', 0)
     if err:
-        return err
+        raise ValueError(err)
 
     args = [rg, '--color=never']
     if output_mode == 'files_with_matches':
@@ -582,15 +582,15 @@ async def run_grep_async(pattern: str, path: str | None = None, glob: str | None
         if context_value is not None:
             context_value, err = _parse_nonnegative_int(context_value, '-C/context')
             if err:
-                return err
+                raise ValueError(err)
             args.extend(['-C', str(context_value)])
         else:
             before, err = _parse_nonnegative_int(kwargs.get('-B'), '-B')
             if err:
-                return err
+                raise ValueError(err)
             after, err = _parse_nonnegative_int(kwargs.get('-A'), '-A')
             if err:
-                return err
+                raise ValueError(err)
             if before is not None:
                 args.extend(['-B', str(before)])
             if after is not None:
@@ -611,11 +611,11 @@ async def run_grep_async(pattern: str, path: str | None = None, glob: str | None
         args, description=f"Grep {pattern!r}",
         cancel_event=cancel_event)
     if status == "cancelled":
-        return "Error: grep search was cancelled by the user"
+        raise RuntimeError('grep search was cancelled by the user')
     duration_ms = int((time.perf_counter() - start) * 1000)
     stderr = stderr.strip()
     if job.exit_code not in [0, 1]:
-        return f"Error: ripgrep failed with exit code {job.exit_code}" + (f"\n{stderr}" if stderr else "")
+        raise RuntimeError(f'ripgrep failed with exit code {job.exit_code}' + (f'\n{stderr}' if stderr else ''))
 
     lines = stdout.splitlines()
     selected, truncated = _select_limited(lines, offset_n, head_limit)

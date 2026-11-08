@@ -147,10 +147,8 @@ def parse_args(args) -> SubagentOptions:
 
 async def run_prompt_async(subagent_type: str, prompt: str,
                            thinking: model_requests.TurnThinkingSettings | None = None) -> str:
-    if subagent_type != "Explore":
-        return (
-            f"Error: unknown subagent_type {subagent_type!r} "
-            "(only 'Explore' is supported)")
+    if subagent_type != 'Explore':
+        raise ValueError(f"unknown subagent_type {subagent_type!r} (only 'Explore' is supported)")
     if not prompt:
         return ""
     may_delegate = (
@@ -176,22 +174,43 @@ async def run_prompt_async(subagent_type: str, prompt: str,
         thinking = _core.capture_turn_settings()
     # This answer-only helper has no thought renderer. Keep computation while
     # excluding the parent's presentation setting from acquisition and output.
-    thinking = _core.replace(thinking, traces="off")
+    thinking = _core.replace(thinking, traces='off')
+
+    def request_event(event):
+        # The shared loop emits recoverable errors for interactive frontends.
+        # An answer-only process has no such UI: dropping these existing events
+        # would make a failed request indistinguishable from a valid empty answer.
+        if event.get('type') in ['api_error', 'stream_error', 'transcript_error',
+                                 'provider_error', 'network_error']:
+            error = event['error']
+            if isinstance(error, Exception):
+                raise error
+            raise OSError(str(error))
+
     return await _core.run_tool_loop_async(
-        messages, allowed=allowed, thinking=thinking)
+        messages, allowed=allowed, thinking=thinking, on_event=request_event)
 
 
 async def run_cli_async(
         subagent_type: str, prompt: str | None = None,
-        thinking: model_requests.TurnThinkingSettings | None = None) -> None:
+        thinking: model_requests.TurnThinkingSettings | None = None) -> int:
+    """Report request failure through the existing CLI status, never answer text."""
     prompt = prompt if prompt is not None else sys.stdin.read().strip()
-    result = await run_prompt_async(subagent_type, prompt, thinking=thinking)
+    try:
+        result = await run_prompt_async(subagent_type, prompt, thinking=thinking)
+    # Provider protocol errors also derive from ValueError; they are failed
+    # requests, not invalid CLI configuration, so classify them first.
+    except (OSError, protocols.ProtocolError, formats.TranscriptFormatError,
+            model_requests.ApiError) as error:
+        diagnostic = error.formatted() if isinstance(error, model_requests.ApiError) else error
+        _print_text_line('Request failed: ', diagnostic, file=sys.stderr)
+        return 1
+    except ValueError as error:
+        _print_text_line('Configuration error: ', error, file=sys.stderr)
+        return 2
     if result:
-        print(
-            texts.escape_terminal_text(result, multiline=True),
-            end="",
-        )
-        print()
+        print(texts.escape_terminal_text(result, multiline=True))
+    return 0
 
 
 def _close_descriptors(options: SubagentOptions) -> None:
@@ -289,8 +308,8 @@ async def async_main(args) -> int:
 
         operation = run_cli_async(
             options.subagent_type, options.prompt, thinking=thinking)
-        completed, _result = await runtime.run(operation)
-        return 0 if completed else 1
+        completed, result = await runtime.run(operation)
+        return result if completed else 1
     finally:
         session.subagent_depth = previous_depth
         session.delegated_root_conversation_id = previous_root

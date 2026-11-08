@@ -1105,6 +1105,12 @@ def invalid_input_message(tool_name, issues):
 
 
 def tool_result(ok: bool, content, *, process_output=None) -> dict:
+    """Carry a known tool outcome independently of its arbitrary payload text.
+
+    Handlers use this existing envelope for returned outcomes; raised failures
+    are converted by the runtime's exception boundary. ProcessOutput preserves
+    captured channels for presentation, never a second source of status.
+    """
     result = {"ok": ok, "content": str(content)}
     if process_output is not None:
         result["process_output"] = process_outputs.ProcessOutput.from_dict(process_output).to_dict()
