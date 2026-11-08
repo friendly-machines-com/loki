@@ -142,7 +142,7 @@ def probe(native, limits_type, sid, workspace, output, actor_script):
     sys.path.insert(0, str(Path(actor_script).resolve().parent))
     from loki_agent import host_ipc, windows_api as api
     handles = []
-    information = None
+    information = api.ProcessInformation()
     console = job = None
     captured = bytearray()
     try:
@@ -158,7 +158,7 @@ def probe(native, limits_type, sid, workspace, output, actor_script):
         report_path = workspace / 'private-reader-child.json'
         information = api.create_process_in_app_container(
             sys.executable, ['-I', '-u', str(actor_script), '--private-reader-child', str(report_path)],
-            native.sid(sid), current_directory=str(workspace),
+            native.sid(sid), information=information, current_directory=str(workspace),
             standard_handles=[None, None, None], pseudoconsole=console.value)
         # Null stdio suppresses inherited redirected parent handles; otherwise
         # the child's fd 0 can be a log/NUL handle instead of ConPTY's console.
@@ -211,12 +211,12 @@ def probe(native, limits_type, sid, workspace, output, actor_script):
             # wait for this same controller to drain its own output reader.
             for value in handles:
                 cleanup.callback(api.close_handle, value)
-            if information:
+            if information.hProcess:
                 cleanup.callback(api.close_handle, information.hProcess)
                 cleanup.callback(api.close_handle, information.hThread)
             if job:
                 api.close_handle(job)
-            if information:
+            if information.hProcess:
                 # Setup can fail before job assignment. Explicitly terminate
                 # that suspended child too; closing an empty job cannot kill it.
                 if native.wait(information.hProcess, 0) == 258:

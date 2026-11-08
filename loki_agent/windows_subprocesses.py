@@ -1,15 +1,13 @@
 # pytype: skip-file
 """Windows worker and local tool processes with native creation and async stdio.
 
-The stream and orchestration layer below is copied from CPython 3.14.7 --
-``Lib/asyncio/base_subprocess.py``, ``Lib/asyncio/subprocess.py``,
-``Lib/asyncio/streams.py`` (``FlowControlMixin``) and
-``Lib/asyncio/windows_utils.py`` -- and adapted, so that Loki depends only on
-public asyncio plus its own Win32 bindings instead of private asyncio
-internals.  CPython is distributed under the PSF licence; the copied code
-keeps its structure and comments.  Intentional differences:
+The native pipe-attachment orchestration is adapted from CPython 3.14.7
+``Lib/asyncio/base_subprocess.py`` under its PSF licence. Byte framing and the
+process surface now use Loki's shared documented-protocol bridge; they do not
+construct stdlib subprocess/stream internals. Secured pipe allocation is shared
+with inherited IPC in host_ipc. Intentional native lifetime differences follow.
 
-* ``pipe`` uses random names, explicit endpoint-specific security and
+* ``host_ipc.overlapped_pipe`` uses random names, explicit endpoint-specific security and
   ``PIPE_REJECT_REMOTE_CLIENTS``. Contained creators use the LOCAL namespace;
   their package receives only the access needed to connect this stdio pair.
   Confidential owner/credential channels remain separate one-way allocations.
@@ -21,8 +19,8 @@ keeps its structure and comments.  Intentional differences:
   through stream attachment and the owner's final pre-resume check.
 * Exit is observed by waiting on the process through Loki's own non-blocking
   wait, not by registering the handle with the loop's completion port.
-* ``_process_exited`` wakes ``_wait`` waiters immediately (the 3.13+ behavior),
-  so a descendant holding the worker's stdout cannot hang ``Process.wait()``.
+* Leader exit signals the shared process protocol independently of stream EOF,
+  so a descendant holding stdout cannot hang ``Process.wait()``.
 """
 
 from __future__ import annotations
@@ -30,211 +28,15 @@ from __future__ import annotations
 import asyncio
 import collections
 from contextlib import ExitStack
-import ctypes
 import subprocess
 import sys
-import uuid
 import warnings
-from ctypes import wintypes
 
 from . import windows_api as api
-from . import windows_runtime, host_ipc
+from . import windows_runtime, host_ipc, streams
+from .lifetimes import finish_cleanup
 
 PIPE = subprocess.PIPE
-
-PIPE_ACCESS_DUPLEX = 0x00000003
-PIPE_ACCESS_INBOUND = 0x00000001
-PIPE_WAIT = 0x00000000
-PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
-ERROR_PIPE_BUSY = 231
-ERROR_PIPE_CONNECTED = 535
-ERROR_ACCESS_DENIED = 5
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-BUFSIZE = 8192
-_MAX_NAME_ATTEMPTS = 20
-
-
-def pipe(*, duplex=False, overlapped=(True, True), bufsize=BUFSIZE):
-    """Like ``os.pipe()`` but with overlapped support and using handles.
-
-    Returns ``(h1, h2)``: ``h1`` is the ``CreateNamedPipe`` end and ``h2`` the
-    connecting client.  ``overlapped`` selects which is opened for overlapped
-    I/O; the child's end is deliberately synchronous, as in CPython.
-    """
-    convert = api.bind(
-        "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-        wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
-    free = api.bind("kernel32", "LocalFree", ctypes.c_void_p,
-                    ctypes.c_void_p)
-    create_pipe = api.bind(
-        "kernel32", "CreateNamedPipeW", ctypes.c_void_p, wintypes.LPCWSTR,
-        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
-        wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p)
-    connect = api.bind("kernel32", "ConnectNamedPipe", wintypes.BOOL,
-                       ctypes.c_void_p, ctypes.c_void_p)
-
-    if duplex:
-        openmode = PIPE_ACCESS_DUPLEX
-        access = api.AccessMask.GENERIC_READ | api.AccessMask.GENERIC_WRITE
-        obsize, ibsize = bufsize, bufsize
-    else:
-        openmode = PIPE_ACCESS_INBOUND
-        access = api.AccessMask.GENERIC_WRITE
-        obsize, ibsize = 0, bufsize
-    openmode |= api.FileFlags.FILE_FLAG_FIRST_PIPE_INSTANCE
-    if overlapped[0]:
-        openmode |= api.FileFlags.FILE_FLAG_OVERLAPPED
-    client_flags = (api.FileFlags.FILE_FLAG_OVERLAPPED if overlapped[1] else 0)
-
-    # The pipe name is not a control: the ends are connected here and only the
-    # child's inherited handle reaches the child.  The DACL nevertheless keeps
-    # the default one -- which grants Everyone read -- from applying while the
-    # name is briefly visible in the namespace.
-    policy = host_ipc.pipe_policy(duplex=duplex)
-    descriptor = ctypes.c_void_p()
-    if not convert(policy['descriptor'], 1, ctypes.byref(descriptor), None):
-        raise api.WindowsApiError("cannot build the worker pipe descriptor")
-    server = client = None
-    try:
-        attributes = api.SecurityAttributes(
-            ctypes.sizeof(api.SecurityAttributes), descriptor.value, 0)
-        for attempt in range(_MAX_NAME_ATTEMPTS):
-            # Contained creators need the LOCAL pipe namespace. The ACP front
-            # remains uncontained; its existing child-handle protocol is intact.
-            prefix = r"\\.\pipe\LOCAL" if policy['package'] is not None else r"\\.\pipe"
-            address = prefix + "\\" + "loki-worker-" + uuid.uuid4().hex
-            handle = create_pipe(address, openmode, PIPE_WAIT
-                                 | PIPE_REJECT_REMOTE_CLIENTS, 1, obsize,
-                                 ibsize, 0, ctypes.byref(attributes))
-            if handle and handle != INVALID_HANDLE_VALUE:
-                server = handle
-                break
-            status = ctypes.get_last_error()
-            # Another process holding this name cannot be distinguished from
-            # a name collision here; try another random name either way.
-            if (attempt == _MAX_NAME_ATTEMPTS - 1
-                    or status not in [ERROR_PIPE_BUSY, ERROR_ACCESS_DENIED]):
-                raise api.WindowsApiError("CreateNamedPipeW failed",
-                                          status=status)
-        try:
-            client = api.open_with_access(address, access,
-                                          creation=api.FileCreateDisposition.OPEN_EXISTING,
-                                          flags=client_flags,
-                                          share_mode=0)
-        except api.WindowsApiError:
-            api.close_handle(server)
-            server = None
-            raise
-        # The client connected first, so this reports ERROR_PIPE_CONNECTED.
-        if not connect(server, None):
-            status = ctypes.get_last_error()
-            if status != ERROR_PIPE_CONNECTED:
-                raise api.WindowsApiError("ConnectNamedPipe failed",
-                                          status=status)
-        return server, client
-    except BaseException:
-        for handle in [server, client]:
-            if handle is not None:
-                api.close_handle(handle)
-        raise
-    finally:
-        free(descriptor)
-
-
-class PipeHandle:
-    """Wrapper for an overlapped pipe handle which is vaguely file-like."""
-
-    def __init__(self, handle):
-        self._handle = handle
-
-    def __repr__(self):
-        handle = (f'handle={self._handle!r}' if self._handle is not None
-                  else 'closed')
-        return f'<{self.__class__.__name__} {handle}>'
-
-    @property
-    def handle(self):
-        return self._handle
-
-    def fileno(self):
-        """The raw Windows handle: what the proactor's pipe calls expect."""
-        if self._handle is None:
-            raise ValueError("I/O operation on closed pipe")
-        return self._handle
-
-    def close(self):
-        handle, self._handle = self._handle, None
-        if handle is not None:
-            api.close_handle(handle)
-
-    def __del__(self, _warn=warnings.warn):
-        if self._handle is not None:
-            _warn(f"unclosed {self!r}", ResourceWarning, source=self)
-            self.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, traceback):
-        self.close()
-
-
-# -- copied from Lib/asyncio/streams.py -----------------------------------
-
-
-class FlowControlMixin(asyncio.Protocol):
-    """Reusable flow control logic for ``StreamWriter.drain()``.
-
-    This implements the protocol methods ``pause_writing()``,
-    ``resume_writing()`` and ``connection_lost()``.  If the subclass overrides
-    these it must call the super methods.  ``StreamWriter.drain()`` must wait
-    for ``_drain_helper()``.
-    """
-
-    def __init__(self, loop=None):
-        self._loop = loop
-        self._paused = False
-        self._drain_waiters = collections.deque()
-        self._connection_lost = False
-
-    def pause_writing(self):
-        assert not self._paused
-        self._paused = True
-
-    def resume_writing(self):
-        assert self._paused
-        self._paused = False
-        for waiter in self._drain_waiters:
-            if not waiter.done():
-                waiter.set_result(None)
-
-    def connection_lost(self, exc):
-        self._connection_lost = True
-        # Wake up the writer(s) if currently paused.
-        if not self._paused:
-            return
-        for waiter in self._drain_waiters:
-            if not waiter.done():
-                if exc is None:
-                    waiter.set_result(None)
-                else:
-                    waiter.set_exception(exc)
-
-    async def _drain_helper(self):
-        if self._connection_lost:
-            raise ConnectionResetError('Connection lost')
-        if not self._paused:
-            return
-        waiter = self._loop.create_future()
-        self._drain_waiters.append(waiter)
-        try:
-            await waiter
-        finally:
-            self._drain_waiters.remove(waiter)
-
-    def _get_close_waiter(self, stream):
-        raise NotImplementedError
 
 
 # -- copied from Lib/asyncio/base_subprocess.py ---------------------------
@@ -275,15 +77,13 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
 
     def __init__(self, loop, protocol, args, shell,
                  stdin, stdout, stderr, bufsize,
-                 waiter=None, extra=None, **kwargs):
-        super().__init__(extra)
+                 waiter=None, **kwargs):
+        super().__init__()
         self._closed = False
         self._protocol = protocol
         self._loop = loop
         self._proc = None
         self._pid = None
-        self._returncode = None
-        self._exit_waiters = set()
         self._pending_calls = collections.deque()
         self._pipes = {}
         self._finished = False
@@ -300,7 +100,6 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
             self._start(args=args, shell=shell, stdin=stdin, stdout=stdout,
                         stderr=stderr, bufsize=bufsize, **kwargs)
             self._pid = self._proc.pid
-            self._extra['subprocess'] = self._proc
             self._connect_task = self._loop.create_task(self._connect_pipes(waiter))
         except BaseException:
             with ExitStack() as cleanup:
@@ -328,19 +127,18 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
             return
         self._closed = True
 
-        for proto in self._pipes.values():
-            if proto is None:
-                continue
-            if self._loop is not None and not self._loop.is_closed():
-                proto.pipe.close()
-
-        if (self._proc is not None
-                and self._returncode is None
-                and self._proc.poll() is None):
-            try:
-                self._proc.kill()
-            except (ProcessLookupError, PermissionError):
-                pass
+        try:
+            with ExitStack() as cleanup:
+                if self._loop is not None and not self._loop.is_closed():
+                    for proto in reversed(list(self._pipes.values())):
+                        if proto is not None:
+                            cleanup.callback(proto.pipe.close)
+        finally:
+            if self._proc is not None and self._proc.returncode is None:
+                try:
+                    self._proc.kill()
+                except ProcessLookupError:
+                    pass
 
     def __del__(self, _warn=warnings.warn):
         if not self._closed:
@@ -351,7 +149,10 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
         return self._pid
 
     def get_returncode(self):
-        return self._returncode
+        return self._proc.returncode if self._proc is not None else None
+
+    def get_extra_info(self, name, default=None):
+        return self._proc if name == 'subprocess' else default
 
     def get_pipe_transport(self, fd):
         if fd in self._pipes:
@@ -359,12 +160,12 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
         return None
 
     def _check_proc(self):
-        if self._proc is None:
+        if self._proc is None or self._protocol is None:
             raise ProcessLookupError()
 
     def send_signal(self, sig):
-        self._check_proc()
-        self._proc.send_signal(sig)
+        # Windows has no signals here: preserve the existing job-stop behavior.
+        self.terminate()
 
     def terminate(self):
         self._check_proc()
@@ -402,16 +203,19 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
         except (SystemExit, KeyboardInterrupt):
             raise
         except BaseException as exc:
-            # Close any pipes that were already connected before the
-            # error/cancellation, so a failed attachment leaks nothing.
-            for proto in self._pipes.values():
-                if proto is not None:
-                    proto.pipe.close()
-            for raw_pipe in [proc.stdin, proc.stdout, proc.stderr]:
-                if raw_pipe is not None:
-                    raw_pipe.close()
-            if waiter is not None and not waiter.cancelled():
-                waiter.set_exception(exc)
+            # Attempt every independent pipe release, and notify the factory
+            # even if a checked native close itself reports failure.
+            try:
+                with ExitStack() as cleanup:
+                    for raw_pipe in [proc.stderr, proc.stdout, proc.stdin]:
+                        if raw_pipe is not None:
+                            cleanup.callback(raw_pipe.close)
+                    for proto in reversed(list(self._pipes.values())):
+                        if proto is not None:
+                            cleanup.callback(proto.pipe.close)
+            finally:
+                if waiter is not None and not waiter.cancelled():
+                    waiter.set_exception(exc)
         else:
             if waiter is not None and not waiter.cancelled():
                 waiter.set_result(None)
@@ -431,34 +235,13 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
 
     def _process_exited(self, returncode):
         assert returncode is not None, returncode
-        assert self._returncode is None, self._returncode
-        self._returncode = returncode
-        if self._proc.returncode is None:
-            self._proc.returncode = returncode
+        assert self._proc.returncode == returncode, self._proc.returncode
         self._call(self._protocol.process_exited)
-        # Wake up futures waiting for wait() as soon as the process exits: a
-        # descendant holding the worker's stdout must not hide root death.
-        for waiter in self._exit_waiters:
-            if not waiter.done():
-                waiter.set_result(returncode)
-        self._exit_waiters = None
         self._try_finish()
-
-    async def _wait(self):
-        """Wait until the process exit and return the process return code."""
-        if self._returncode is not None:
-            return self._returncode
-        waiter = self._loop.create_future()
-        self._exit_waiters.add(waiter)
-        try:
-            return await waiter
-        finally:
-            if self._exit_waiters is not None:
-                self._exit_waiters.discard(waiter)
 
     def _try_finish(self):
         assert not self._finished
-        if self._returncode is None:
+        if self.get_returncode() is None:
             return
         if all(pipe_transport is not None and pipe_transport.disconnected
                for pipe_transport in self._pipes.values()):
@@ -470,190 +253,73 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
             self._protocol.connection_lost(exc)
         finally:
             self._loop = None
-            self._proc = None
+            # Retain the native owner's cached result, not another result copy.
+            # A retired protocol forbids new signalling through this transport.
             self._protocol = None
 
 
-# -- copied from Lib/asyncio/subprocess.py --------------------------------
-
-
-class SubprocessStreamProtocol(FlowControlMixin, asyncio.SubprocessProtocol):
-    """Like ``StreamReaderProtocol``, but for a subprocess."""
-
-    def __init__(self, limit, loop):
-        super().__init__(loop=loop)
-        self._limit = limit
-        self.stdin = self.stdout = self.stderr = None
-        self._transport = None
-        self._process_exited = False
-        self._pipe_fds = []
-        self._stdin_closed = self._loop.create_future()
-
-    def connection_made(self, transport):
-        self._transport = transport
-
-        stdout_transport = transport.get_pipe_transport(1)
-        if stdout_transport is not None:
-            self.stdout = asyncio.StreamReader(limit=self._limit)
-            self.stdout.set_transport(stdout_transport)
-            self._pipe_fds.append(1)
-
-        stderr_transport = transport.get_pipe_transport(2)
-        if stderr_transport is not None:
-            self.stderr = asyncio.StreamReader(limit=self._limit)
-            self.stderr.set_transport(stderr_transport)
-            self._pipe_fds.append(2)
-
-        stdin_transport = transport.get_pipe_transport(0)
-        if stdin_transport is not None:
-            self.stdin = asyncio.StreamWriter(stdin_transport,
-                                              protocol=self,
-                                              reader=None,
-                                              loop=self._loop)
-
-    def pipe_data_received(self, fd, data):
-        reader = self.stdout if fd == 1 else self.stderr if fd == 2 else None
-        if reader is not None:
-            reader.feed_data(data)
-
-    def pipe_connection_lost(self, fd, exc):
-        if fd == 0:
-            if self.stdin is not None:
-                self.stdin.close()
-            self.connection_lost(exc)
-            if not self._stdin_closed.done():
-                if exc is None:
-                    self._stdin_closed.set_result(None)
-                else:
-                    self._stdin_closed.set_exception(exc)
-                    # Calling wait_closed() is not mandatory, so do not log
-                    # the traceback when it is not awaited.
-                    self._stdin_closed._log_traceback = False
-            return
-        reader = self.stdout if fd == 1 else self.stderr if fd == 2 else None
-        if reader is not None:
-            if exc is None:
-                reader.feed_eof()
-            else:
-                reader.set_exception(exc)
-        if fd in self._pipe_fds:
-            self._pipe_fds.remove(fd)
-        self._maybe_close_transport()
-
-    def process_exited(self):
-        self._process_exited = True
-        self._maybe_close_transport()
-
-    def _maybe_close_transport(self):
-        if len(self._pipe_fds) == 0 and self._process_exited:
-            self._transport.close()
-            self._transport = None
-
-    def _get_close_waiter(self, stream):
-        if stream is self.stdin:
-            return self._stdin_closed
-        return None
-
-
-class Process:
+class Process(streams.Process):
     """The subprocess surface used by ACP, file-backed jobs and streamed hooks."""
 
-    def __init__(self, transport, protocol, loop):
-        self._transport = transport
-        self._protocol = protocol
-        self._loop = loop
-        self.stdin = protocol.stdin
-        self.stdout = protocol.stdout
-        self.stderr = protocol.stderr
-        self.pid = transport.get_pid()
+    def __init__(self, transport, protocol):
+        super().__init__(transport, protocol)
+
+    async def wait(self):
+        # The native observer can itself report a failed wait/release. Waiting
+        # only on the protocol event would hide that error or strand this caller.
+        await asyncio.shield(self._transport._exit_task)
+        return await super().wait()
+
+    async def aclose(self):
+        # The shared process waits for protocol closure only. Native retirement
+        # must also observe its existing exit task, including release failures.
+        try:
+            self.close()
+        finally:
+            async def retired():
+                try:
+                    await self.wait()
+                finally:
+                    if self.returncode is not None:
+                        try:
+                            await self._protocol.closed
+                        finally:
+                            native = self._transport._proc
+                            with ExitStack() as errors:
+                                for raw in [native.stderr, native.stdout, native.stdin]:
+                                    if raw is not None:
+                                        errors.callback(raw.raise_close_error)
+            await finish_cleanup(retired())
 
     def __repr__(self):
         return f'<{self.__class__.__name__} {self.pid}>'
-
-    @property
-    def returncode(self):
-        return self._transport.get_returncode()
-
-    async def wait(self):
-        return await self._transport._wait()
-
-    def send_signal(self, sig):
-        self._transport.send_signal(sig)
-
-    def terminate(self):
-        self._transport.terminate()
-
-    def kill(self):
-        self._transport.kill()
 
 
 # -- Loki's contained worker ---------------------------------------------
 
 
-class ContainedWorkerProcess:
-    """The process-shaped object the copied transport drives.
-
-    Owns the native process, its job object and its thread handle.  ``poll``
-    is synchronous because the base transport calls it from ``close()``;
-    ``wait`` is Loki's non-blocking native wait.
-    """
-
-    def __init__(self, contained):
-        self._contained = contained
-        self.pid = contained.pid
-        self.returncode = None
-        self.stdin = None
-        self.stdout = None
-        self.stderr = None
-
-    def poll(self):
-        if self.returncode is None and self._contained.returncode is not None:
-            self.returncode = self._contained.returncode
-        return self.returncode
-
-    async def wait(self):
-        code = await self._contained.wait()
-        self.returncode = code
-        return code
-
-    def send_signal(self, sig):  # Windows has no signals: stop the job.
-        self.terminate()
-
-    def terminate(self):
-        self._contained.terminate()
-
-    kill = terminate
-
-    def release(self):
-        """Release the native handles; idempotent, never under a live wait."""
-        if self._contained is not None:
-            contained, self._contained = self._contained, None
-            contained.close()
-
-
 class ContainedWorkerTransport(BaseSubprocessTransport):
     """One contained worker: Loki's launcher, the copied pipe orchestration."""
 
-    def __init__(self, loop, protocol, *, workspace, environment,
+    def __init__(self, loop, protocol, *, native, workspace, environment,
                  arguments, inherited_handles, current_directory,
                  waiter=None):
         self._exit_task = None
         super().__init__(loop, protocol, args=None, shell=False,
                          stdin=PIPE, stdout=PIPE, stderr=None, bufsize=0,
-                         waiter=waiter, extra=None,
-                         workspace=workspace, environment=environment,
+                         waiter=waiter,
+                         native=native, workspace=workspace, environment=environment,
                          arguments=arguments, inherited_handles=inherited_handles,
                          current_directory=current_directory)
 
     def _start(self, args, shell, stdin, stdout, stderr, bufsize, **kwargs):
-        child_read, front_write = pipe(overlapped=(False, True), duplex=True)
-        try:
-            front_read, child_write = pipe(overlapped=(True, False))
-        except BaseException:
-            api.close_handle(child_read)
-            api.close_handle(front_write)
-            raise
-        try:
+        with ExitStack() as parents, ExitStack() as children:
+            child_read, front_write = host_ipc.overlapped_pipe(overlapped=(False, True), duplex=True)
+            children.callback(api.close_handle, child_read)
+            parents.callback(api.close_handle, front_write)
+            front_read, child_write = host_ipc.overlapped_pipe(overlapped=(True, False))
+            children.callback(api.close_handle, child_write)
+            parents.callback(api.close_handle, front_read)
             api.set_handle_information(
                 child_read, api.HandleFlags.HANDLE_FLAG_INHERIT,
                 api.HandleFlags.HANDLE_FLAG_INHERIT)
@@ -661,25 +327,23 @@ class ContainedWorkerTransport(BaseSubprocessTransport):
                 child_write, api.HandleFlags.HANDLE_FLAG_INHERIT,
                 api.HandleFlags.HANDLE_FLAG_INHERIT)
             with windows_runtime.worker_stdout_null() as null_handle:
-                contained = windows_runtime.launch(
-                    sys.argv[0],
+                contained = kwargs['native']
+                windows_runtime.prepare_contained(
+                    contained, sys.argv[0],
                     [*kwargs['arguments'], "--stdout-null-handle",
                      str(null_handle)],
                     kwargs['environment'], kwargs['workspace'],
                     [*kwargs['inherited_handles'], null_handle],
                     stdio=(child_read, child_write),
                     current_directory=kwargs['current_directory'])
-        except BaseException:
-            for handle in [front_read, front_write, child_read, child_write]:
-                api.close_handle(handle)
-            raise
-        # The front's copies of the child's ends must not outlive the launch,
-        # or the worker's exit would never be visible as EOF here.
-        api.close_handle(child_read)
-        api.close_handle(child_write)
-        self._proc = ContainedWorkerProcess(contained)
-        self._proc.stdin = PipeHandle(front_write)
-        self._proc.stdout = PipeHandle(front_read)
+            # Child copies must retire before parent transport adoption. Their
+            # checked-close failure still leaves both parents owned for rollback;
+            # an ExitStack consumes each callback once even when it raises.
+            children.close()
+            self._proc = contained
+            self._proc.stdin = host_ipc.PipeHandle(front_write)
+            self._proc.stdout = host_ipc.PipeHandle(front_read)
+            parents.pop_all()
         self._exit_task = self._loop.create_task(self._watch_exit())
 
     async def _watch_exit(self):
@@ -687,27 +351,22 @@ class ContainedWorkerTransport(BaseSubprocessTransport):
             returncode = await self._proc.wait()
             self._process_exited(returncode)
         finally:
-            if self._closed:
+            if self._closed and self._proc.returncode is not None:
                 self._release()
 
-    def close(self):
-        super().close()
-        # close() requests termination, but the observer must still publish
-        # the exit. Releasing handles or cancelling it here strands waiters.
-        if self._exit_task is None or self._exit_task.done():
-            self._release()
-
     def _call_connection_lost(self, exc):
-        proc = self._proc
+        # The exit task owns early-close release; final callbacks own normal
+        # retirement. Publish their native failure through the existing closed
+        # future only after all stdio has retired, not as a loop-only diagnostic.
         try:
-            super()._call_connection_lost(exc)
-        finally:
-            if proc is not None:
-                proc.release()
+            self._release()
+        except Exception as error:
+            exc = error
+        super()._call_connection_lost(exc)
 
     def _release(self):
         if self._proc is not None:
-            self._proc.release()
+            self._proc.close()
 
 
 class LocalProcessTransport(ContainedWorkerTransport):
@@ -722,12 +381,9 @@ class LocalProcessTransport(ContainedWorkerTransport):
             native=native, environment=environment, cwd=cwd,
             inherited_handles=inherited_handles, owning=owning, creationflags=creationflags)
 
-    def close(self):
-        BaseSubprocessTransport.close(self)
-        # During failed construction there may be no observer yet. The local
-        # factory still owns the native process and must reap it before release.
-        if self._exit_task is not None and self._exit_task.done():
-            self._release()
+    def _release(self):
+        if self._proc is not None:
+            self._proc.close()
 
     def _start(self, args, shell, stdin, stdout, stderr, bufsize, **kwargs):
         parent_pipes = {}
@@ -736,9 +392,9 @@ class LocalProcessTransport(ContainedWorkerTransport):
                 children = []
                 for fd, value in enumerate([stdin, stdout, stderr]):
                     if value == PIPE:
-                        first, second = pipe(duplex=fd == 0, overlapped=(fd != 0, fd == 0))
+                        first, second = host_ipc.overlapped_pipe(duplex=fd == 0, overlapped=(fd != 0, fd == 0))
                         child, parent = [first, second] if fd == 0 else [second, first]
-                        parent_pipes[fd] = PipeHandle(parent)
+                        parent_pipes[fd] = host_ipc.PipeHandle(parent)
                         cleanup.callback(api.close_handle, child)
                         api.set_handle_information(child, api.HandleFlags.HANDLE_FLAG_INHERIT,
                                                    api.HandleFlags.HANDLE_FLAG_INHERIT)
@@ -751,7 +407,7 @@ class LocalProcessTransport(ContainedWorkerTransport):
                     native, args, kwargs['environment'], kwargs['cwd'],
                     [*kwargs['inherited_handles'], *children], children,
                     owning=kwargs['owning'], creationflags=kwargs['creationflags'])
-            self._proc = ContainedWorkerProcess(native)
+            self._proc = native
             self._proc.stdin = parent_pipes.get(0)
             self._proc.stdout = parent_pipes.get(1)
             self._proc.stderr = parent_pipes.get(2)
@@ -779,7 +435,7 @@ async def create_local_process(*command, stdin=None, stdout=None, stderr=None,
     transport = None
     try:
         loop = asyncio.get_running_loop()
-        protocol = SubprocessStreamProtocol(limit=64 * 1024, loop=loop)
+        protocol = streams.ProcessProtocol()
         waiter = loop.create_future()
         transport = LocalProcessTransport(
             loop, protocol, native=native, command=list(command), environment=env,
@@ -791,21 +447,21 @@ async def create_local_process(*command, stdin=None, stdout=None, stderr=None,
                 before_resume()
             api.resume_thread(native.information.hThread)
 
-        return await _complete_creation(transport, protocol, loop, waiter, resume)
+        return await _complete_creation(transport, protocol, waiter, resume)
     except BaseException as error:
         if transport is None:
-            await windows_runtime.retire_local(native)
+            await windows_runtime.retire_local(native, preserve_failure=True)
         if isinstance(error, api.WindowsApiError):
-            if error.status is not None:
+            if error.status is not None and not isinstance(error, api.WindowsResourceError):
                 raise OSError(None, str(error), None, error.status) from error
             raise OSError(str(error)) from error
         raise
 
 
-async def _complete_creation(transport, protocol, loop, waiter, ready=None):
+async def _complete_creation(transport, protocol, waiter, ready=None):
     try:
         await waiter
-        process = Process(transport, protocol, loop)
+        process = Process(transport, protocol)
         if ready is not None:
             ready()
         return process
@@ -816,36 +472,56 @@ async def _complete_creation(transport, protocol, loop, waiter, ready=None):
             try:
                 await transport._connect_task
             finally:
-                transport.close()
                 try:
-                    if proc is not None:
-                        for raw in [proc.stdin, proc.stdout, proc.stderr]:
-                            if raw is not None:
-                                raw.close()
+                    transport.close()
                 finally:
-                    await transport._exit_task
+                    try:
+                        if proc is not None:
+                            with ExitStack() as cleanup:
+                                for raw in [proc.stderr, proc.stdout, proc.stdin]:
+                                    if raw is not None:
+                                        cleanup.callback(raw.close)
+                    finally:
+                        # Failed termination is not observed exit. This owner
+                        # remains alive, with family control, through the join.
+                        try:
+                            await transport._exit_task
+                        finally:
+                            if proc is not None:
+                                with ExitStack() as errors:
+                                    # Failed attachment may never publish protocol
+                                    # callbacks. Retire the observed native owner
+                                    # here too, and retain an earlier callback's
+                                    # error without another native release attempt.
+                                    if protocol.closed.done():
+                                        errors.callback(protocol.closed.result)
+                                    if proc.returncode is not None:
+                                        errors.callback(transport._release)
+                                    for raw in [proc.stderr, proc.stdout, proc.stdin]:
+                                        if raw is not None:
+                                            errors.callback(raw.raise_close_error)
 
-        task = asyncio.create_task(finish())
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    pass
-            task.result()
+        await finish_cleanup(finish(), preserve_failure=True)
         raise
 
 
 async def create_worker_process(*, workspace, environment, arguments,
                                 inherited_handles, current_directory):
     """Start one contained worker and return the asyncio ``Process``."""
-    loop = asyncio.get_running_loop()
-    protocol = SubprocessStreamProtocol(limit=64 * 1024, loop=loop)
-    waiter = loop.create_future()
-    transport = ContainedWorkerTransport(
-        loop, protocol, workspace=workspace, environment=environment,
-        arguments=arguments, inherited_handles=inherited_handles,
-        current_directory=current_directory, waiter=waiter)
-    return await _complete_creation(transport, protocol, loop, waiter)
+    native = windows_runtime.ContainedProcess(None)
+    transport = None
+    try:
+        loop = asyncio.get_running_loop()
+        protocol = streams.ProcessProtocol(limit=64 * 1024)
+        waiter = loop.create_future()
+        transport = ContainedWorkerTransport(
+            loop, protocol, native=native, workspace=workspace, environment=environment,
+            arguments=arguments, inherited_handles=inherited_handles,
+            current_directory=current_directory, waiter=waiter)
+        return await _complete_creation(
+            transport, protocol, waiter,
+            ready=lambda: api.resume_thread(native.information.hThread))
+    except BaseException:
+        if transport is None:
+            await windows_runtime.retire_local(native, preserve_failure=True)
+        raise

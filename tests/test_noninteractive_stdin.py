@@ -320,7 +320,7 @@ class WindowsStdinAdapterTests(unittest.TestCase):
         with mock.patch.object(host_ipc, 'os', platform), \
                 mock.patch.object(host_ipc, 'sys', SimpleNamespace(platform='win32')), \
                 mock.patch.dict(sys.modules, {'msvcrt': crt}), \
-                mock.patch.object(host_ipc, 'private_pipe', return_value=[101, 102]) as create, \
+                mock.patch.object(host_ipc, 'private_pipe', return_value=[101, 102], create=True) as create, \
                 mock.patch.object(host_ipc.windows_api, 'close_handle') as close:
             descriptor, release = host_ipc.eof_stdin()
             self.assertEqual(descriptor, 17)
@@ -339,7 +339,7 @@ class WindowsStdinAdapterTests(unittest.TestCase):
         with mock.patch.object(host_ipc, 'os', platform), \
                 mock.patch.object(host_ipc, 'sys', SimpleNamespace(platform='win32')), \
                 mock.patch.dict(sys.modules, {'msvcrt': crt}), \
-                mock.patch.object(host_ipc, 'private_pipe', return_value=[101, 102]), \
+                mock.patch.object(host_ipc, 'private_pipe', return_value=[101, 102], create=True), \
                 mock.patch.object(host_ipc.windows_api, 'close_handle') as close:
             with self.assertRaisesRegex(OSError, 'conversion failed'):
                 host_ipc.eof_stdin()

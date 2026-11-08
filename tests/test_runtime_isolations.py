@@ -1391,8 +1391,8 @@ class WindowsWorkerStdioTests(unittest.IsolatedAsyncioTestCase):
             error = None
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.object(
-                    windows_subprocesses, "pipe",
-                    side_effect=[(11, 12), (13, 14)]))
+                    windows_subprocesses.host_ipc, "overlapped_pipe",
+                    side_effect=[(11, 12), (13, 14)], create=True))
                 inherit = stack.enter_context(mock.patch.object(
                     windows_subprocesses.api, "set_handle_information"))
                 stack.enter_context(mock.patch.object(
@@ -1402,17 +1402,17 @@ class WindowsWorkerStdioTests(unittest.IsolatedAsyncioTestCase):
                     windows_runtime, "worker_stdout_null"))
                 if launch_error is None:
                     call = stack.enter_context(mock.patch.object(
-                        windows_runtime, "launch", return_value=contained))
+                        windows_runtime, "prepare_contained"))
                 else:
                     call = stack.enter_context(mock.patch.object(
-                        windows_runtime, "launch", side_effect=launch_error))
+                        windows_runtime, "prepare_contained", side_effect=launch_error))
                 null.return_value.__enter__.return_value = 101
                 try:
                     transport._start(
                         args=None, shell=False,
                         stdin=windows_subprocesses.PIPE,
                         stdout=windows_subprocesses.PIPE, stderr=None,
-                        bufsize=0, workspace="/work",
+                        bufsize=0, native=contained, workspace="/work",
                         environment={"SAFE": "value"},
                         arguments=["--worker", "--session-owner-fd", "r=7"],
                         inherited_handles=[7, 9], current_directory="/cwd")
@@ -1421,6 +1421,8 @@ class WindowsWorkerStdioTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     if transport._exit_task is not None:
                         transport._exit_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await transport._exit_task
             return transport, inherit, call, closed, error
 
         transport, inherit, call, closed, error = await exercise()
@@ -1431,11 +1433,11 @@ class WindowsWorkerStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inherit.call_args_list,
                          [mock.call(11, 1, 1), mock.call(14, 1, 1)])
         self.assertEqual(call.call_args.kwargs["stdio"], (11, 14))
-        self.assertEqual(call.call_args.args[1],
+        self.assertEqual(call.call_args.args[2],
                          ["--worker", "--session-owner-fd", "r=7",
                           "--stdout-null-handle", "101"])
-        self.assertEqual(call.call_args.args[4], [7, 9, 101])
-        self.assertEqual(call.call_args.args[3], "/work")
+        self.assertEqual(call.call_args.args[5], [7, 9, 101])
+        self.assertEqual(call.call_args.args[4], "/work")
         self.assertEqual(call.call_args.kwargs["current_directory"], "/cwd")
         self.assertCountEqual(closed, [11, 14])
         self.assertEqual(transport._proc.pid, 4242)

@@ -111,6 +111,8 @@ def _canonical_or_absolute(path: str) -> str:
     """
     try:
         return os.path.normcase(_final_path(path))
+    except windows_api.WindowsResourceError:
+        raise
     except windows_api.WindowsApiError:
         return os.path.normcase(os.path.abspath(path))
 
@@ -572,5 +574,7 @@ class Check:
 
 class Backend(Protocol):
     def apply(self, plan: Plan, definition: Definition) -> list[Check]: ...
+
     def verify(self, definition: Definition) -> list[Check]: ...
+
     def uninstall(self, blob: dict) -> list[Check]: ...

@@ -23,18 +23,21 @@ from loki_agent import credential_storages, credential_supervisors, paths
 from loki_agent import runtime_isolation
 from loki_agent.credentials import CredentialStore
 
+if os.name == 'nt':
+    from loki_agent.windows_subprocesses import BaseSubprocessTransport
+
 
 class ProcessResources:
-    """The launched process's own shutdown state."""
+    """Observe production launch ownership; public fixture drivers use cleanup only."""
 
     def __init__(self, process):
         self.process = process
         self.wait = process.wait
         self.transport = getattr(process, '_transport', None)
-        # The transport drops its ``_proc`` when it finishes; the worker it
-        # names records its own release, so keep the reference here.
-        self.worker = (getattr(self.transport, '_proc', None)
-                       if os.name == 'nt' else None)
+        # Keep the actual native owner, whose leader and family releases have
+        # different lifetimes. The transport retains its cached exit result.
+        self.native = (getattr(self.transport, '_proc', None)
+                       if os.name == 'nt' and isinstance(self.transport, BaseSubprocessTransport) else None)
         self.pipes = []
         if os.name == 'posix' and self.transport is not None:
             for fd in [0, 1, 2]:
@@ -45,16 +48,19 @@ class ProcessResources:
     def assert_released(self, case):
         case.assertIsNotNone(
             self.process.returncode, 'shutdown did not observe the child exit')
-        if os.name == 'nt':
-            if self.transport is not None:
-                case.assertTrue(self.transport._exit_task.done())
-                case.assertFalse(self.transport._exit_task.cancelled())
-                if self.worker is not None:
-                    # release() is the owner's own record that it handed its
-                    # native handles back, including the job object.
-                    case.assertIsNone(
-                        self.worker._contained,
-                        'worker still owns its native handles')
+        if self.transport is None:
+            case.assertIsNone(self.process.job)
+            case.assertFalse(self.process.information.hProcess)
+            case.assertFalse(self.process.information.hThread)
+        elif os.name == 'nt':
+            case.assertIsInstance(self.transport, BaseSubprocessTransport)
+            case.assertTrue(self.transport._exit_task.done())
+            case.assertFalse(self.transport._exit_task.cancelled())
+            if self.native is not None:
+                # This retirement scope still owns both the leader and its job.
+                case.assertIsNone(self.native.job)
+                case.assertFalse(self.native.information.hProcess)
+                case.assertFalse(self.native.information.hThread)
         else:
             case.assertTrue(self.transport.is_closing())
             for pipe in self.pipes:
@@ -69,6 +75,8 @@ class ProcessResources:
             await self.wait()
         if self.transport is not None:
             self.transport.close()
+        else:
+            process.close()
 
 
 class LifecycleObservations:
@@ -103,13 +111,10 @@ class LifecycleObservations:
             case.assertFalse(server._writer_close_task.cancelled())
             case.assertIsNone(server._writer_close_task.exception())
             if os.name == 'nt':
-                # The Windows capability writer is a pipe adapter, not a
-                # StreamWriter, so read its own owner state instead.
-                case.assertIsNone(server._writer._source.thread)
-                case.assertIsNone(server._writer._source.stop_event)
-                case.assertIsNone(server._writer._sink.thread)
                 case.assertEqual(server._writer._endpoint.handles(), [])
-                case.assertTrue(server._writer._pump.done())
+                for operation in [server._writer._reading, server._writer._writing]:
+                    if operation is not None:
+                        case.assertTrue(operation.done())
             else:
                 case.assertTrue(server._writer.is_closing())
         pending = asyncio.all_tasks() - self.tasks_before
@@ -139,9 +144,11 @@ async def process_lifecycle(name):
         stack.enter_context(mock.patch.dict(os.environ, environment, clear=True))
         # Model the actual frontend caller without changing the interpreter's
         # global sys module or substituting a different executable/dispatcher.
+        frozen = os.name == 'nt' and launcher.lower().endswith('.exe')
         identity = SimpleNamespace(
-            executable=launcher if os.name == 'nt' else sys.executable,
-            argv=[launcher], frozen=os.name == 'nt', stderr=sys.stderr)
+            executable=launcher if frozen else sys.executable,
+            argv=[launcher], frozen=frozen, platform=sys.platform,
+            stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
         stack.enter_context(mock.patch.object(runtime_isolation, 'sys', identity))
         if os.name == 'nt':
             from loki_agent import windows_runtime, windows_subprocesses

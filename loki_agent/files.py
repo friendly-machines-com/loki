@@ -50,6 +50,8 @@ else:
         from . import windows_api
         try:
             sddl = windows_api.dacl_sddl(file_path)
+        except windows_api.WindowsResourceError:
+            raise
         except windows_api.WindowsApiError as error:
             if error.status in [windows_api.ERROR_FILE_NOT_FOUND,
                                 windows_api.ERROR_PATH_NOT_FOUND]:

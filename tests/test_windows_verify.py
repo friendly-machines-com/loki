@@ -455,6 +455,15 @@ class ProbeContainmentTests(unittest.TestCase):
 
         self.assertEqual(checks["process token"].status, "fail")
 
+    def test_close_failure_is_not_classified_as_an_access_denial(self):
+        access = windows_api.AccessMask.GENERIC_READ
+        self.allow(WORKSPACE, access)
+        failure = windows_api.WindowsApiError('CloseHandle failed', status=5)
+        with mock.patch.object(windows_api, 'close_handle', side_effect=failure):
+            with self.assertRaises(windows_api.WindowsApiError) as caught:
+                windows_verify._denied('probe', WORKSPACE, access, 'read')
+        self.assertIs(caught.exception, failure)
+
 
 class VerifyContainerTests(unittest.TestCase):
     """The uncontained inventory must read rights, not SID strings.

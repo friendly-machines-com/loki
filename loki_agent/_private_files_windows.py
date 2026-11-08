@@ -91,6 +91,10 @@ def _raise_oserror(error: windows_api.WindowsApiError) -> None:
     """Translate a failed call into the OSError the storage protocol expects."""
     status = error.status
     message = str(error)
+    if isinstance(error, windows_api.WindowsResourceError):
+        # A cleanup code is not evidence that acquisition was refused. In
+        # particular it must never trigger a missing-parent creation retry.
+        raise OSError(message) from error
     if status is None:
         raise OSError(message) from error
     unsigned = status & 0xffffffff
@@ -188,14 +192,20 @@ def read(handle, size):
 
 
 def binary_file(handle, mode):
-    """Transfer HANDLE ownership to the CRT, then to the Python file once."""
+    """Consume a native HANDLE as a standard Python binary stream.
+
+    Relative opens return HANDLEs, but fdopen and subprocess fileno consumers
+    require CRT descriptors. Convert without reopening the selected pathname:
+    each stage closes only the representation it owns, including on failure.
+    A successful Python file is the sole close owner afterward.
+    """
     import msvcrt
 
     try:
         fd = msvcrt.open_osfhandle(
             handle, os.O_BINARY | os.O_NOINHERIT | (os.O_RDONLY if mode == 'rb' else os.O_WRONLY))
     except BaseException:
-        windows_api.close_handle(handle)
+        close(handle)
         raise
     try:
         return os.fdopen(fd, mode)
@@ -237,7 +247,13 @@ def fsync(handle) -> None:
 
 
 def close(handle) -> None:
-    windows_api.close_handle(handle)
+    # Storage owns one release attempt, just like os.close; never retry a
+    # native numeric handle whose validity is unknown after failure.
+    try:
+        windows_api.close_handle(handle)
+    except windows_api.WindowsApiError as error:
+        # Closing is not an acquisition result, regardless of its error code.
+        raise OSError(str(error)) from error
 
 
 # -- opens ----------------------------------------------------------------
@@ -253,14 +269,14 @@ def open_directory(path: str):
     try:
         information = windows_api.by_handle_file_information(handle)
     except windows_api.WindowsApiError as error:
-        windows_api.close_handle(handle)
+        close(handle)
         _raise_oserror(error)
     attributes = information.dwFileAttributes
     # Only the mechanism is checked here: a root has to be a directory at
     # all.  Whether a reparse-point directory is acceptable is policy, and
     # the caller decides it from describe() on the returned handle.
     if not attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY:
-        windows_api.close_handle(handle)
+        close(handle)
         raise NotADirectoryError(path)
     return handle
 
@@ -320,7 +336,7 @@ def _directory_result(handle):
         if not attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY:
             raise NotADirectoryError("state path is not a directory")
     except BaseException:
-        windows_api.close_handle(handle)
+        close(handle)
         raise
     return handle
 
@@ -356,7 +372,7 @@ def create_directory_at(directory, name: str, mode: int = 0o700):
         | windows_api.NtCreateOptions.FILE_OPEN_REPARSE_POINT
         | _SYNCHRONOUS,
         windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL)
-    windows_api.close_handle(_directory_result(handle))
+    close(_directory_result(handle))
 
 
 def open_append_at(directory, name: str):
@@ -389,7 +405,7 @@ def replace_at(directory, temporary: str, name: str) -> None:
         except windows_api.WindowsApiError as error:
             _raise_oserror(error)
     finally:
-        windows_api.close_handle(source)
+        close(source)
 
 
 def unlink_at(directory, name: str) -> None:
@@ -406,7 +422,7 @@ def unlink_at(directory, name: str) -> None:
         except windows_api.WindowsApiError as error:
             _raise_oserror(error)
     finally:
-        windows_api.close_handle(target)
+        close(target)
 
 
 # -- description ----------------------------------------------------------
@@ -426,4 +442,4 @@ def describe_path(path: str) -> FileFacts:
     try:
         return _facts_from_handle(handle)
     finally:
-        windows_api.close_handle(handle)
+        close(handle)

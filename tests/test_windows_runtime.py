@@ -289,10 +289,17 @@ class IsolationSeamTests(unittest.TestCase):
             current_directory=os.getcwd())
 
 
-class LaunchTests(unittest.TestCase):
-    def exercise(self, contained):
+class LaunchTests(unittest.IsolatedAsyncioTestCase):
+    async def exercise(self, contained, default_installed=True, capabilities=None, stdio=None,
+                       retirement=None, creation_failure=False):
         events = []
         information = api.ProcessInformation(11, 12, 13, 14)
+
+        def private_default(*args):
+            events.append('private-default')
+            if not default_installed:
+                raise api.WindowsApiError('private default refused')
+            return b'private-acl'
 
         def duplicate(source_process, source, target, output, rights, inherit, flags):
             ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = source + 100
@@ -304,38 +311,61 @@ class LaunchTests(unittest.TestCase):
             if symbol == 'DuplicateHandle':
                 return duplicate
             if symbol == 'WaitForSingleObject':
-                return lambda *args: 0
+                return lambda *args: 258 if retirement is not None and not retirement.exited.is_set() else 0
 
             def call(*args):
                 events.append(symbol)
                 return 1
             return call
 
+        def create_child(*args, **options):
+            output = options['information']
+            ctypes.memmove(ctypes.byref(output), ctypes.byref(information), ctypes.sizeof(information))
+            if creation_failure:
+                raise KeyboardInterrupt('interrupted native buffer cleanup')
+            return output
+
+        def terminate(*args):
+            events.append('terminate')
+            if retirement is not None:
+                retirement.terminated.set()
+
+        def closed(handle):
+            if retirement is not None and handle in [11, 12]:
+                self.assertTrue(retirement.exited.is_set(), 'released an unobserved child')
+                retirement.closed.append(handle)
+
         with mock.patch.dict('sys.modules', {'msvcrt': types.SimpleNamespace(
                 get_osfhandle=lambda fd: fd + 30)}), \
                 mock.patch.object(api, 'bind', side_effect=native_bind), \
                 mock.patch.object(api, 'derive_app_container_sid', return_value='package'), \
                 mock.patch.object(api, 'current_process_handle', return_value=1), \
+                mock.patch.object(api, 'current_user_sid', return_value='S-1-5-21-1'), \
+                mock.patch.object(api, 'set_token_default_dacl', side_effect=private_default), \
                 mock.patch.object(api, 'create_process_in_app_container',
-                                  return_value=information) as create, \
+                                  side_effect=create_child) as create, \
                 mock.patch.object(api, 'open_process_token', return_value=22), \
                 mock.patch.object(api, 'token_is_app_container', return_value=contained), \
                 mock.patch.object(api, 'token_app_container_sid', return_value='package'), \
                 mock.patch.object(api, 'resume_thread',
                                   side_effect=lambda *args: events.append('resume')), \
                 mock.patch.object(api, 'terminate_process',
-                                  side_effect=lambda *args: events.append('terminate')), \
-                mock.patch.object(api, 'close_handle') as close:
-            if contained:
-                process = runtime.launch('loki.py', ['--runtime'], {'SAFE': 'value'},
-                                         '/work', [40, 41],
-                                         current_directory='/work')
+                                  side_effect=terminate), \
+                mock.patch.object(api, 'close_handle', side_effect=closed) as close:
+            success = contained and default_installed and capabilities is None and not creation_failure
+            if success:
+                process = await runtime.launch(
+                    'loki.py', ['--runtime'], {'SAFE': 'value'},
+                    '/work', [40, 41], stdio=stdio, current_directory='/work')
+                await process.wait()
                 process.close()
             else:
-                with self.assertRaises(RuntimeIsolationError):
-                    runtime.launch('loki.py', ['--runtime'], {'SAFE': 'value'},
-                                   '/work', [40, 41],
-                                   current_directory='/work')
+                failure = (KeyboardInterrupt if creation_failure else RuntimeIsolationError
+                           if not contained or capabilities is not None else api.WindowsApiError)
+                with self.assertRaises(failure):
+                    await runtime.launch(
+                        'loki.py', ['--runtime'], {'SAFE': 'value'},
+                        '/work', [40, 41], stdio=stdio, current_directory='/work')
             scratch = os.path.join('/work', runtime.SCRATCH_DIRECTORY)
             expected = {
                 'SAFE': 'value', runtime.WORKSPACE_ENV: '/work',
@@ -351,71 +381,51 @@ class LaunchTests(unittest.TestCase):
             self.assertEqual(create.call_args.kwargs['current_directory'],
                              '/work')
             self.assertEqual(create.call_args.kwargs['inherited_handles'],
-                             [40, 41, 130, 131, 132])
+                             [40, 41, 130, 131, 132] if stdio is None else [40, 41, 132, *stdio])
+            self.assertEqual(create.call_args.kwargs['standard_handles'],
+                             [130, 131, 132] if stdio is None else [*stdio, 132])
+            # Stdio remains borrowed; only our duplicate and native owners close.
+            self.assertCountEqual([call.args[0] for call in close.call_args_list],
+                                  [*([22] if not creation_failure else []),
+                                   *([130, 131, 132] if stdio is None else [132]), 21, 12, 11])
             self.assertIn(mock.call(11), close.call_args_list)
             self.assertIn(mock.call(12), close.call_args_list)
             self.assertIn(mock.call(21), close.call_args_list)
         return events
 
-    def test_verified_child_is_assigned_before_resume(self):
-        events = self.exercise(True)
+    async def test_verified_child_is_assigned_before_resume(self):
+        events = await self.exercise(True)
         self.assertLess(events.index('AssignProcessToJobObject'), events.index('resume'))
         self.assertNotIn('terminate', events)
 
-    def test_wrong_token_is_terminated_without_resume(self):
-        events = self.exercise(False)
+    async def test_wrong_token_is_terminated_without_resume(self):
+        events = await self.exercise(False)
         self.assertIn('terminate', events)
         self.assertNotIn('resume', events)
 
-    def exercise_stdio(self):
-        """A piped child: caller-owned stdin/stdout, duplicated stderr only."""
-        closed = []
-        information = api.ProcessInformation(11, 12, 13, 14)
+    async def test_piped_child_receives_caller_handles_and_duplicated_stderr(self):
+        await self.exercise(True, stdio=(50, 51))
 
-        def duplicate(source_process, source, target, output, rights, inherit, flags):
-            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = source + 100
-            return 1
+    async def _held_failed_launch(self, creation_failure=False):
+        retirement = types.SimpleNamespace(terminated=asyncio.Event(), exited=asyncio.Event(), closed=[])
+        task = asyncio.create_task(self.exercise(False, retirement=retirement, creation_failure=creation_failure))
+        try:
+            await retirement.terminated.wait()
+            self.assertEqual(retirement.closed, [])
+            task.cancel()
+            retirement.exited.set()
+            events = await task
+            self.assertEqual(retirement.closed, [12, 11])
+            self.assertNotIn('resume', events)
+        finally:
+            retirement.exited.set()
+            await asyncio.gather(task, return_exceptions=True)
 
-        def native_bind(library, symbol, *signature):
-            if symbol == 'CreateJobObjectW':
-                return lambda *args: 21
-            if symbol == 'DuplicateHandle':
-                return duplicate
-            return lambda *args: 1
+    async def test_failed_initial_launch_retains_ownership_through_later_cancellation(self):
+        await self._held_failed_launch()
 
-        with mock.patch.dict('sys.modules', {'msvcrt': types.SimpleNamespace(
-                get_osfhandle=lambda fd: fd + 30)}), \
-                mock.patch.object(api, 'bind', side_effect=native_bind), \
-                mock.patch.object(api, 'derive_app_container_sid', return_value='package'), \
-                mock.patch.object(api, 'current_process_handle', return_value=1), \
-                mock.patch.object(api, 'create_process_in_app_container',
-                                  return_value=information) as create, \
-                mock.patch.object(api, 'open_process_token', return_value=22), \
-                mock.patch.object(api, 'token_is_app_container', return_value=True), \
-                mock.patch.object(api, 'token_app_container_sid', return_value='package'), \
-                mock.patch.object(api, 'resume_thread'), \
-                mock.patch.object(api, 'close_handle',
-                                  side_effect=closed.append):
-            process = runtime.launch('loki.py', ['--worker'], {'SAFE': 'value'},
-                                     '/work', [40, 41], stdio=(50, 51),
-                                     current_directory=os.getcwd())
-            process.close()
-            self.assertEqual(create.call_args.kwargs['inherited_handles'],
-                             [40, 41, 132, 50, 51])
-            self.assertEqual(create.call_args.kwargs['standard_handles'],
-                             (50, 51, 132))
-            # The caller's cwd decision is forwarded unchanged: the launch
-            # never substitutes the workspace (or anything else) for it.
-            self.assertEqual(create.call_args.kwargs['current_directory'],
-                             os.getcwd())
-        # Only the launch's own handles are closed: the inspected token (22)
-        # and its stderr duplicate (fd 2 -> 32 -> 132); the caller's stdio
-        # handles 50 and 51 are not.  The process close then releases the
-        # job, thread and process handles.
-        self.assertEqual(closed, [22, 132, 21, 12, 11])
-
-    def test_piped_child_receives_caller_handles_and_duplicated_stderr(self):
-        self.exercise_stdio()
+    async def test_interrupted_native_cleanup_uses_the_same_owned_retirement(self):
+        await self._held_failed_launch(creation_failure=True)
 
 
 class LocalLaunchTests(unittest.TestCase):
@@ -508,11 +518,40 @@ class LocalLaunchTests(unittest.TestCase):
             self.assertTrue(seen['create'].call_args.kwargs['search_path'])
 
 
+class FamilyAccountingTests(unittest.TestCase):
+    def _close_failure(self, failed_handle):
+        owner = runtime.ContainedProcess(api.ProcessInformation(71, 72, 73, 0), job=88)
+        failure = api.WindowsApiError('CloseHandle failed', status=6)
+        attempted = []
+
+        def close(handle):
+            attempted.append(handle)
+            if handle == failed_handle:
+                raise failure
+
+        with mock.patch.object(api, 'close_handle', side_effect=close):
+            with self.assertRaises(api.WindowsApiError) as caught:
+                owner.close()
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(attempted, [88, 72, 71])
+            self.assertIsNone(owner.job)
+            self.assertFalse(owner.information.hThread)
+            self.assertFalse(owner.information.hProcess)
+            owner.close()
+        self.assertEqual(attempted, [88, 72, 71])
+
+    def test_family_close_failure_still_attempts_both_leader_handles_once(self):
+        self._close_failure(88)
+
+    def test_thread_close_failure_still_attempts_process_release_once(self):
+        self._close_failure(72)
+
+
 class LocalRetirementTests(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_cancellation_joins_exit_before_closing_handles(self):
         entered, exited = asyncio.Event(), asyncio.Event()
         events = []
-        process = mock.Mock(information=object())
+        process = mock.Mock(information=api.ProcessInformation(71, 72, 73, 0))
 
         async def wait():
             entered.set()

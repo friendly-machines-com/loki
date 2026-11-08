@@ -696,6 +696,18 @@ class FakeBackend:
         return [windows_setup.Check("ledger", "pass", "cleared")]
 
 
+class NativeCleanupClassificationTests(unittest.TestCase):
+    def test_profile_cleanup_failure_cannot_trigger_an_already_exists_fallback(self):
+        failure = windows_api.WindowsResourceError(
+            'LocalFree failed', status=windows_containers.PROFILE_ALREADY_EXISTS)
+        with mock.patch.object(windows_containers, 'create_app_container_profile', side_effect=failure), \
+                mock.patch.object(windows_api, 'derive_app_container_sid') as derive:
+            with self.assertRaises(windows_api.WindowsResourceError) as caught:
+                windows_setup.WindowsBackend({})._ensure_profile('profile')
+        self.assertIs(caught.exception, failure)
+        derive.assert_not_called()
+
+
 class ConfigureCommandTests(unittest.TestCase):
     """--configure applies the editor's plan without importing Tk.
 

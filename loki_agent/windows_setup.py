@@ -99,7 +99,8 @@ class WindowsBackend:
         try:
             return windows_containers.create_app_container_profile(name)
         except windows_api.WindowsApiError as error:
-            if error.status != windows_containers.PROFILE_ALREADY_EXISTS:
+            if (isinstance(error, windows_api.WindowsResourceError)
+                    or error.status != windows_containers.PROFILE_ALREADY_EXISTS):
                 raise
             return windows_api.derive_app_container_sid(name)
 

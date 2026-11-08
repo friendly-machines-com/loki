@@ -203,7 +203,7 @@ class _WindowsPty(PtyHandle):
     def terminate(self):
         from . import windows_api
 
-        if self.information is not None and self.poll() is None:
+        if self.information is not None and self.information.hProcess and self.poll() is None:
             try:
                 windows_api.terminate_process(self.information.hProcess)
             except windows_api.WindowsApiError:
@@ -220,61 +220,70 @@ class _WindowsPty(PtyHandle):
         # closing its pipe first: ClosePseudoConsole must never wait for a
         # drain on this same thread. Attempt every release even if one fails.
         try:
-            if self.output_read is not None:
-                windows_api.close_handle(self.output_read)
-                self.output_read = None
+            handle, self.output_read = self.output_read, None
+            if handle is not None:
+                windows_api.close_handle(handle)
         finally:
             try:
-                if self.input_write is not None:
-                    windows_api.close_handle(self.input_write)
-                    self.input_write = None
+                handle, self.input_write = self.input_write, None
+                if handle is not None:
+                    windows_api.close_handle(handle)
             finally:
                 try:
-                    if self.hpc is not None:
-                        windows_api.pseudoconsole_close(self.hpc)
-                        self.hpc = None
+                    hpc, self.hpc = self.hpc, None
+                    if hpc is not None:
+                        windows_api.pseudoconsole_close(hpc)
                 finally:
-                    if self.information is not None:
-                        information = self.information
+                    information, self.information = self.information, None
+                    if information is not None:
                         try:
-                            if information.hThread:
-                                windows_api.close_handle(information.hThread)
-                                information.hThread = None
+                            handle, information.hThread = information.hThread, None
+                            if handle:
+                                windows_api.close_handle(handle)
                         finally:
-                            if information.hProcess:
-                                windows_api.close_handle(information.hProcess)
-                                information.hProcess = None
-                        self.information = None
+                            handle, information.hProcess = information.hProcess, None
+                            if handle:
+                                windows_api.close_handle(handle)
 
 
-def _windows_spawn(argv, cols, rows, env, cwd):
-    from . import host_ipc, windows_api
+if sys.platform == "win32":
+    def _windows_spawn(argv, cols, rows, env, cwd):
+        from . import host_ipc, windows_api
 
-    handle = _WindowsPty(None, None, None, None)
-    try:
-        # ConPTY pipes need the same pipe-only policy as inherited IPC; a
-        # thread-private token default may not admit a client-end reopen.
-        # The handle owns host ends as soon as they are acquired. This stack
-        # owns only the temporary ends ConPTY duplicates during creation.
-        with contextlib.ExitStack() as copies:
-            input_read, handle.input_write = host_ipc.private_pipe(inherit=False)
-            copies.callback(windows_api.close_handle, input_read)
-            handle.output_read, output_write = host_ipc.private_pipe(inherit=False)
-            copies.callback(windows_api.close_handle, output_write)
-            handle.hpc = windows_api.pseudoconsole_create(
-                cols, rows, input_read, output_write)
-            handle.information = windows_api.create_process_with_pseudoconsole(
-                argv[0], argv[1:], handle.hpc, environment=env, current_directory=cwd)
-        # Root exit alone is not terminal EOF. Release our session reference
-        # so ConPTY closes output after its last attached client disconnects.
-        windows_api.pseudoconsole_release(handle.hpc)
-        return handle
-    except BaseException:
+        handle = _WindowsPty(None, None, None, None)
         try:
-            handle.terminate()
-        finally:
-            handle.close()
-        raise
+            # ConPTY pipes need the same pipe-only policy as inherited IPC; a
+            # thread-private token default may not admit a client-end reopen.
+            # The handle owns host ends as soon as they are acquired. This stack
+            # owns only the temporary ends ConPTY duplicates during creation.
+            with contextlib.ExitStack() as copies:
+                input_read, handle.input_write = host_ipc.private_pipe(inherit=False)
+                copies.callback(windows_api.close_handle, input_read)
+                handle.output_read, output_write = host_ipc.private_pipe(inherit=False)
+                copies.callback(windows_api.close_handle, output_write)
+                handle.hpc = windows_api.pseudoconsole_create(
+                    cols, rows, input_read, output_write)
+                # This is the plain, uncontained TEST child, not a fallback from
+                # containment. Own native output before temporary cleanup can fail;
+                # explicit NULL stdio prevents redirected parent-handle inheritance.
+                handle.information = windows_api.ProcessInformation()
+                windows_api.create_process_suspended(
+                    argv[0], argv[1:], information=handle.information,
+                    pseudoconsole=handle.hpc.value, standard_handles=[None, None, None],
+                    environment=env, current_directory=cwd)
+            # ConPTY has duplicated its child ends. Drop our copies before the
+            # suspended child can run or cleanup can wait for its termination.
+            windows_api.resume_thread(handle.information.hThread)
+            # Root exit alone is not terminal EOF. Release our session reference
+            # so ConPTY closes output after its last attached client disconnects.
+            windows_api.pseudoconsole_release(handle.hpc)
+            return handle
+        except BaseException:
+            try:
+                handle.terminate()
+            finally:
+                handle.close()
+            raise
 
 
 if sys.platform != "win32":

@@ -32,6 +32,8 @@ from .connections import (
     connection_display_fields,
 )
 from .credentials import CredentialStore
+from . import streams
+from .lifetimes import finish_cleanup
 # The Ask bounds are the tool's public contract and live with the tool
 # definition; the front validates against the same values instead of
 # restating them. Model-authored questions are rendered by the client,
@@ -217,35 +219,39 @@ class WorkerChannel:
                     future.set_exception(failure)
 
     async def close(self):
-        if not self._closed:
-            self._closed = True
-            if self.process.stdin is not None:
-                self.process.stdin.close()
-                with contextlib.suppress(
-                        BrokenPipeError, ConnectionError, OSError):
-                    await self.process.stdin.wait_closed()
-        try:
-            await asyncio.wait_for(self.process.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=2)
-            except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
-        if not self._reader_task.done():
-            self._reader_task.cancel()
-        with contextlib.suppress(
-                asyncio.CancelledError, acps.TransportError):
-            await self._reader_task
-        # The platform process is released only after the reader has stopped:
-        # on Windows this closes the stdio threads, the front pipe handles
-        # and the job whose close kills any descendants.  POSIX subprocesses
-        # own their transport and need nothing here.
-        runtime_isolation.close_runtime_process(self.process)
-        if self.credential_delegation is not None:
-            await self.credential_delegation.close()
+        self._closed = True
+        delegation = self.credential_delegation
+
+        async def retire():
+            async with contextlib.AsyncExitStack() as cleanup:
+                if delegation is not None:
+                    cleanup.push_async_callback(delegation.close)
+                if isinstance(self.process, streams.Process):
+                    # Loki owns its transport/native observers as well as the
+                    # leader. Join that existing owner, including close errors.
+                    cleanup.push_async_callback(self.process.aclose)
+                else:
+                    # Standard-library fixture processes retain their fixture's
+                    # stream owner; do not invent Session-completion semantics.
+                    cleanup.callback(runtime_isolation.close_runtime_process, self.process)
+                try:
+                    try:
+                        if self.process.stdin is not None:
+                            self.process.stdin.close()
+                            with contextlib.suppress(BrokenPipeError, ConnectionError, OSError):
+                                await self.process.stdin.wait_closed()
+                    finally:
+                        # The worker joins its prompt and jobs. An outer elapsed
+                        # escalation can interrupt that cleanup, not complete it.
+                        await self.process.wait()
+                finally:
+                    if not self._reader_task.done():
+                        self._reader_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, acps.TransportError):
+                        await self._reader_task
             self.credential_delegation = None
+
+        await finish_cleanup(retire())
 
 
 class SessionOperations:

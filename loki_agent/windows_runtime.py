@@ -18,6 +18,7 @@ from ctypes import wintypes
 from . import windows_api as api
 from . import windows_state as state
 from . import windows_verify
+from .lifetimes import finish_cleanup
 from .runtime_isolations import RuntimeIsolationError
 
 WORKSPACE_ENV = "LOKI_CONTAINER_WORKSPACE"
@@ -313,25 +314,19 @@ class ContainedProcess:
         self.job = job
         self.pid = information.dwProcessId if information is not None else None
         self.returncode = None
+        # Native results and family ownership live here; attached raw stdio is
+        # owned by the transport, not by either native-handle release operation.
+        self.stdin = self.stdout = self.stderr = None
 
     async def wait(self):
-        wait = api.bind("kernel32", "WaitForSingleObject", wintypes.DWORD,
-                        ctypes.c_void_p, wintypes.DWORD)
-        get_code = api.bind("kernel32", "GetExitCodeProcess", wintypes.BOOL,
-                            ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD))
         while self.returncode is None:
-            result = wait(self.information.hProcess, 0)
-            if result == 0:
-                code = wintypes.DWORD()
-                _checked(get_code(self.information.hProcess, ctypes.byref(code)),
-                         "GetExitCodeProcess")
-                self.returncode = code.value
+            result = api.wait_for_single_object(self.information.hProcess, 0)
+            if result == api.WAIT_OBJECT_0:
+                self.returncode = api.get_exit_code_process(self.information.hProcess)
             elif result == 258:  # WAIT_TIMEOUT; do not block the broker loop.
                 await asyncio.sleep(0.02)
             else:
                 raise api.WindowsApiError(f"WaitForSingleObject: {result}")
-        if self.job is None:
-            self.close()
         return self.returncode
 
     def terminate(self):
@@ -353,32 +348,36 @@ class ContainedProcess:
     kill = terminate
 
     def close(self):
-        # A local job retains the runtime's existing enclosing job. Closing a
-        # root handle must not kill descendants on normal foreground completion.
-        # Supervisor-owned jobs retain their existing kill-on-close lifetime.
-        if self.job is not None:
-            api.close_handle(self.job)
-            self.job = None
-        if self.information is not None:
-            for field in ['hThread', 'hProcess']:
-                handle = getattr(self.information, field)
-                if handle:
-                    api.close_handle(handle)
-                    setattr(self.information, field, None)
+        try:
+            job, self.job = self.job, None
+            if job is not None:
+                api.close_handle(job)
+        finally:
+            if self.information is not None:
+                with ExitStack() as cleanup:
+                    for field in ['hProcess', 'hThread']:
+                        handle = getattr(self.information, field)
+                        setattr(self.information, field, None)
+                        if handle:
+                            cleanup.callback(api.close_handle, handle)
 
 
 def duplicate_standard_handle(value, fd):
     """Lend an inheritable stdio copy without changing a borrowed CRT handle."""
     import msvcrt
     source = fd if value is None else value if isinstance(value, int) else value.fileno()
+    return duplicate_handle(msvcrt.get_osfhandle(source), inheritable=True)
+
+
+def duplicate_handle(handle, *, inheritable):
     duplicate = api.bind('kernel32', 'DuplicateHandle', wintypes.BOOL,
                          ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                          ctypes.POINTER(ctypes.c_void_p), wintypes.DWORD,
                          wintypes.BOOL, wintypes.DWORD)
     process = api.current_process_handle()
     result = ctypes.c_void_p()
-    _checked(duplicate(process, msvcrt.get_osfhandle(source), process,
-                       ctypes.byref(result), 0, True, 2), 'DuplicateHandle')
+    _checked(duplicate(process, handle, process,
+                       ctypes.byref(result), 0, inheritable, 2), 'DuplicateHandle')
     return result.value
 
 
@@ -437,8 +436,9 @@ def prepare_local(process, command, environment, current_directory, handles, sta
             api.set_token_default_dacl(primary, compatible)
             if not owning:
                 expected_default = api.token_default_dacl(primary)
+        process.information = api.ProcessInformation()
         process.information = api.create_process_suspended(
-            command[0], command[1:], current_directory=current_directory,
+            command[0], command[1:], information=process.information, current_directory=current_directory,
             inherited_handles=handles, environment=environment, standard_handles=standard_handles,
             primary_token=primary, object_security=security, creationflags=creationflags,
             # This is ordinary external-command lookup, from the creator's
@@ -461,35 +461,34 @@ def prepare_local(process, command, environment, current_directory, handles, sta
             raise api.WindowsApiError('suspended child creation ACL mismatch')
 
 
-async def retire_local(process):
+async def retire_local(process, *, preserve_failure=False):
     """Join unpublished-child teardown; JobManager cannot own it before return."""
-    if process.information is None:
+    if process.information is None or not process.information.hProcess:
+        process.close()
         return
 
     async def finish():
         try:
-            process.terminate()
-        except ProcessLookupError:
-            pass
-        await process.wait()
-        process.close()
-
-    task = asyncio.create_task(finish())
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        while not task.done():
             try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
+                process.terminate()
+            except ProcessLookupError:
                 pass
-        task.result()
-        raise
+        finally:
+            # A failed termination request is not exit. Retain this owner and
+            # its control handles until the actual observer establishes exit.
+            await process.wait()
+            process.close()
+
+    await finish_cleanup(finish(), preserve_failure=preserve_failure)
 
 
-def launch(executable, arguments, environment, workspace, inherited_handles,
-           stdio=None, current_directory=None):
-    """Start the contained process, with piped or inherited standard handles.
+def prepare_contained(process, executable, arguments, environment, workspace, inherited_handles,
+                      stdio=None, current_directory=None):
+    """Prepare a suspended contained child in its caller's existing owner.
+
+    Native security/creation calls are synchronous platform operations, but
+    this layer never waits for child exit. Root and worker factories use the
+    same asynchronous retirement owner if any later step fails.
 
     ``stdio`` is ``(stdin_handle, stdout_handle)`` for children that speak a
     protocol on their standard streams (the ACP worker): both handles must
@@ -504,8 +503,6 @@ def launch(executable, arguments, environment, workspace, inherited_handles,
     the child runs in: the profile whose package SID confines it, and the
     ``LOKI_CONTAINER_WORKSPACE`` value its own startup gate verifies.
     """
-    import msvcrt
-
     package = api.derive_app_container_sid(state.profile_name_for(workspace))
     child_environment = dict(environment)
     child_environment[WORKSPACE_ENV] = workspace
@@ -542,60 +539,50 @@ def launch(executable, arguments, environment, workspace, inherited_handles,
                        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
     assign = api.bind("kernel32", "AssignProcessToJobObject", wintypes.BOOL,
                       ctypes.c_void_p, ctypes.c_void_p)
-    duplicate = api.bind("kernel32", "DuplicateHandle", wintypes.BOOL,
-                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                         ctypes.POINTER(ctypes.c_void_p), wintypes.DWORD,
-                         wintypes.BOOL, wintypes.DWORD)
-    current = api.current_process_handle()
-    job = _checked(create_job(None, None), "CreateJobObjectW")
-    information = None
-    duplicates = []
-    handed_off = False
-    try:
+    with ExitStack() as pending_job, ExitStack() as duplicated_stdio:
+        job = _checked(create_job(None, None), "CreateJobObjectW")
+        pending_job.callback(api.close_handle, job)
         limits = _ExtendedLimits()
         limits.basic.flags = api.JobObjectLimits.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         _checked(set_job(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)),
                  "SetInformationJobObject")
-        # Duplicate stdio rather than changing inheritance on the parent's fds.
-        for fd in [0, 1, 2] if stdio is None else (2,):
-            handle = ctypes.c_void_p()
-            _checked(duplicate(current, msvcrt.get_osfhandle(fd), current,
-                               ctypes.byref(handle), 0, True, 2), "DuplicateHandle")
-            duplicates.append(handle.value)
-        standard_handles = stdio + (duplicates[-1],) if stdio is not None \
-            else duplicates
-        information = api.create_process_in_app_container(
-            executable, arguments, package,
+        duplicates = []
+        for fd in [0, 1, 2] if stdio is None else [2]:
+            handle = duplicate_standard_handle(None, fd)
+            duplicated_stdio.callback(api.close_handle, handle)
+            duplicates.append(handle)
+        standard_handles = [*stdio, duplicates[-1]] if stdio is not None else duplicates
+        process.information = api.ProcessInformation()
+        process.information = api.create_process_in_app_container(
+            executable, arguments, package, information=process.information,
             current_directory=current_directory,
-            inherited_handles=[*inherited_handles, *duplicates, *(
-                stdio if stdio is not None else ())],
+            inherited_handles=[*inherited_handles, *duplicates, *(stdio if stdio is not None else [])],
             environment=child_environment, standard_handles=standard_handles)
-        token = api.open_process_token(information.hProcess)
+        process.pid = process.information.dwProcessId
+        token = api.open_process_token(
+            process.information.hProcess, api.TokenAccess.TOKEN_QUERY)
         try:
             if (not api.token_is_app_container(token)
                     or api.token_app_container_sid(token) != package):
                 raise RuntimeIsolationError("Suspended runtime token mismatch")
         finally:
             api.close_handle(token)
-        _checked(assign(job, information.hProcess), "AssignProcessToJobObject")
-        api.resume_thread(information.hThread)
-        process = ContainedProcess(information, job)
-        handed_off = True
+        _checked(assign(job, process.information.hProcess), "AssignProcessToJobObject")
+        # Before assignment, retirement must terminate the child directly, not
+        # an empty job. Transfer only after actual assignment has succeeded.
+        process.job = job
+        pending_job.pop_all()
+
+
+async def launch(executable, arguments, environment, workspace, inherited_handles,
+                 stdio=None, current_directory=None):
+    """Own initial creation/resume through failure and actual exit observation."""
+    process = ContainedProcess(None)
+    try:
+        prepare_contained(process, executable, arguments, environment, workspace,
+                          inherited_handles, stdio=stdio, current_directory=current_directory)
+        api.resume_thread(process.information.hThread)
         return process
-    finally:
-        for handle in duplicates:
-            api.close_handle(handle)
-        if not handed_off:
-            try:
-                if information is not None:
-                    api.terminate_process(information.hProcess)
-                    wait = api.bind("kernel32", "WaitForSingleObject", wintypes.DWORD,
-                                    ctypes.c_void_p, wintypes.DWORD)
-                    result = wait(information.hProcess, 5000)
-                    if result != 0:
-                        raise api.WindowsApiError(f"Runtime cleanup wait: {result}")
-            finally:
-                if information is not None:
-                    api.close_handle(information.hThread)
-                    api.close_handle(information.hProcess)
-                api.close_handle(job)
+    except BaseException:
+        await retire_local(process, preserve_failure=True)
+        raise

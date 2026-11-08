@@ -1,6 +1,6 @@
 """Setup decision/recovery tests. ACL calls are substituted, not native evidence."""
 
-import ctypes
+from contextlib import contextmanager
 import os
 import tempfile
 import types
@@ -251,62 +251,121 @@ class RulesTests(unittest.TestCase):
 
 
 class InheritanceTests(unittest.TestCase):
+    @contextmanager
+    def _dacl_calls(self, *, conversion=True, descriptor=10, readable=True, present=True, dacl=11, status=0):
+        # Substitute only the native ABI, not inheritance/ownership decisions.
+        # Both pathname policies and the shared handle primitive must release
+        # their converted descriptor without consuming the caller's handle.
+        def convert(text, revision, output, length):
+            output._obj.value = descriptor
+            return conversion
+
+        def get_dacl(descriptor, present_out, output, defaulted):
+            present_out._obj.value = present
+            output._obj.value = dacl
+            return readable
+
+        calls = {
+            'ConvertStringSecurityDescriptorToSecurityDescriptorW': mock.Mock(side_effect=convert),
+            'GetSecurityDescriptorDacl': mock.Mock(side_effect=get_dacl),
+            'SetNamedSecurityInfoW': mock.Mock(return_value=status),
+            'SetSecurityInfo': mock.Mock(return_value=status),
+            'LocalFree': mock.Mock(return_value=None),
+        }
+
+        def bind(library, symbol, *args):
+            return calls[symbol]
+
+        with mock.patch.object(containers, 'bind', side_effect=bind), \
+                mock.patch.object(api, 'bind', side_effect=bind), \
+                mock.patch.object(api.ctypes, 'get_last_error', return_value=5, create=True), \
+                mock.patch.object(api, 'close_handle') as close:
+            yield calls
+            close.assert_not_called()
+
     def test_only_protected_sddl_requests_disabling_inheritance(self):
         for sddl, expected in [
-                ('D:AI(A;;FR;;;SY)',
-                 api.SecurityInformation.DACL_SECURITY_INFORMATION),
-                ('D:P(A;;FR;;;SY)',
-                 api.SecurityInformation.DACL_SECURITY_INFORMATION
+                ('D:AI(A;;FR;;;SY)', api.SecurityInformation.DACL_SECURITY_INFORMATION),
+                ('D:P(A;;FR;;;SY)', api.SecurityInformation.DACL_SECURITY_INFORMATION
                  | api.SecurityInformation.PROTECTED_DACL_SECURITY_INFORMATION)]:
-            set_named = mock.Mock(return_value=0)
-
-            def convert(text, revision, output, length):
-                ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 10
-                return 1
-
-            def get_dacl(descriptor, present, output, defaulted):
-                ctypes.cast(present, ctypes.POINTER(ctypes.wintypes.BOOL))[0] = True
-                ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 11
-                return 1
-            functions = {
-                'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
-                'GetSecurityDescriptorDacl': get_dacl,
-                'SetNamedSecurityInfoW': set_named,
-                'LocalFree': lambda *args: None,
-            }
-            with self.subTest(sddl=sddl), mock.patch.object(
-                    containers, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]):
+            with self.subTest(sddl=sddl), self._dacl_calls() as calls:
                 containers.set_dacl_sddl('/work', sddl)
-            self.assertEqual(set_named.call_args.args[2], expected)
+            self.assertEqual(calls['SetNamedSecurityInfoW'].call_args.args[2], expected)
+            calls['LocalFree'].assert_called_once()
+            self.assertEqual(calls['LocalFree'].call_args.args[0].value, 10)
 
     def test_handle_setter_requests_disabling_inheritance_like_the_named_one(self):
-        # The handle-relative grant must carry the same protected-flag rule as
-        # the pathname one, or a re-applied grant could drop DACL protection.
         for sddl, expected in [
-                ('D:AI(A;;FR;;;SY)',
-                 api.SecurityInformation.DACL_SECURITY_INFORMATION),
-                ('D:P(A;;FR;;;SY)',
-                 api.SecurityInformation.DACL_SECURITY_INFORMATION
+                ('D:AI(A;;FR;;;SY)', api.SecurityInformation.DACL_SECURITY_INFORMATION),
+                ('D:P(A;;FR;;;SY)', api.SecurityInformation.DACL_SECURITY_INFORMATION
                  | api.SecurityInformation.PROTECTED_DACL_SECURITY_INFORMATION)]:
-            set_info = mock.Mock(return_value=0)
-
-            def convert(text, revision, output, length):
-                ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 10
-                return 1
-
-            def get_dacl(descriptor, present, output, defaulted):
-                ctypes.cast(present, ctypes.POINTER(ctypes.wintypes.BOOL))[0] = True
-                ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 11
-                return 1
-            functions = {
-                'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
-                'GetSecurityDescriptorDacl': get_dacl,
-                'SetSecurityInfo': set_info,
-                'LocalFree': lambda *args: None,
-            }
             handle = object()
-            with self.subTest(sddl=sddl), mock.patch.object(
-                    containers, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]):
+            with self.subTest(sddl=sddl), self._dacl_calls() as calls:
                 containers.set_handle_dacl_sddl(handle, sddl)
-            self.assertEqual(set_info.call_args.args[0], handle)
-            self.assertEqual(set_info.call_args.args[2], expected)
+            applied = calls['SetSecurityInfo'].call_args.args
+            self.assertIs(applied[0], handle)
+            self.assertEqual(applied[1], api.SE_FILE_OBJECT)
+            self.assertEqual(applied[2], expected)
+            calls['SetNamedSecurityInfoW'].assert_not_called()
+            calls['LocalFree'].assert_called_once()
+            self.assertEqual(calls['LocalFree'].call_args.args[0].value, 10)
+
+    def test_kernel_handle_keeps_dacl_only_behavior(self):
+        with self._dacl_calls() as calls:
+            api.set_handle_dacl(object(), 'D:P(A;;FR;;;SY)', object_type=api.SE_KERNEL_OBJECT)
+        applied = calls['SetSecurityInfo'].call_args.args
+        self.assertEqual(applied[1], api.SE_KERNEL_OBJECT)
+        self.assertEqual(applied[2], api.SecurityInformation.DACL_SECURITY_INFORMATION)
+
+    def test_shared_named_setter_does_not_acquire_setup_protection_policy(self):
+        with self._dacl_calls() as calls:
+            api.set_named_dacl('/work', 'D:P(A;;FR;;;SY)')
+        self.assertEqual(calls['SetNamedSecurityInfoW'].call_args.args[2],
+                         api.SecurityInformation.DACL_SECURITY_INFORMATION)
+        calls['SetSecurityInfo'].assert_not_called()
+
+    def test_handle_conversion_failure_does_not_free_unacquired_output(self):
+        with self._dacl_calls(conversion=False) as calls:
+            with self.assertRaises(api.WindowsApiError):
+                api.set_handle_dacl(object(), 'D:P(A;;FR;;;SY)')
+        calls['GetSecurityDescriptorDacl'].assert_not_called()
+        calls['SetSecurityInfo'].assert_not_called()
+        calls['LocalFree'].assert_not_called()
+
+    def test_null_descriptor_is_not_queried_applied_or_freed(self):
+        for setter, target in [[api.set_handle_dacl, object()],
+                               [api.set_named_dacl, '/work'],
+                               [containers.set_dacl_sddl, '/work']]:
+            with self.subTest(setter=setter.__name__), self._dacl_calls(descriptor=None) as calls:
+                with self.assertRaisesRegex(api.WindowsApiError, 'null'):
+                    setter(target, 'D:P(A;;FR;;;SY)')
+            for name in ['GetSecurityDescriptorDacl', 'SetSecurityInfo', 'SetNamedSecurityInfoW', 'LocalFree']:
+                calls[name].assert_not_called()
+
+    def _assert_handle_dacl_refused(self, **options):
+        with self._dacl_calls(**options) as calls:
+            with self.assertRaises(api.WindowsApiError):
+                api.set_handle_dacl(object(), 'D:P(A;;FR;;;SY)')
+        calls['SetSecurityInfo'].assert_not_called()
+        calls['LocalFree'].assert_called_once()
+        self.assertEqual(calls['LocalFree'].call_args.args[0].value, 10)
+
+    def test_handle_query_failure_releases_the_descriptor_without_applying(self):
+        self._assert_handle_dacl_refused(readable=False)
+
+    def test_absent_handle_dacl_is_refused_without_applying(self):
+        self._assert_handle_dacl_refused(present=False)
+
+    def test_null_handle_dacl_is_refused_without_applying(self):
+        self._assert_handle_dacl_refused(dacl=0)
+
+    def test_handle_application_failure_preserves_status_and_releases_the_descriptor(self):
+        handle = object()
+        with self._dacl_calls(status=5) as calls:
+            with self.assertRaises(api.WindowsApiError) as refused:
+                api.set_handle_dacl(handle, 'D:P(A;;FR;;;SY)')
+        self.assertEqual(refused.exception.status, 5)
+        self.assertIs(calls['SetSecurityInfo'].call_args.args[0], handle)
+        calls['SetNamedSecurityInfoW'].assert_not_called()
+        calls['LocalFree'].assert_called_once()
+        self.assertEqual(calls['LocalFree'].call_args.args[0].value, 10)

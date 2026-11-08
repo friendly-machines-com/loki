@@ -387,6 +387,8 @@ def _attempt(path: str, desired_access: int):
     """
     try:
         handle = windows_api.open_with_access(path, desired_access)
+    except windows_api.WindowsResourceError:
+        raise  # Retirement failure is never evidence of an access refusal.
     except windows_api.WindowsApiError as error:
         return error
     windows_api.close_handle(handle)

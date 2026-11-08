@@ -81,7 +81,7 @@ def launch(native, tokens, directory, actor_script, depth, *, package=None, job=
     private = f'D:P(A;;GA;;;{owner})(A;;GA;;;SY)(A;;GA;;;BA)'
     current = api.current_process_handle()
     owned = []
-    information = None
+    information = api.ProcessInformation()
     result = {'resumed': False}
     parent = api.open_process_token(current, api.TokenAccess.TOKEN_QUERY)
     before = None
@@ -114,10 +114,9 @@ def launch(native, tokens, directory, actor_script, depth, *, package=None, job=
             try:
                 information = api.create_process_in_app_container(
                     sys.executable, ['-I', '-u', str(actor_script), '--owning-child', str(output), str(depth)],
-                    package, current_directory=str(directory), inherited_handles=handles,
+                    package, information=information, current_directory=str(directory), inherited_handles=handles,
                     standard_handles=[handles[0], handles[1], handles[1]],
                     primary_token=token, object_security=private + 'S:(ML;;NW;;;LW)')
-                owned.extend([information.hProcess, information.hThread])
             finally:
                 for handle in handles:
                     os.set_handle_inheritable(handle, False)
@@ -167,9 +166,11 @@ def launch(native, tokens, directory, actor_script, depth, *, package=None, job=
             # Register all closers before cleanup can fail. The child is killed
             # and reaped while its handles are still held, including pre-job
             # failures where closing the enclosing job would not yet help.
+            if information.hProcess:
+                owned.extend([information.hProcess, information.hThread])
             for handle in owned:
                 cleanup.callback(api.close_handle, handle)
-            if information is not None:
+            if information.hProcess:
                 if native.wait(information.hProcess, 0) == 258:
                     api.terminate_process(information.hProcess)
                     result['terminated_before_close'] = True

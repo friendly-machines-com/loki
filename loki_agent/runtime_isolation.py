@@ -19,7 +19,7 @@ import logging
 import os
 import sys
 
-from . import host_ipc
+from . import host_ipc, streams
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +103,7 @@ if sys.platform == "win32":
         # Not the workspace: the ambient cwd is what relative opens, DLL
         # searches and executable lookups resolve against, and the workspace
         # is the one directory model-directed tools can write.
-        return windows_runtime.launch(
+        return await windows_runtime.launch(
             executable, command[1:], environment, workspace, inherited,
             current_directory=os.getcwd())
 
@@ -143,7 +143,7 @@ if sys.platform == "win32":
         # Terminal runtimes hand native ownership to the supervisor. ACP
         # workers instead hand it to their transport; the front must not close
         # those handles underneath the transport's exit observer.
-        if isinstance(process, windows_runtime.ContainedProcess):
+        if isinstance(process, windows_runtime.ContainedProcess) or isinstance(process, streams.Process):
             process.close()
 
 else:
