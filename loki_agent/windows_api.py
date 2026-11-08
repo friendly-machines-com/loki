@@ -480,6 +480,10 @@ def set_handle_dacl(handle, sddl: str, object_type: int = SE_FILE_OBJECT) -> Non
         ctypes.c_void_p, ctypes.c_void_p)
     with _converted_dacl(sddl) as dacl:
         flags = SecurityInformation.DACL_SECURITY_INFORMATION
+        if object_type == SE_FILE_OBJECT and 'P' in sddl.partition('D:')[2].split('(', 1)[0]:
+            # File publication must preserve a protected destination DACL.
+            # Kernel-object callers retain their existing DACL-only behavior.
+            flags |= SecurityInformation.PROTECTED_DACL_SECURITY_INFORMATION
         status = set_info(handle, object_type, flags, None, None, dacl, None)
         if status != ERROR_SUCCESS:
             raise WindowsApiError(f"SetSecurityInfo(dacl) failed: {status}",

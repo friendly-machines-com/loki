@@ -224,7 +224,7 @@ class RecoveryTests(unittest.TestCase):
             mock.patch.object(api, 'open_directory_for_acl', side_effect=lambda path: path),
             mock.patch.object(api, 'close_handle', side_effect=close_model_or_native),
             mock.patch.object(api, 'handle_dacl_sddl', side_effect=self.descriptors.__getitem__),
-            mock.patch.object(containers, 'set_handle_dacl_sddl', side_effect=lambda handle, sddl: self.descriptors.__setitem__(handle, sddl)),
+            mock.patch.object(api, 'set_handle_dacl', side_effect=lambda handle, sddl: self.descriptors.__setitem__(handle, sddl)),
         ]
         for patch in patches:
             patch.start()
@@ -509,7 +509,7 @@ class InheritanceTests(unittest.TestCase):
                  | api.SecurityInformation.PROTECTED_DACL_SECURITY_INFORMATION)]:
             handle = object()
             with self.subTest(sddl=sddl), self._dacl_calls() as calls:
-                containers.set_handle_dacl_sddl(handle, sddl)
+                api.set_handle_dacl(handle, sddl)
             applied = calls['SetSecurityInfo'].call_args.args
             self.assertIs(applied[0], handle)
             self.assertEqual(applied[1], api.SE_FILE_OBJECT)

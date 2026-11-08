@@ -28,7 +28,6 @@ from loki_agent import credential_storages  # noqa: E402
 from loki_agent import private_files  # noqa: E402
 from loki_agent import windows_acl  # noqa: E402
 from loki_agent import windows_api  # noqa: E402
-from loki_agent import windows_containers  # noqa: E402
 from loki_agent import windows_state  # noqa: E402
 
 
@@ -269,7 +268,7 @@ class GrantHandlePrimitiveTests(unittest.TestCase):
             self.target.mkdir()
             updated = windows_state.add_package_ace(
                 current, self.package, windows_state.Access.READ_WRITE)
-            windows_containers.set_handle_dacl_sddl(handle, updated)
+            windows_api.set_handle_dacl(handle, updated)
             self.assertEqual(windows_api.file_identity(handle), identity)
             self.assertEqual(windows_state.workspace_key(str(moved)), identity)
             self.assertNotEqual(windows_state.workspace_key(str(self.target)), identity)
@@ -310,7 +309,7 @@ class GrantHandlePrimitiveTests(unittest.TestCase):
             current = windows_api.handle_dacl_sddl(handle)
             updated = windows_state.add_package_ace(
                 current, self.package, windows_state.Access.READ_WRITE)
-            windows_containers.set_handle_dacl_sddl(handle, updated)
+            windows_api.set_handle_dacl(handle, updated)
         finally:
             windows_api.close_handle(handle)
         on_disk = windows_api.dacl_sddl(str(self.target))
@@ -324,7 +323,7 @@ class GrantHandlePrimitiveTests(unittest.TestCase):
         protected = "D:P(A;OICI;FA;;;%s)" % windows_api.current_user_sid()
         handle = windows_api.open_directory_for_acl(str(self.target))
         try:
-            windows_containers.set_handle_dacl_sddl(handle, protected)
+            windows_api.set_handle_dacl(handle, protected)
         finally:
             windows_api.close_handle(handle)
         header = windows_api.dacl_sddl(str(self.target)).split('(', 1)[0]

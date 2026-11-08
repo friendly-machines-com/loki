@@ -48,11 +48,15 @@ import os
 import sys
 
 from . import paths
+from . import private_files
 from . import windows_api
 from . import windows_state
 from . import windows_containers
 from . import windows_verify
-from .windows_acl import names_package, dacl_parts, private_dacl_sddl
+from .windows_acl import (
+    ace_fields, names_package, dacl_parts, flag_codes, package_access,
+    package_allow, private_dacl_sddl, rights_mask,
+)
 from .windows_state import (
     Access,
     Backend,
@@ -61,6 +65,7 @@ from .windows_state import (
     Grant,
     Plan,
     add_package_ace,
+    access_mask,
     build_plan,
     configuration_path_errors,
     entry_grants,
@@ -130,17 +135,32 @@ class WindowsBackend:
         if current is None:
             raise windows_api.WindowsApiError(
                 f"{path} has no DACL to extend")
-        updated = add_package_ace(current, package, access)
+        required = access_mask(access)
+
+        def ensure(descriptor, sid):
+            # A source interpreter can be inside the already-granted source
+            # tree. An exact recursive grant needs no edit; inherited excess or
+            # incomplete inheritance must still be refused, never repaired.
+            if package_access(descriptor, sid) == required and package_allow(descriptor, sid) == required:
+                for kind, flags, rights, obj, inherited, trustee in ace_fields(descriptor):
+                    if trustee == sid and kind == 'A' and not obj and not inherited and rights_mask(rights) == required:
+                        codes = flag_codes(flags)
+                        if {'OI', 'CI'} <= codes <= {'OI', 'CI', 'ID'}:
+                            return descriptor
+            return add_package_ace(descriptor, sid, access)
+
+        updated = ensure(current, package)
         role = tool_role_sid(package)
-        updated = remove_package_aces(updated, role)
         if access is Access.READ_WRITE:
-            updated = add_package_ace(updated, role, access)
+            updated = ensure(updated, role)
+        else:
+            updated = remove_package_aces(updated, role)
         # Do not rewrite a DACL this edit did not change.  The write is the
         # expensive part (inherited ACEs propagate), and setup is re-runnable:
         # re-applying an existing configuration must not re-touch the runtime
         # tree.  Same rule as _ungrant_path below.
         if updated != current:
-            windows_containers.set_handle_dacl_sddl(handle, updated)
+            windows_api.set_handle_dacl(handle, updated)
 
     def _ungrant_path(self, path: str, package: str) -> None:
         current = windows_api.dacl_sddl(path)
@@ -154,8 +174,28 @@ class WindowsBackend:
             windows_containers.set_dacl_sddl(path, updated)
 
     def _private_directory(self, path: str, user: str) -> None:
-        os.makedirs(path, exist_ok=True)
-        windows_containers.set_dacl_sddl(path, private_dacl_sddl(user))
+        private_files.make_private_directory(path)
+        handle = self._state_handle(path)
+        try:
+            information = windows_api.by_handle_file_information(handle)
+            if not information.dwFileAttributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY:
+                raise windows_api.WindowsApiError(f'Not a directory: {path!r}')
+            if windows_api.handle_owner_sid(handle) != user:
+                raise windows_api.WindowsApiError(f'Credential directory is not owned by this user: {path!r}')
+            current = windows_api.handle_dacl_sddl(handle)
+            existing = dacl_parts(current)[1] if current is not None else []
+            if any(ace[1:-1].split(';')[0] not in ['A', 'D'] for ace in existing):
+                raise windows_api.WindowsApiError('Unsupported credential directory permissions')
+            if (current is not None and 'P' in dacl_parts(current)[0]
+                    and not private_files.describe(handle).group_or_other_access):
+                return  # Already private; do not rewrite aliases or widen owner access.
+            header, private = dacl_parts(private_dacl_sddl(user))
+            denied = [ace for ace in existing if ace[1:-1].split(';')[0] == 'D']
+            updated = header + ''.join([*denied, *private])
+            if updated != current:
+                windows_api.set_handle_dacl(handle, updated)
+        finally:
+            windows_api.close_handle(handle)
 
     def _state_handle(self, path):
         handle = windows_api.open_with_access(
@@ -177,7 +217,7 @@ class WindowsBackend:
         for path in setup_files():
             handle = self._state_handle(path)
             try:
-                windows_containers.set_handle_dacl_sddl(handle, private_dacl_sddl(user))
+                windows_api.set_handle_dacl(handle, private_dacl_sddl(user))
             finally:
                 windows_api.close_handle(handle)
         handle = self._state_handle(paths.loki_state_dir())
@@ -195,7 +235,7 @@ class WindowsBackend:
             for package in sorted(state_writer_sids(self.ledger)):
                 updated = add_package_ace(updated, package, Access.READ_WRITE)
             if updated != current:
-                windows_containers.set_handle_dacl_sddl(handle, updated)
+                windows_api.set_handle_dacl(handle, updated)
         finally:
             windows_api.close_handle(handle)
 
@@ -215,7 +255,7 @@ class WindowsBackend:
                     updated = add_package_ace(current, package, Access.READ_WRITE)
                     if not grants_access(updated, package, Access.READ_WRITE):
                         raise windows_api.WindowsApiError('state permissions deny the recorded runtime: ' + path)
-                    windows_containers.set_handle_dacl_sddl(handle, updated)
+                    windows_api.set_handle_dacl(handle, updated)
             finally:
                 windows_api.close_handle(handle)
 

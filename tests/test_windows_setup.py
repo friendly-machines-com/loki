@@ -421,7 +421,7 @@ class GrantHandleTests(unittest.TestCase):
                 windows_api, "handle_dacl_sddl",
                 return_value=self.EXISTING) as read, \
                 mock.patch.object(
-                    windows_containers, "set_handle_dacl_sddl") as write:
+                    windows_api, "set_handle_dacl") as write:
             self.backend._grant_path(
                 handle, "/work", windows_setup.Access.READ_WRITE, PACKAGE_SID)
         read.assert_called_once_with(handle)
@@ -434,10 +434,72 @@ class GrantHandleTests(unittest.TestCase):
         with mock.patch.object(
                 windows_api, "handle_dacl_sddl", return_value=unchanged), \
                 mock.patch.object(
-                    windows_containers, "set_handle_dacl_sddl") as write:
+                    windows_api, "set_handle_dacl") as write:
             self.backend._grant_path(
                 handle, "/work", windows_setup.Access.READ, PACKAGE_SID)
         write.assert_not_called()
+
+    def test_exact_inherited_recursive_grants_need_no_permission_edit(self):
+        for access in [windows_setup.Access.READ, windows_setup.Access.READ_WRITE]:
+            with self.subTest(access=access):
+                rights = windows_state.access_sddl(access)
+                current = self.EXISTING + f'(A;OICIID;{rights};;;{PACKAGE_SID})'
+                if access is windows_setup.Access.READ_WRITE:
+                    current += f'(A;OICIID;{rights};;;{windows_state.tool_role_sid(PACKAGE_SID)})'
+                with mock.patch.object(windows_api, 'handle_dacl_sddl', return_value=current), \
+                        mock.patch.object(windows_api, 'set_handle_dacl') as write:
+                    self.backend._grant_path(object(), '/work', access, PACKAGE_SID)
+                write.assert_not_called()
+
+    def test_inherited_excess_denials_and_incomplete_inheritance_still_refuse_edits(self):
+        for flags, rights, extra in [
+                ['OICIID', '0x1301BF', ''], ['CIID', 'FRFX', ''],
+                ['OICIIOID', 'FRFX', ''], ['OICINPID', 'FRFX', ''],
+                ['OICIID', 'FRFX', f'(D;;FR;;;{PACKAGE_SID})'],
+                ['OICIID', 'FRFX', f'(A;OICIID;0x1301BF;;;{windows_state.tool_role_sid(PACKAGE_SID)})']]:
+            with self.subTest(flags=flags, rights=rights, extra=extra):
+                current = self.EXISTING + f'(A;{flags};{rights};;;{PACKAGE_SID})' + extra
+                with mock.patch.object(windows_api, 'handle_dacl_sddl', return_value=current), \
+                        mock.patch.object(windows_api, 'set_handle_dacl') as write:
+                    with self.assertRaises(windows_api.WindowsApiError):
+                        self.backend._grant_path(object(), '/work', windows_setup.Access.READ, PACKAGE_SID)
+                write.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == 'win32', 'native inherited directory grants')
+    def test_native_nested_read_grant_keeps_the_inherited_descriptor_unchanged(self):
+        import secrets
+
+        package = windows_api.derive_app_container_sid('Loki.InheritedGrant.' + secrets.token_hex(12))
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as handles:
+            child = os.path.join(root, 'interpreter')
+            os.mkdir(child)
+            parent_handle = windows_api.open_directory_for_acl(root)
+            handles.callback(windows_api.close_handle, parent_handle)
+            child_handle = windows_api.open_directory_for_acl(child)
+            handles.callback(windows_api.close_handle, child_handle)
+            self.backend._grant_path(parent_handle, root, windows_setup.Access.READ, package)
+            before = windows_api.handle_dacl_sddl(child_handle)
+            self.assertTrue(windows_state.grants_access(before, package, windows_setup.Access.READ))
+            with mock.patch.object(windows_api, 'set_handle_dacl',
+                                   side_effect=AssertionError('an inherited no-op must not write permissions')) as write:
+                self.backend._grant_path(child_handle, child, windows_setup.Access.READ, package)
+            write.assert_not_called()
+            self.assertEqual(windows_api.handle_dacl_sddl(child_handle), before)
+
+    def test_handle_application_failure_neither_retries_by_path_nor_closes_the_borrowed_handle(self):
+        handle = object()
+        failure = windows_api.WindowsApiError('grant denied', status=5)
+        with mock.patch.object(windows_api, 'handle_dacl_sddl', return_value=self.EXISTING), \
+                mock.patch.object(windows_api, 'set_handle_dacl', side_effect=failure) as apply, \
+                mock.patch.object(windows_containers, 'set_dacl_sddl') as named, \
+                mock.patch.object(windows_api, 'close_handle') as close:
+            with self.assertRaises(windows_api.WindowsApiError) as refused:
+                self.backend._grant_path(handle, '/work', windows_setup.Access.READ, PACKAGE_SID)
+        self.assertIs(refused.exception, failure)
+        apply.assert_called_once()
+        self.assertIs(apply.call_args.args[0], handle)
+        named.assert_not_called()
+        close.assert_not_called()
 
     def test_refuses_an_object_with_no_dacl(self):
         with mock.patch.object(
@@ -731,7 +793,7 @@ class ManagedStatePolicyTests(unittest.TestCase):
     def test_writable_workspace_grants_both_package_and_tool_role(self):
         backend = windows_setup.WindowsBackend({})
         with mock.patch.object(windows_api, 'handle_dacl_sddl', return_value='D:P'), \
-                mock.patch.object(windows_containers, 'set_handle_dacl_sddl') as write:
+                mock.patch.object(windows_api, 'set_handle_dacl') as write:
             backend._grant_path(123, '/work', windows_state.Access.READ_WRITE, PACKAGE_SID)
         sddl = write.call_args.args[1]
         self.assertTrue(windows_state.grants_access(sddl, PACKAGE_SID, windows_state.Access.READ_WRITE))

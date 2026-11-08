@@ -1,12 +1,11 @@
-"""OS mutation for the Windows container: profile creation and DACLs.
+"""Setup-specific Windows profile lifecycle and pathname DACL mutation.
 
-It lives apart from the shared API so the runtime's own code has no built-in
-way to create a profile or rewrite a DACL.  ``windows_setup`` explains what
-that buys and what it does not.
-
-Nothing here decides *what* to grant -- that is the editor's model, the path
-rules and the user's decision.  These are the calls that carry the decision
-out.
+``windows_setup`` owns grant decisions. Opened-handle DACL updates use the
+shared ``windows_api.set_handle_dacl`` primitive, also needed by editor
+publication and process protection. The pathname setter stays here because
+setup's protected-DACL propagation differs from the shared named setter's
+DACL-only operation. Neither module placement nor these primitives grant
+permission: the process token and the object's DACL enforce that boundary.
 """
 
 from __future__ import annotations
@@ -17,10 +16,10 @@ from ctypes import wintypes
 from .windows_api import (
     ERROR_SUCCESS,
     _converted_dacl,
-    WindowsResourceError,
     SE_FILE_OBJECT,
     SecurityInformation,
     WindowsApiError,
+    WindowsResourceError,
     bind,
     sid_text,
 )
@@ -50,27 +49,6 @@ def set_dacl_sddl(path: str, sddl: str) -> None:
         if status != ERROR_SUCCESS:
             raise WindowsApiError(
                 f"SetNamedSecurityInfoW({path!r}) failed: {status}", status=status)
-
-
-def set_handle_dacl_sddl(handle, sddl: str) -> None:
-    """Set the DACL of the object ``handle`` names, as ``set_dacl_sddl`` would.
-
-    The handle-relative counterpart of ``set_dacl_sddl``: the same descriptor
-    conversion and the same protected-flag rule, applied to the object the
-    handle names.  Keeping both here means a grant that goes through a handle
-    cannot drift from one that goes through a pathname.
-    """
-    set_info = bind("advapi32", "SetSecurityInfo", wintypes.DWORD,
-                    ctypes.c_void_p, ctypes.c_int, wintypes.DWORD,
-                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                    ctypes.c_void_p)
-    with _converted_dacl(sddl) as dacl:
-        flags = SecurityInformation.DACL_SECURITY_INFORMATION
-        if 'P' in sddl.split('(', 1)[0][2:]:
-            flags |= SecurityInformation.PROTECTED_DACL_SECURITY_INFORMATION
-        status = set_info(handle, SE_FILE_OBJECT, flags, None, None, dacl, None)
-        if status != ERROR_SUCCESS:
-            raise WindowsApiError(f"SetSecurityInfo(dacl) failed: {status}")
 
 
 def create_app_container_profile(name: str) -> str:
