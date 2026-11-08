@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 from loki_entrypoints import configure_container, entrypoint
 from response_header_fixtures import isolated_response_headers
-from process_lifecycle_fixtures import close_fixture_connection
+from process_lifecycle_fixtures import close_fixture_connection, observe_fixture
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import file_locks, private_files
@@ -475,17 +475,53 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(os.path.exists(self.path))
         self.assertTrue(self.store.try_save())
 
-    async def test_busy_snapshot_survives_failed_save_and_retry_keeps_observations(self):
+    async def test_exit_save_reports_real_failures_and_keeps_observations(self):
         self.observe()
         await self.store.save()
-        original = Path(self.path).read_bytes()
+        with open(self.path, 'rb') as stream:
+            original = stream.read()
         self.observe(headers={"x-remaining": "5"})
-        with mock.patch.object(file_locks, 'try_lock_exclusive',
-                               side_effect=BlockingIOError):
-            with contextlib.redirect_stderr(io.StringIO()) as errors:
-                await self.store.save_on_exit()
-            self.assertIn("Could not save", errors.getvalue())
-            self.assertEqual(Path(self.path).read_bytes(), original)
+        with mock.patch.object(response_headers.private_files, "open_lock_file_at",
+                               side_effect=OSError("lock unavailable")), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            await self.store.save_on_exit()
+        self.assertIn("Could not save", errors.getvalue())
+        with open(self.path, 'rb') as stream:
+            self.assertEqual(stream.read(), original)
+        self.assertTrue(self.store.dirty)
+        await self.store.save()
+        with contextlib.closing(response_headers.Store(self.path)) as reopened:
+            saved = reopened.snapshot()["endpoints"][0]
+        self.assertEqual(saved["headers"]["x-remaining"]["value"], "5")
+
+    async def test_contended_exit_save_waits_and_cancellation_keeps_observations(self):
+        # Another holder's completion has no guaranteed wall time, so the
+        # exit save waits for the lock instead of an arbitrary grace budget;
+        # cancellation stops the wait and leaves the observations retryable.
+        self.observe()
+        await self.store.save()
+        with open(self.path, 'rb') as stream:
+            original = stream.read()
+        self.observe(headers={"x-remaining": "5"})
+        contended = asyncio.Event()
+
+        def hold(_fd):
+            contended.set()
+            raise BlockingIOError
+
+        with mock.patch.object(file_locks, 'try_lock_exclusive', side_effect=hold):
+            task = asyncio.create_task(self.store.save())
+            try:
+                await observe_fixture(contended.wait(), task)
+                self.assertTrue(self.store.dirty)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        with open(self.path, 'rb') as stream:
+            self.assertEqual(stream.read(), original)
         await self.store.save()
         with contextlib.closing(response_headers.Store(self.path)) as reopened:
             saved = reopened.snapshot()["endpoints"][0]

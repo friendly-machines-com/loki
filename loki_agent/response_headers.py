@@ -305,13 +305,14 @@ class Store:
     async def save(self):
         # ACP and orderly shutdown may yield only between complete attempts,
         # never while holding a publication lock or resetting dirty state.
+        # Waiting for a competing holder deliberately has no duration: its
+        # completion has no guaranteed wall time, and an arbitrary grace
+        # budget would give up on a lock that is about to free. The
+        # synchronous terminal path uses try_save() instead, where
+        # nonblocking "currently held" reporting is the only option.
         if self.try_save():
             return
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 0.25
         while True:
-            if loop.time() >= deadline:
-                raise OSError("response status snapshot is busy")
             await asyncio.sleep(0.01)
             if self.try_save():
                 return

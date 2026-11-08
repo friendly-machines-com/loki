@@ -364,14 +364,15 @@ async def update_user_settings(changes, *, file=None) -> Settings:
         facts = private_files.information(lock_fd)
         if not facts.regular or facts.reparse_point:
             raise SettingsError("Settings lock is not a regular file")
-        deadline = asyncio.get_running_loop().time() + 0.25
+        # Waiting for the holder deliberately has no duration: another
+        # writer's completion has no guaranteed wall time, and an arbitrary
+        # grace budget would report "busy" for a lock that is about to free.
+        # Cancellation stops the wait.
         while True:
             try:
                 file_locks.try_lock_exclusive(lock_fd)
                 break
             except BlockingIOError:
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise SettingsError("Settings file is busy")
                 await asyncio.sleep(0.01)
         parser = read_ini(target, directory_fd=directory_fd, name=name)
         _overrides(parser, target)

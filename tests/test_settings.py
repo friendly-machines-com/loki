@@ -192,14 +192,24 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         await self.update({'terminal.show_bash_stdout': False})
         self.assertFalse((await self.load()).terminal.show_bash_stdout)
 
-    async def test_lock_contention_times_out_without_changing_file(self):
+    async def test_lock_contention_waits_for_the_holder_without_a_duration(self):
+        # Another writer's completion has no guaranteed wall time, so the
+        # update waits for the lock instead of an arbitrary grace budget;
+        # a held write must not produce a "busy" failure.
         await self.update({"terminal.show_bash_stdout": False})
-        original = self.file.read_bytes()
-        with mock.patch.object(file_locks, "try_lock_exclusive", side_effect=BlockingIOError):
-            with self.assertRaisesRegex(settings.SettingsError, "busy"):
-                await self.update({"terminal.show_bash_stdout": True})
-        self.assertEqual(self.file.read_bytes(), original)
-        await self.update({"terminal.show_bash_stdout": True})
+        real_try_lock = file_locks.try_lock_exclusive
+        attempts = []
+
+        def contend(fd):
+            attempts.append(fd)
+            if len(attempts) < 3:
+                raise BlockingIOError
+            return real_try_lock(fd)
+
+        with mock.patch.object(file_locks, "try_lock_exclusive", side_effect=contend):
+            await self.update({"terminal.show_bash_stdout": True})
+        self.assertEqual(len(attempts), 3)
+        self.assertTrue((await self.load()).terminal.show_bash_stdout)
 
     async def test_cancelled_lock_wait_releases_resources(self):
         await self.update({"terminal.show_bash_stdout": False})
