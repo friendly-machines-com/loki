@@ -19,7 +19,6 @@ def classify(events):
             for block in replays.classify_event(event)]
 
 
-
 def user_message(text):
     return formats.message_item("user", text)
 

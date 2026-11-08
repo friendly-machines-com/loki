@@ -112,4 +112,3 @@ def classify_event(event: dict, *, show_reasoning=False):
              f"[Session event: {event_type or 'unknown'}]\n"
              f"{pformat(event, width=100)}",
              ("session_event", str(event_type)))]
-
