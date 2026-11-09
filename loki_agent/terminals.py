@@ -1330,6 +1330,27 @@ def _tilde_parameters(parameters):
     return fields[0][0], modifiers, event_type
 
 
+def _modify_other_keys_parameters(parameters):
+    """Decode xterm modifyOtherKeys format 1: CSI 27;modifier;code ~.
+
+    Terminals send this without any protocol negotiation: foot maps a
+    shifted Return to CSI 27;2;13~ in its default configuration, and xterm
+    plus mintty send it with modifyOtherKeys mode 2 enabled. The leading 27
+    is a fixed marker, not a key code, so this three-field tilde form cannot
+    collide with the one- and two-field legacy tilde keys.
+    """
+    fields = _numeric_parameter_fields(parameters)
+    if fields is None or len(fields) != 3:
+        return None
+    if fields[0] != [27] or len(fields[2]) != 1 or fields[2][0] is None:
+        return None
+    decoded = _modifier_field(fields[1])
+    if decoded is None:
+        return None
+    modifiers, event_type = decoded
+    return fields[2][0], modifiers, event_type
+
+
 def _unicode_scalar(code):
     return (
         isinstance(code, int)
@@ -1460,6 +1481,21 @@ def decode_legacy_control_sequence(sequence):
         return True, None
 
     if sequence.final == ord("~"):
+        # modifyOtherKeys format 1 arrives before the legacy tilde keys so a
+        # three-field sequence is never mistaken for one of them.
+        decoded = _modify_other_keys_parameters(sequence.parameters)
+        if decoded is not None:
+            number, modifiers, event_type = decoded
+            modifiers &= ~KITTY_LOCK_MODIFIERS
+            # Only Shift-Enter is acted on; other modified Enter forms
+            # (Alt/Ctrl, in any spelling) and modified text keys stay inert.
+            if (
+                    event_type == KittyEventType.RELEASE
+                    or number != KittyKeyCode.ENTER
+                    or modifiers != KittyModifier.SHIFT):
+                return True, None
+            return True, KeyEvent("SHIFT_ENTER")
+
         decoded = _tilde_parameters(sequence.parameters)
         if decoded is None:
             return False, None
@@ -1739,6 +1775,14 @@ class AsyncKeyReader:
 
         if key.code == KittyKeyCode.ENTER and not modifiers:
             self._queue_event(KeyEvent("ENTER"))
+            return
+        if (
+                key.code == KittyKeyCode.ENTER
+                and modifiers == KittyModifier.SHIFT):
+            # Kitty keyboard protocol Shift-Enter (CSI 13;2u; a release
+            # never reaches this handler). Enter alone submits; with Shift
+            # it inserts a layout newline.
+            self._queue_event(KeyEvent("SHIFT_ENTER"))
             return
         if key.code == KittyKeyCode.BACKSPACE and not modifiers:
             self._queue_event(KeyEvent("BACKSPACE"))
@@ -2058,6 +2102,11 @@ class PromptController:
                     # print() This would unnecessarily scroll
                     self.terminal.flush()
                 return '' if unchanged_seed else self.buffer.text()
+            if event.kind == "SHIFT_ENTER":
+                # Shift-Enter inserts a layout newline; Enter alone submits.
+                # The buffer already stores pasted newlines, so this is the
+                # same state a paste produces.
+                self.buffer.insert("\n")
             if event.kind not in ["RESIZE", "MODE_CYCLE", "PASTE_START", "PASTE_END"]:
                 self.initial_text_untouched = False
             if event.kind == "TEXT":

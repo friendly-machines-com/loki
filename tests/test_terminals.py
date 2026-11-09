@@ -720,6 +720,43 @@ class AsyncKeyReaderTests(unittest.TestCase):
             [terminals.KeyEvent("MODE_CYCLE")],
         )
 
+    def test_decodes_shift_enter_from_both_modern_encodings(self):
+        reader = terminals.AsyncKeyReader(fd=0)
+
+        # Kitty keyboard protocol: CSI 13;2u. Presses and repeats queue the
+        # key; releases are ignored like every other kitty key event.
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[13;2u"),
+            [terminals.KeyEvent("SHIFT_ENTER")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[13;2:1u"),
+            [terminals.KeyEvent("SHIFT_ENTER")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[13;2:2u"),
+            [terminals.KeyEvent("SHIFT_ENTER")],
+        )
+        self.assertEqual(feed_bytes(reader, b"\x1b[13;2:3u"), [])
+
+        # xterm modifyOtherKeys format 1: CSI 27;2;13~. foot sends Shift-Enter
+        # this way in its default configuration, without any negotiation.
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[27;2;13~"),
+            [terminals.KeyEvent("SHIFT_ENTER")],
+        )
+
+        # Other modified Enter spellings stay inert so they can never submit.
+        for sequence in (
+                b"\x1b[27;3;13~", b"\x1b[27;5;13~", b"\x1b[27;16;13~",
+                b"\x1b[13;3u", b"\x1b[13;5u", b"\x1b[27;2;9~"):
+            self.assertEqual(feed_bytes(reader, sequence), [])
+
+        # Unmodified Enter keeps every existing spelling.
+        self.assertEqual(feed_bytes(reader, b"\r"), [terminals.KeyEvent("ENTER")])
+        self.assertEqual(feed_bytes(reader, b"\n"), [terminals.KeyEvent("ENTER")])
+        self.assertEqual(feed_bytes(reader, b"\x1b[13u"), [terminals.KeyEvent("ENTER")])
+
     def test_kitty_csi_u_uses_configured_interrupt_character(self):
         self.control_settings.return_value = (
             DEFAULT_CONTROL_BYTES[0], DEFAULT_CONTROL_BYTES[1], frozenset((0x18,)))
@@ -1052,6 +1089,22 @@ class PromptControllerTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(
                     self.read_with_events(events, initial_text="filter "), expected)
+
+    def test_shift_enter_inserts_a_newline_and_enter_still_submits(self):
+        self.assertEqual(
+            self.read_with_events([
+                terminals.KeyEvent("TEXT", "first"),
+                terminals.KeyEvent("SHIFT_ENTER"),
+                terminals.KeyEvent("TEXT", "second"),
+                terminals.KeyEvent("ENTER"),
+            ]),
+            "first\nsecond")
+        self.assertEqual(
+            self.read_with_events([
+                terminals.KeyEvent("SHIFT_ENTER"),
+                terminals.KeyEvent("ENTER"),
+            ]),
+            "\n")
 
     def test_normal_seed_is_empty_until_the_user_edits_it(self):
         def read(events):
