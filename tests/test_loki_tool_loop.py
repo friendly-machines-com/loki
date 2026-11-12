@@ -2048,7 +2048,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
         self.assertEqual(
             saved["session_state"]["reasoning_effort"], "high")
         self.assertIn(
-            "Effort: high, Context: unknown; /model, /thinking",
+            "Effort: high, Context: unknown; /compact, /model, /thinking",
             terminal_frontend.status_text(),
         )
 
@@ -3371,6 +3371,8 @@ class StatusTextTests(unittest.TestCase):
                 self.assertNotIn("/effort", remote)
                 self.assertIn("/thinking", remote)
                 self.assertIn("/trace thinking", remote)
+                self.assertIn("/compact", remote)
+                self.assertNotIn("/compact", local)
 
     def test_status_text_shows_none_when_no_model_is_selected(self):
 
@@ -3379,7 +3381,7 @@ class StatusTextTests(unittest.TestCase):
                                return_value=None):
             text = terminal_frontend.status_text()
 
-        self.assertIn("Model: none, Context: unknown; /model", text)
+        self.assertIn("Model: none, Context: unknown; /compact, /model", text)
         self.assertNotIn("Model: ;", text)
 
     def test_activity_status_redraws_only_for_changed_counts(self):
@@ -3428,7 +3430,7 @@ class StatusTextTests(unittest.TestCase):
             text,
             "Remote: API: example.test:8443/base/path, Model: model-x, "
             "Context: unknown; "
-            "/model, /thinking, /trace thinking, /status, /account\n"
+            "/compact, /model, /thinking, /trace thinking, /status, /account\n"
             f"Local: CWD: {loki.STARTUP_CWD}, turn: running, "
             f"mode: {loki.current_agent_mode()}; /todo:0/0, /queue{{txt:2,img:1}}, "
             "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",

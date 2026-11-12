@@ -599,6 +599,7 @@ class ToolHookPipeline:
         # share that object's accounting, not another counter in this list.
         # Final observers stay in turn_end_hooks and cannot authorize inference.
         self.turn_error_hooks = []
+        self.pre_compact_hooks = []
 
     def add_pre(self, hook_id, callback, on_error="deny", matcher=None):
         self.pre_hooks.append(RegisteredHook(
@@ -615,7 +616,46 @@ class ToolHookPipeline:
     @property
     def has_custom_hooks(self):
         return bool(self.pre_hooks or self.gate_hooks or self.post_hooks
-                    or self.turn_end_hooks or self.turn_error_hooks)
+                    or self.turn_end_hooks or self.turn_error_hooks or self.pre_compact_hooks)
+
+    async def prepare_compaction(self, payload, *, cancel_event, file_observations):
+        """Run PreCompact policy once per operation, OUTSIDE transport retries.
+
+        loki.compact_context_async supplies saved-log identity/path, not credentials.
+        That path can reveal sensitive archived history to trusted user-configured
+        commands. Pre-tool transformations and turn-error retry decisions are not
+        context producers either; this gate only allows/denies, never accepts events,
+        replacements or instructions. Empty successful output follows the runner's
+        existing continue convention; malformed output/process failure denies.
+
+        Borrow the Session's file-observation dictionary only for invalidation.
+        Declared workspace effects invalidate BEFORE launch so failure/cancellation
+        cannot resurrect stale read-before-write authority. Reported changed paths
+        also conservatively clear it: this infrequent gate needs no new pathname
+        interpretation or narrower cache. Hook filesystem effects are not rolled
+        back on denial. _run_hook_command owns its existing sanitized creator,
+        output limits, configured timeout/cancellation, stderr and joined cleanup;
+        no hook JSON gains a launcher, credential capability or Session authority.
+        """
+        for hook in self.pre_compact_hooks:
+            if cancel_event.is_set():
+                raise recoveries.Cancelled()
+            if hook.config.workspace_side_effects:
+                file_observations.clear()
+            result = await _run_hook_command(
+                hook.config.command, payload, hook.config.cwd, hook.config.timeout_ms,
+                cancel_event=cancel_event, create_exec=hook.create_exec, stderr_reporter=hook.stderr_reporter)
+            changed, invalidate_all = hook._side_effects(result)
+            if changed or invalidate_all:
+                file_observations.clear()
+            if set(result) - {"action", "message", "changed_paths"}:
+                raise HookExecutionError("PreCompact accepts only an allow/deny decision and file-effect bookkeeping")
+            action = result.get("action", "continue")
+            message = result.get("message")
+            if action not in ["continue", "deny"] or (message is not None and not isinstance(message, str)):
+                raise HookExecutionError("PreCompact returned an invalid allow/deny decision")
+            if action == "deny":
+                raise HookExecutionError(message or "Context compaction was denied by a configured hook.")
 
     async def recover_turn(self, payload, *, cancel_event):
         """Run policy in config order; no decision here executes a retry.
@@ -1057,7 +1097,9 @@ def build_hook_pipeline(definitions, *, create_exec, stderr_reporter=None):
     pipeline = ToolHookPipeline()
     for config in definitions:
         hook = ExternalHook(config, create_exec=create_exec, stderr_reporter=stderr_reporter)
-        if config.phase == "turn_end":
+        if config.phase == "pre_compact":
+            pipeline.pre_compact_hooks.append(hook)
+        elif config.phase == "turn_end":
             pipeline.turn_end_hooks.append(hook)
         elif config.phase == "turn_error":
             pipeline.turn_error_hooks.append(hook)

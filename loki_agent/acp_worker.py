@@ -9,7 +9,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-from . import connections, model_requests, paths, savefiles
+from . import compactions, connections, model_requests, paths, savefiles
 from . import (
     acp_commands,
     acps,
@@ -837,10 +837,11 @@ class Worker:
                 code=acps.INVALID_PARAMS)
         user_text = self._prompt_text(params)
         command = acp_commands.parse(user_text)
-        if command is None or command[0] == "!":
-            # Reset once, at admission, before a task is scheduled or a local
-            # bang command awaits. Later cancellation belongs to this turn.
-            # Local-only commands must not change turn cancellation state.
+        if command is None or command[0] in ["!", "compact"]:
+            # Reset once at admission, before scheduling or a network command
+            # awaits. /compact needs the same cancellation snapshot as inference;
+            # the other slash-local shortcuts deliberately keep their old signal.
+            # Overlap rejection above still owns the whole operation/reply.
             # A following preference update must not change the admitted
             # turn's first request; continuations reuse this same snapshot.
             if thinking is None:
@@ -874,6 +875,30 @@ class Worker:
         # text falls through to the model's Skill tool.
         outcome = None
         command = acp_commands.parse(user_text)
+        if command is not None and command[0] == "compact":
+            # The usual local-command return skips cancellation handling and
+            # ordinary-turn persistence. Compaction is instead a busy-gated
+            # network operation: the shared owner saves before installation,
+            # and no user message, image consumption or turn-end hook is made.
+            # Check cancellation BEFORE entry (including scheduled-before-start),
+            # never after success: a post-publication cancel cannot undo commit.
+            stop_reason = "end_turn"
+            try:
+                if self.cancel_event.is_set():
+                    raise recoveries.Cancelled()
+                outcome = await acp_commands.run(
+                    user_text, self.session, cancel_event=self.cancel_event,
+                    thinking=thinking, allow_ask=self.can_ask_user)
+                text = outcome.text
+            except recoveries.Cancelled:
+                text, stop_reason = "Context compaction cancelled.", "cancelled"
+            except asyncio.CancelledError:
+                text, stop_reason = "Context compaction cancelled.", "cancelled"
+            except Exception as error:
+                text = "Context compaction failed: " + compactions.format_error(error)
+            if text:
+                self.write(acps.notification("session/update", acp_events.agent_message_chunk(self.session_id, text)))
+            return {"stopReason": stop_reason}
         cancelled_bang = (command is not None and command[0] == "!"
                           and self.cancel_event.is_set())
         if not cancelled_bang and user_text.lstrip().startswith(("/", "!")):

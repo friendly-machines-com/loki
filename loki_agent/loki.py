@@ -24,6 +24,7 @@ from dataclasses import replace
 from functools import partial
 
 from . import connections
+from . import compactions
 from . import model_requests
 from . import recoveries
 from . import files
@@ -1568,6 +1569,20 @@ def record_agent_mode_instruction():
     mark_chat_log_dirty()
 
 
+def offered_tools(allowed=None, *, allow_ask=False):
+    """Capture the ordinary tool definitions for sampling OR manual compaction.
+
+    The tool loop's former inline construction cannot be borrowed by a checkpoint
+    request without starting sampling/dispatch. Share only this projection, not a
+    second registry or a fake tool turn. Frontends supply their existing mode/Ask
+    admission; these definitions never grant compaction permission to execute tools.
+    """
+    tools = TOOLS if allowed is None else [spec["definition"] for name, spec in TOOL_REGISTRY.items() if name in allowed]
+    if not allow_ask:
+        tools = tool_contracts.without_ask_tool(tools)
+    return skills.tools_for_model(tools, LOKI_CONFIG_DIR)
+
+
 def _turn_is_refusal(turn: formats.DecodedTurn) -> bool:
     stop_reason = str(turn.metadata.get("stop_reason") or "").lower()
     if stop_reason in ["refusal", "content_filter", "safety"]:
@@ -1638,17 +1653,7 @@ async def run_tool_loop_async(
     # only the turn event here would miss Session/broker loss during a request.
     advertised_tools = None
     if chat_fn is None:
-        advertised_tools = (
-            TOOLS if allowed is None else [
-                spec["definition"]
-                for name, spec in TOOL_REGISTRY.items()
-                if name in allowed
-            ])
-        if ask_user is None:
-            # Without an interactive seam there is nobody to answer, so
-            # the model is never offered the question tool at all.
-            advertised_tools = tool_contracts.without_ask_tool(advertised_tools)
-        advertised_tools = skills.tools_for_model(advertised_tools, LOKI_CONFIG_DIR)
+        advertised_tools = offered_tools(allowed, allow_ask=ask_user is not None)
 
         def chat_fn(items, on_text_delta=None, *, codex_turn_state, on_reasoning_delta=None):
             kwargs = {
@@ -2723,10 +2728,25 @@ def new_chat_log(filename):
     session.chat_log_dirty = True
 
 
-def save_chat_log():
+def save_chat_log(*, events=None):
+    """Publish current history or an explicit, still-uninstalled candidate.
+
+    compact_context_async must save before changing Session.transcript_items;
+    temporarily installing history or marking dirty would expose an uncommitted
+    window to other consumers. An explicit candidate therefore bypasses the clean
+    shortcut, requires a selected path and reports actual publication. Reuse the
+    atomic writer and CURRENT preference/todo serialization, not reset/resume APIs.
+    Exceptions leave candidate installation to the caller (which must not install
+    on failure); filesystem effects already exposed by a failing writer are not
+    claimed rolled back. No await splits publication and caller installation.
+    """
     session = current_session()
 
-    if session.chat_log_path is None or not session.chat_log_dirty:
+    if session.chat_log_path is None:
+        if events is not None:
+            raise compactions.CompactionError("Select a saved conversation before compacting context.")
+        return False
+    if events is None and not session.chat_log_dirty:
         return False
 
     state = dict(session.session_state)
@@ -2754,7 +2774,7 @@ def save_chat_log():
         else:
             state[name] = value
     content = savefiles.serialize_chat_log(
-        session.transcript_items,
+        session.transcript_items if events is None else events,
         session.session_todos,
         state,
         toolsets=session.session_toolsets,
@@ -2764,6 +2784,86 @@ def save_chat_log():
     session.session_state = state
     session.chat_log_dirty = False
     return True
+
+
+async def compact_context_async(*, cancel_event, thinking=None, allowed=None, allow_ask=False):
+    """Session-owned manual operation; frontends retain admission/busy ownership.
+
+    Ordinary tool turns append responses before dispatch and ordinary clean saves
+    may skip: neither can commit a checkpoint candidate safely. Capture identity,
+    a private active-window/config snapshot and borrowed request authority before
+    awaits. The canonical archive is append-only while this frontend-owned operation
+    runs; identity/length and selected-window equality detect replacement/appends or
+    active edits. Configuration equality also catches in-place model/profile edits.
+    A lease refresh is NOT a conversation change. Recheck after policy and before
+    commit; stale/closed/cancelled operations cannot install their candidate.
+
+    Publish existing history first, even when clean, to reject an unsaveable session
+    before billing rather than trusting a pathname/access precheck. PreCompact runs
+    once with saved-log metadata, outside prepared transport retries. Its declared
+    filesystem effects are not rolled back. All candidate state stays local across
+    hook/request awaits. Immediately after final checks, save the explicit candidate
+    THEN install it with no await between them. That is cancellation's commit boundary:
+    a later cancellation cannot relabel success or undo publication. Preserve todos,
+    cwd, jobs, staged input, file observations (except declared hook effects), model,
+    conversation identity and current preferences; reset/resume helpers would not.
+    """
+    if not isinstance(cancel_event, asyncio.Event):
+        raise TypeError("cancel_event must be an asyncio.Event")
+    session = current_session()
+    original_config = session.runtime_config
+    context = replace(_model_request_context(), config=copy.deepcopy(original_config))
+    compactions.require_v2(context)
+    path = session.chat_log_path
+    if not isinstance(path, str) or not path:
+        raise compactions.CompactionError("Select a saved conversation before compacting context.")
+    archive = session.transcript_items
+    length = len(archive)
+    active = copy.deepcopy(formats.active_events(archive))
+    formats.validate_replacement(active)
+    identity = session.conversation_id
+    authority = session.credential_authority
+    pipeline = TOOL_HOOK_PIPELINE
+    thinking = thinking if thinking is not None else capture_turn_settings()
+    tools = copy.deepcopy(offered_tools(allowed, allow_ask=allow_ask))
+    task = asyncio.current_task()
+
+    def cancelled():
+        return cancel_event.is_set() or not session.active or bool(task.cancelling())
+
+    def recheck():
+        if cancelled():
+            raise recoveries.Cancelled()
+        if (current_session() is not session or session.conversation_id != identity
+                or session.chat_log_path != path or session.transcript_items is not archive or len(archive) != length
+                or session.runtime_config is not original_config or original_config != context.config
+                or session.credential_authority is not authority or formats.active_events(archive) != active):
+            raise compactions.CompactionError("The conversation or selected model changed; context was not compacted.")
+
+    recheck()
+    if not save_chat_log(events=archive):
+        raise compactions.CompactionError("The conversation could not be saved; context was not compacted.")
+    await pipeline.prepare_compaction(
+        {"event": "pre_compact", "operation": "remote_v2", "conversation_id": identity,
+         # Preserve the log's opaque key AND its lookup context: a configured
+         # hook cwd need not be Loki's fixed process cwd. Do not absolutize it.
+         "chat_log_path": path, "chat_log_cwd": STARTUP_CWD,
+         "model": context.config.model, "provider": context.config.chat_provider.provider_id},
+        cancel_event=cancel_event, file_observations=session.file_observations)
+    recheck()
+    checkpoint = await compactions.request_v2(context, active, tools, thinking, cancelled)
+    window = compactions.build_v2_window(active, checkpoint)
+    # Projection validates origin/profile compatibility before a candidate can
+    # replace history. The provider owns framing; saved provenance cannot choose it.
+    context.config.chat_provider.streaming_chat_payload(window, tools, context.config.model)
+    record = formats.context_replace_event(window)
+    candidate = archive + [record]
+    recheck()
+    if not save_chat_log(events=candidate):
+        raise compactions.CompactionError("The compacted context could not be saved; previous context remains active.")
+    session.transcript_items = candidate
+    session.context_snapshot(live=True)
+    return "Context compacted. Earlier messages remain in the transcript."
 
 
 def mark_chat_log_dirty():

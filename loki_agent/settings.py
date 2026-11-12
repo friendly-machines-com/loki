@@ -75,6 +75,10 @@ class HookConfigurationError(SettingsError):
 _HOOK_PHASES = {
     "pre_tool_call": [None, "deny"],
     "pre_tool_gate": [None, "deny"],
+    # Manual compaction policy is a fail-closed allow/deny gate, not a context
+    # producer. Only trusted user configuration can install it; runtime input
+    # and saved/provider JSON never create hooks or relax its error default.
+    "pre_compact": [None, "deny"],
     "post_tool_call": [None, "continue"],
     "turn_end": [None, None],
     "turn_error": [None, None],
@@ -239,8 +243,8 @@ def _hooks(parser, report):
                     raise HookConfigurationError(
                         f"{location}: {name} is required and must not be empty")
                 continue
-            if phase in ["turn_end", "turn_error"] and name in [
-                    "tools", "on_error", "workspace_side_effects"]:
+            if ((phase in ["turn_end", "turn_error"] and name in ["tools", "on_error", "workspace_side_effects"])
+                    or (phase == "pre_compact" and name == "tools")):
                 raise HookConfigurationError(f"{location} does not support {name}")
             try:
                 codec = definition.metadata.get("codec")
@@ -259,6 +263,8 @@ def _hooks(parser, report):
             values[name] = value
         if values["on_error"] not in [None, "deny", "continue"]:
             raise HookConfigurationError(f"{location}: on_error must be 'deny' or 'continue'")
+        if phase == "pre_compact" and values["on_error"] != "deny":
+            raise HookConfigurationError(f"{location}: pre_compact errors must deny compaction")
         if phase == "post_tool_call" and values["on_error"] == "deny":
             raise HookConfigurationError(
                 f"{location}: on_error cannot be 'deny' for post_tool_call")

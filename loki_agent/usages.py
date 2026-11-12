@@ -125,6 +125,16 @@ class ContextTracker:
             self._historical = not live
         for index in range(self._processed, len(transcript)):
             event = transcript[index]
+            if event.get("type") == "context_replace":
+                # Manual compaction replaced inference input: every earlier
+                # observation now measures a different window, even on resume.
+                # The nested checkpoint's usage is compaction billing, NOT an
+                # observation of the installed context. Do not descend into it
+                # or publish a fake zero to ACP; wait for an ordinary response.
+                self._usage = None
+                self._boundary = None
+                self._historical = True
+                continue
             if event.get("type") != "model_response":
                 continue
             event_identity = (

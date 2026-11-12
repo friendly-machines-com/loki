@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 TRANSCRIPT_SCHEMA = "day-agent.session.v4"
+REPLACEMENT_SCHEMA = "day-agent.session.v5"
 OPENAI_CHAT = "openai_chat"
 ANTHROPIC_MESSAGES = "anthropic_messages"
 OPENAI_RESPONSES = "openai_responses"
@@ -224,6 +225,22 @@ def provider_operation_item(call_id, name, input_value, output=None, *,
     if protocol_data:
         item["protocol_data"] = _copy(protocol_data)
     return item
+
+
+def compaction_item(value):
+    """Native checkpoint DATA, copied without changing its fields or order.
+
+    Responses and Anthropic decoders lift this into an ordered response peer,
+    rather than losing it in an unknown-output wrapper. Their payloads differ:
+    encrypted state is not required for every provider, and Anthropic can report
+    a null/failed block. Usability belongs to the requesting operation. Inline,
+    V2 and standalone contracts make different context-selection decisions;
+    receiving this item alone never deletes history. Readable summary text is
+    provider data, never newly authored system/developer authority.
+    """
+    if not isinstance(value, dict) or value.get("type") != "compaction":
+        raise TranscriptFormatError("expected a native compaction item")
+    return _copy(value)
 
 
 def model_response_event(protocol, items, *, provider=None, endpoint=None,
@@ -492,7 +509,7 @@ def _event_items(event):
 
 
 def projection_target(protocol, *, provider_id=None, provider_name=None,
-                      endpoint=None, model=None):
+                      endpoint=None, model=None, openai_request_profile=None):
     """Describe the concrete connection receiving a projection.
 
     Opaque continuation data is safe to replay only to the connection that
@@ -500,13 +517,44 @@ def projection_target(protocol, *, provider_id=None, provider_name=None,
     providers can implement the same wire format while using incompatible
     signatures, encrypted reasoning payloads, and provider-scoped IDs.
     """
-    return {
+    target = {
         "protocol": protocol,
         "provider_id": provider_id,
         "provider_name": provider_name,
         "endpoint": endpoint,
         "model": model,
     }
+    if openai_request_profile is not None:
+        target["openai_request_profile"] = _copy(openai_request_profile)
+    return target
+
+
+def _require_checkpoint_replay(event, protocol, target):
+    """Reject loss of selected opaque state instead of the native-output fallback.
+
+    All three provider projectors call this before portable/foreign projection.
+    Protocol equality cannot authorize replay to another endpoint/model/profile.
+    The selected Provider owns outgoing framing; saved provenance only restricts
+    reuse and cannot install headers or choose a profile. Isolated codec helpers
+    may omit a target for same-protocol round trips; runtime Providers never do.
+    A failed match is an error, not permission to discard a checkpoint or revive
+    archived context. Selected-model identity is requested_model when available;
+    a backend's reported model alias is an observation, not a new selection.
+    """
+    if not any(item.get("type") == "compaction" for item in event.get("items", [])):
+        return
+    if event.get("protocol") != protocol or protocol not in [OPENAI_RESPONSES, ANTHROPIC_MESSAGES]:
+        raise ProjectionError("the selected connection cannot replay this compaction checkpoint")
+    if target is None:
+        return
+    origin_model = event.get("requested_model", event.get("model"))
+    if (not event.get("endpoint") or event.get("endpoint") != target.get("endpoint")
+            or not origin_model or origin_model != target.get("model")
+            or event.get("provider") != (target.get("provider_id") or target.get("provider_name"))
+            or target.get("protocol") != protocol
+            or _protocol_fields(event, "loki").get("openai_request_profile")
+            != target.get("openai_request_profile")):
+        raise ProjectionError("the selected connection or model cannot replay this compaction checkpoint")
 
 
 def _native_replay_allowed(event, protocol, target):
@@ -585,7 +633,7 @@ def response_tool_calls(value):
 def pending_tool_calls(events):
     pending = {}
     order = []
-    for event in events or []:
+    for event in active_events(events or []):
         for item in _event_items(event):
             if is_app_tool_call(item):
                 call_id = tool_call_id(item)
@@ -641,6 +689,8 @@ def _validate_response(event, index):
             "must be a boolean or null")
     response_calls = set()
     for item in items:
+        if item.get("type") == "context_replace":
+            raise TranscriptFormatError("context replacement must be a top-level event, not a response item")
         if item.get("type") == "provider_operation":
             for field_name in ["call_id", "name"]:
                 value = item.get(field_name)
@@ -659,6 +709,65 @@ def _validate_response(event, index):
                 f"event {index} contains duplicate function call "
                 f"{call_id!r}")
         response_calls.add(call_id)
+
+
+def validate_replacement(events):
+    """Validate one finished flat inference window, not a producer's authority.
+
+    context_replace_event and log loading share this structural check. Ordinary
+    event validation also permits a pending tool turn; a checkpoint boundary must
+    instead contain settled call/result pairs. No nested replacement/reference
+    graph is accepted, so selection and replay need no recursive history walk.
+    The V2 producer separately owns retention and instruction/origin constraints;
+    accepting structure is not a claim of semantic completeness.
+    """
+    if not isinstance(events, list) or any(
+            not isinstance(event, dict) or event.get("type") == "context_replace" for event in events):
+        raise TranscriptFormatError("replacement events must be a flat canonical list")
+    validate_events(events)
+    for event in events:
+        if event.get("type") == "message" and (
+                event.get("role") not in ["system", "developer", "user", "assistant"]
+                or not isinstance(event.get("content"), list)
+                or any(not isinstance(block, dict) for block in event["content"])):
+            raise TranscriptFormatError("replacement messages must have canonical roles and content blocks")
+    if pending_tool_calls(events):
+        raise TranscriptFormatError("replacement events contain unresolved tool calls")
+    return events
+
+
+def context_replace_event(events):
+    """Own a complete selected-window snapshot alongside the untouched archive.
+
+    Manual V2 needs local reconstruction in addition to the provider checkpoint;
+    standalone and inline contracts make different choices, so native output alone
+    cannot define future inference input. Complete snapshots keep resume independent
+    of policy changes and avoid reference/cursor graph ownership. This deliberately
+    duplicates retained prefixes on disk (and copies their objects here); full JSON
+    saves and archived tool bodies still cost disk/RAM. This is prompt compaction,
+    not storage compaction. No hook runs on load. The new top-level control record
+    requires v5; ordinary logs remain v4 with the same existing item shapes.
+    """
+    validate_replacement(events)
+    return {"type": "context_replace", "events": _copy(events)}
+
+
+def active_events(events):
+    """Return the latest selected window plus its suffix in a fresh list.
+
+    Provider projections and pending-tool checks need inference context; transcript
+    and prompt-history replay keep walking the archive. Borrow the selected event
+    objects read-only, but ALWAYS copy the list container: appending a new prompt
+    must never mutate a persisted snapshot. There is no second Session history,
+    cache or epoch to synchronize. Invalid stored windows fail rather than falling
+    back to silently different history.
+    """
+    for index in range(len(events) - 1, -1, -1):
+        event = events[index]
+        if event.get("type") == "context_replace":
+            selected = validate_replacement(event.get("events"))
+            return list(selected) + events[index + 1:]
+    return list(events)
 
 
 def validate_events(events):
@@ -696,6 +805,12 @@ def validate_events(events):
             matches.pop()
             if not matches:
                 pending.pop(call_id, None)
+        elif event_type == "context_replace":
+            if set(event) != {"type", "events"}:
+                raise TranscriptFormatError("context replacement contains unsupported fields")
+            if pending:
+                raise TranscriptFormatError("cannot replace context with unresolved tool calls")
+            validate_replacement(event.get("events"))
         elif event_type != "message":
             raise TranscriptFormatError(
                 f"event {index} has unknown type {event_type!r}")
@@ -712,7 +827,8 @@ def new_log_blob(events, session_todos, toolsets=None):
             or any(not isinstance(toolset, list) for toolset in toolsets)):
         raise TranscriptFormatError("toolsets must be a list of lists")
     return {
-        "schema": TRANSCRIPT_SCHEMA,
+        "schema": (REPLACEMENT_SCHEMA if any(event.get("type") == "context_replace" for event in events)
+                   else TRANSCRIPT_SCHEMA),
         "events": _copy(events),
         "toolsets": _copy(toolsets),
         "session_todos": _copy(session_todos),
@@ -720,11 +836,13 @@ def new_log_blob(events, session_todos, toolsets=None):
 
 
 def load_log_blob(blob):
-    if not isinstance(blob, dict) or blob.get("schema") != TRANSCRIPT_SCHEMA:
+    if not isinstance(blob, dict) or blob.get("schema") not in [TRANSCRIPT_SCHEMA, REPLACEMENT_SCHEMA]:
         raise TranscriptFormatError(
-            f"expected chat log schema {TRANSCRIPT_SCHEMA!r}")
+            f"expected chat log schema {TRANSCRIPT_SCHEMA!r} or {REPLACEMENT_SCHEMA!r}")
     events = blob.get("events")
     validate_events(events)
+    if blob["schema"] == TRANSCRIPT_SCHEMA and any(event.get("type") == "context_replace" for event in events):
+        raise TranscriptFormatError("context replacement requires chat log schema v5")
     todos = blob.get("session_todos", [])
     if not isinstance(todos, list):
         raise TranscriptFormatError("chat log session_todos must be a list")
@@ -1121,6 +1239,9 @@ def anthropic_response_to_items(response):
         block_type = block.get("type")
         if block_type == "text":
             blocks.append(_anthropic_text_block(block))
+        elif block_type == "compaction":
+            _flush_message(items, blocks)
+            items.append(compaction_item(block))
         elif block_type == "thinking":
             _flush_message(items, blocks)
             item = {
@@ -1454,6 +1575,8 @@ def openai_responses_response_to_items(response):
         item_type = output.get("type")
         if item_type == "message":
             items.append(_responses_message_item(output))
+        elif item_type == "compaction":
+            items.append(compaction_item(output))
         elif item_type in ["function_call", "custom_tool_call"]:
             items.append(_responses_call(output))
         elif item_type == "reasoning":
@@ -1819,6 +1942,7 @@ def _chat_foreign_provider_messages(event, call_info):
 
 
 def _chat_response_messages(event, call_info, target=None):
+    _require_checkpoint_replay(event, OPENAI_CHAT, target)
     same_protocol = _native_replay_allowed(
         event, OPENAI_CHAT, target)
     if (not same_protocol
@@ -1930,6 +2054,7 @@ def _chat_response_messages(event, call_info, target=None):
 
 
 def items_to_openai_chat_messages(events, target=None):
+    events = active_events(events)
     messages = []
     call_info = {}
     index = 0
@@ -2068,6 +2193,7 @@ def _anthropic_wire_call(call, same_protocol):
 
 
 def _anthropic_response_messages(event, target=None):
+    _require_checkpoint_replay(event, ANTHROPIC_MESSAGES, target)
     same_protocol = _native_replay_allowed(
         event, ANTHROPIC_MESSAGES, target)
     messages = []
@@ -2093,6 +2219,8 @@ def _anthropic_response_messages(event, target=None):
                     or item.get("tool_kind", "function") == "function"):
                 content.append(_anthropic_wire_call(
                     item, same_protocol))
+        elif item_type == "compaction":
+            content.append(_copy(item))
         elif item_type == "anthropic_thinking" and same_protocol:
             block = {
                 "type": "thinking",
@@ -2166,6 +2294,7 @@ def _anthropic_direct_content(event):
 
 
 def items_to_anthropic_parts(events, target=None):
+    events = active_events(events)
     system = []
     messages = []
     index = 0
@@ -2389,6 +2518,7 @@ def _responses_provider_operation_wire(item, same_protocol):
 
 
 def _responses_response_items(event, target=None):
+    _require_checkpoint_replay(event, OPENAI_RESPONSES, target)
     same_protocol = _native_replay_allowed(
         event, OPENAI_RESPONSES, target)
     result = []
@@ -2410,6 +2540,8 @@ def _responses_response_items(event, target=None):
         elif item_type == "provider_operation":
             result.extend(_responses_provider_operation_wire(
                 item, same_protocol))
+        elif item_type == "compaction":
+            result.append(_copy(item))
         elif item_type == "openai_reasoning" and same_protocol:
             result.append(_copy(item.get("value")))
         elif (item_type in ["provider_output", "native_output"]
@@ -2440,7 +2572,20 @@ def _responses_tool_output(blocks):
     return rendered
 
 
-def items_to_openai_responses_parts(events, target=None):
+def items_to_openai_responses_parts(events, target=None, *, system_role="system"):
+    """Project saved local instructions using the selected wire contract's role.
+
+    Provider supplies system_role for LATE top-level system events; the existing
+    extracted prefix cannot cover a first mode announcement after a checkpoint,
+    or later cwd/mode updates. Reordering those instructions into the prefix would
+    change their position/meaning and cached history. Render a new wire item in
+    place instead, leaving canonical authority, text and persisted snapshots alone.
+    This parameter never relabels provider response items: saved/native data cannot
+    gain local developer authority through the instruction-framing path.
+    """
+    if system_role not in ["system", "developer"]:
+        raise ProjectionError("invalid Responses local instruction role")
+    events = active_events(events)
     instructions = []
     input_items = []
     instruction_prefix_open = True
@@ -2455,11 +2600,12 @@ def items_to_openai_responses_parts(events, target=None):
                     if text:
                         instructions.append(text)
                 else:
-                    # Responses accepts system/developer message items in
-                    # input. Keeping a late operator instruction here
-                    # preserves session order and the already-cacheable prefix.
-                    input_items.append(_responses_wire_message(
-                        event, False))
+                    # Preserve the selected position; the Provider owns which
+                    # role its contract admits for locally authored instructions.
+                    message = _responses_wire_message(event, False)
+                    if role == "system":
+                        message["role"] = system_role
+                    input_items.append(message)
             elif role in ["user", "assistant"]:
                 instruction_prefix_open = False
                 input_items.append(_responses_wire_message(

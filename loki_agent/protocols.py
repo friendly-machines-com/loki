@@ -573,6 +573,8 @@ class Provider:
             provider_name=self.provider_name,
             endpoint=self.chat_url,
             model=model,
+            openai_request_profile=(self.openai_request_profile.to_dict()
+                                    if self.openai_request_profile is not None else None),
         )
 
     # -- thinking controls --------------------------------------------------
@@ -854,9 +856,23 @@ class Provider:
                     payload, spec.effort_field, reasoning_effort)
             return payload
         if self.kind == OPENAI_RESPONSES:
+            # Subscription instruction messages use the developer channel; Lite
+            # rejects system messages. Prefix-only conversion used to cover an
+            # initial mode announcement, but /compact before that first turn puts
+            # a checkpoint ahead of it; /cd and later mode changes can append
+            # instructions too. Keep one subscription mapping for both profiles
+            # while generic Responses retains its literal roles. Formats keeps
+            # position/canonical authority; saved provenance never selects framing.
+            system_role = "developer" if self.provider_id == "openai-subscription" else "system"
             instructions, input_items = (
                 formats.items_to_openai_responses_parts(
-                    items, target=target))
+                    items, target=target, system_role=system_role))
+            # Only top-level LOCAL instructions use the mapping. Do not repair
+            # provider-returned system output into local authority, or silently
+            # discard it: refuse invalid native data before transport instead.
+            if system_role == "developer" and any(
+                    item.get("type", "message") == "message" and item.get("role") == "system" for item in input_items):
+                raise formats.ProjectionError("The selected connection cannot use saved provider output with a system message role.")
             payload = {
                 "model": model,
                 "input": input_items,
@@ -927,13 +943,13 @@ class Provider:
                 if lite_tools:
                     prefix.append({
                         "type": "additional_tools",
-                        "role": "developer",
+                        "role": system_role,
                         "tools": lite_tools,
                     })
                 if instructions:
                     prefix.append({
                         "type": "message",
-                        "role": "developer",
+                        "role": system_role,
                         "content": [{
                             "type": "input_text",
                             "text": instructions,
@@ -994,15 +1010,23 @@ class Provider:
             f"streaming is not implemented for protocol {self.kind!r}")
 
     def parse_chat_response(self, response):
-        if self.kind == OPENAI_CHAT:
-            return formats.openai_chat_response_to_items(response)
-        if self.kind == ANTHROPIC_MESSAGES:
-            return formats.anthropic_response_to_items(response)
-        if self.kind == OPENAI_RESPONSES:
-            return formats.openai_responses_response_to_items(response)
-        if self.kind == DUMMY:
-            return formats.openai_chat_response_to_items(response)
-        raise ProtocolError(f"unknown protocol {self.kind!r}")
+        if self.kind in [OPENAI_CHAT, DUMMY]:
+            turn = formats.openai_chat_response_to_items(response)
+        elif self.kind == ANTHROPIC_MESSAGES:
+            turn = formats.anthropic_response_to_items(response)
+        elif self.kind == OPENAI_RESPONSES:
+            turn = formats.openai_responses_response_to_items(response)
+        else:
+            raise ProtocolError(f"unknown protocol {self.kind!r}")
+        if self.openai_request_profile is not None and any(item.get("type") == "compaction" for item in turn.items):
+            # Checkpoints need the producing wire profile in addition to the
+            # request executor's endpoint/model provenance. This saved value is
+            # ONLY a replay restriction; projection_target uses the selected
+            # Provider's profile, never this untrusted log data, for framing.
+            native = copy.deepcopy(turn.metadata.get("protocol_data") or {})
+            native.setdefault("loki", {})["openai_request_profile"] = self.openai_request_profile.to_dict()
+            turn.metadata["protocol_data"] = native
+        return turn
 
     def parse_model_ids(self, response):
         if not isinstance(response, dict):
@@ -1442,6 +1466,24 @@ class AnthropicMessagesStreamAccumulator:
                 if thinking and index in self.thinking_keys:
                     self.on_reasoning_delta(
                         self.thinking_keys[index], "thinking", thinking)
+        elif delta_type == "compaction_delta":
+            # The codec assembles reported data, not a context-selection event.
+            # On-demand blocks may already be complete at start; inline streams
+            # can supply summary/encrypted fragments. Preserve unrelated native
+            # fields and explicit null (failed/no-op) values without fabricating
+            # an OpenAI-shaped payload or adopting readable text as instructions.
+            if block.get("type") != "compaction":
+                raise StreamProtocolError("compaction delta does not belong to a compaction block")
+            for field_name, value in delta.items():
+                if field_name == "type":
+                    continue
+                if field_name in ["content", "encrypted_content"] and isinstance(value, str):
+                    previous = block.get(field_name)
+                    if previous is not None and not isinstance(previous, str):
+                        raise StreamProtocolError("compaction fragments must be strings or null")
+                    block[field_name] = (previous or "") + value
+                else:
+                    block[field_name] = copy.deepcopy(value)
         elif delta_type == "signature_delta":
             signature = delta.get("signature")
             if isinstance(signature, str):

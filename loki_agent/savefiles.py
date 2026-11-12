@@ -443,6 +443,10 @@ class ResumeTranscriptRenderer:
                     "anthropic_thinking",
                     "anthropic_redacted_thinking"]:
                 rendered = self._reasoning_blocks(item, event)
+            elif item_type == "compaction":
+                # Native data does not itself say that local context changed;
+                # show no opaque payload through the unknown-item fallback.
+                rendered = [("notice", [("literal", "[Compaction checkpoint]")])]
             elif item_type in ["native_output", "provider_output"]:
                 rendered = self._native_item_blocks(
                     item, response_protocol=event.get("protocol"))
@@ -473,6 +477,11 @@ class ResumeTranscriptRenderer:
             return self._response_blocks(item)
         if item_type == "tool_result":
             return self._tool_result_blocks(item)
+        if item_type == "context_replace":
+            # Replay walks the archive, not inference selection. Recursing into
+            # a snapshot would duplicate retained messages and the existing
+            # unknown-event fallback would disclose its encrypted checkpoint.
+            return [("notice", [("literal", "[Context compacted]")])]
         return [("other", [
             ("literal", "[Session event: "),
             ("atom", str(item_type or "unknown")),

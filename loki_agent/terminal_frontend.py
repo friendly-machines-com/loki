@@ -21,6 +21,7 @@ from . import attachments
 from .arguments import USAGE, parse_cli_args, preflight as argument_preflight
 from .diagnostics import debug_json
 from . import command_deliveries
+from . import compactions
 from . import formats
 from .attachments import ImageAttachmentError, load_image_attachment
 from . import authentications
@@ -751,6 +752,13 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
         print()
 
 
+def _terminal_allowed_tools():
+    # Sampling and manual compaction advertise the same current mode's tools;
+    # compaction borrows definitions only, not the turn's dispatch callbacks.
+    mode = current_agent_mode()
+    return (PLAN_TOOLS if mode == "plan" else EXPLORE_TOOLS) if mode in ["explore", "plan"] else None
+
+
 async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
                                   cancel_event: asyncio.Event | None = None,
                                   turn_events=None, ui_settings=None,
@@ -763,9 +771,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     recovery = _core.make_turn_recovery(cancel_event)
     thinking = _core.capture_turn_settings()
     reasoning_effort = thinking.effort
-    read_only = current_agent_mode() in ["explore", "plan"]
-    mode_tools = (
-        PLAN_TOOLS if current_agent_mode() == "plan" else EXPLORE_TOOLS)
+    allowed = _terminal_allowed_tools()
 
     def on_response(turn, event):
         current_session().context_snapshot(live=True)
@@ -783,7 +789,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     _redraw_status()
     return await run_tool_loop_async(
         transcript_items,
-        allowed=mode_tools if read_only else None,
+        allowed=allowed,
         on_event=on_event,
         cancel_check=cancel_check,
         stream_chat=True,
@@ -830,7 +836,7 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
         fields["api"], fields["model"])
     if fields["effort"] is not None:
         remote += ', Effort: {}'.format(fields["effort"])
-    remote += ', Context: {}; /model'.format(fields["context"])
+    remote += ', Context: {}; /compact, /model'.format(fields["context"])
     remote += ', /thinking, /trace thinking, /status, /account'
     return (
         remote + '\n'
@@ -868,7 +874,7 @@ def _write_status_text_lines():
         terminal.write_text(fields["effort"])
     print(", Context: ", end="")
     terminal.write_text(fields["context"])
-    print("; /model", end="")
+    print("; /compact, /model", end="")
     print(", /thinking, /trace thinking, /status, /account", end="")
     terminal.enable_autowrap()
     # CR makes the next line start at column one even when LNM is reset;
@@ -1574,6 +1580,34 @@ async def async_main(args, configuration: settings.Settings) -> int:
             match command_text:
                 case '/quit':
                     break
+                case _ if (command_text == '/compact' or (command_text.startswith('/compact')
+                           and len(command_text) > 8 and command_text[8].isspace())):
+                    # This mutates inference context and performs network I/O:
+                    # use FIFO delivery, NOT immediate monitoring. The existing
+                    # input/activity owners retain cancellation and busy state;
+                    # never insert command text or consume staged images as a
+                    # model prompt. The shared operation owns gate/save/commit.
+                    if command_text != '/compact':
+                        print("Usage: /compact", file=sys.stderr)
+                        continue
+                    _terminal_activity.set_turn_running(True)
+                    session.reader.cancel_event.clear()
+                    try:
+                        text = await _core.compact_context_async(
+                            cancel_event=session.reader.cancel_event,
+                            thinking=_core.capture_turn_settings(), allowed=_terminal_allowed_tools(),
+                            allow_ask=terminal_ask_user(session) is not None)
+                    except recoveries.Cancelled:
+                        text = "Context compaction cancelled."
+                    except KeyboardInterrupt:
+                        text = "Context compaction cancelled."
+                    except Exception as error:
+                        text = "Context compaction failed: " + compactions.format_error(error)
+                    finally:
+                        _terminal_activity.set_turn_running(False)
+                    terminal.write_text(text, multiline=True, file=sys.stderr)
+                    print(file=sys.stderr)
+                    continue
                 case _ if (command_text == '/account'
                            or command_text.startswith('/account ')):
                     # Only the interactive (queued) forms reach here; the

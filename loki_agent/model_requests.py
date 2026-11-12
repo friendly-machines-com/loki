@@ -1103,6 +1103,23 @@ async def async_chat_completion(transcript_items: list, tools, report_errors: bo
             notice_codes = response.notice_codes
         except http_client.HttpRequestCancelled:
             raise recoveries.Cancelled()
+    return decode_chat_response(data, context=context, effective_model=effective_model,
+                                notice_codes=notice_codes, reasoning_source=reasoning_source)
+
+
+def decode_chat_response(data, *, context: RequestContext, effective_model=None,
+                         notice_codes=None, reasoning_source=None):
+    """Decode ordinary sampling and V2 checkpoint output with the SAME origin.
+
+    The dedicated checkpoint request cannot enter the tool loop merely to obtain
+    provenance. Its selected native item still needs the executor's trusted
+    endpoint/provider/requested-model bindings; returned envelope text cannot
+    choose them. Provider.parse_chat_response separately stamps selected wire
+    profile restrictions. The returned turn owns decoded data, not Session state
+    or credentials, and callers decide what (if anything) becomes authoritative.
+    """
+    effective_model = effective_model or context.config.model
+    reasoning_source = reasoning_source or context.config.chat_provider.reasoning_field
     if not isinstance(data, dict):
         raise protocols.ProtocolError(
             "chat response must be a JSON object", payload=data)

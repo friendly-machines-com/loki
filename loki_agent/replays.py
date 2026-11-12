@@ -99,6 +99,12 @@ def classify_event(event: dict, *, show_reasoning=False):
         return classify_response(event, show_reasoning=show_reasoning)
     if event_type == "tool_result":
         return classify_tool_result(event)
+    if event_type == "context_replace":
+        # ACP replays archived history exactly once. The selected window is
+        # inference bookkeeping, not another transcript to recurse through;
+        # the unknown-event fallback would duplicate text and dump checkpoint
+        # data. Ordinary status text needs no new ACP compaction capability.
+        return [("agent", "[Context compacted]", ("session_event", "context_replace"))]
     # Unknown event types become visible text rather than being dropped.
     from pprint import pformat
     return [("agent",

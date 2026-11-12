@@ -3440,8 +3440,8 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
 
     def _advertisement(self, commands):
         names = [command["name"] for command in commands]
-        self.assertEqual(set(names), {"status", "account", "pwd", "cd", "image", "thinking", "trace"})
-        self.assertEqual(len(names), 7)
+        self.assertEqual(set(names), {"status", "account", "compact", "pwd", "cd", "image", "thinking", "trace"})
+        self.assertEqual(len(names), 8)
         self.assertNotIn("ps", names)
         self.assertNotIn("todo", names)
         self.assertTrue(all(command["description"] for command in commands))
