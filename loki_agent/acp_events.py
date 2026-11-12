@@ -6,6 +6,8 @@ client-facing meaning).  The worker applies the sessionId and sends.
 
 from __future__ import annotations
 
+from . import process_outputs
+
 TOOL_KINDS = {
     "Read": "read",
     "Glob": "search",
@@ -153,9 +155,9 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
         return [plan(session_id, event["todos"])]
     if kind == "tool_result":
         call_id = _event_call_id(event, state)
-        text = event.get("content")
-        if not isinstance(text, str):
-            text = str(text)
+        # Model/history keep the full image. ACP needs only a readable notice;
+        # inline base64 here would also exceed its frame cap for large images.
+        text = process_outputs.presentation_text(event.get("content"))
         status = "failed" if event.get("is_error") else "completed"
         return [tool_call_update(
             session_id, call_id, _content(text), status=status)]

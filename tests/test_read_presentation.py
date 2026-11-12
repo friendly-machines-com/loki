@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from image_fixtures import PNG_BYTES
+
 from loki_agent import acp_events, formats, loki, protocols, savefiles
 from loki_agent import settings, terminal_frontend, tool_runtime
 from loki_agent import connections
@@ -66,7 +68,7 @@ class ReadPresentationTests(unittest.IsolatedAsyncioTestCase):
     async def test_diagnostics_and_notes_remain_visible(self):
         for filename, data, notice in [("empty", b"", "is empty"),
                                        ("binary", b"\x00", "is binary"),
-                                       ("image.png", b"image", "is an image")]:
+                                       ("image.png", PNG_BYTES, "is an image")]:
             path = self.directory / filename
             path.write_bytes(data)
             _, result = await self.execute(path)

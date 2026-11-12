@@ -1,9 +1,10 @@
 """Local image attachments staged for a later prompt.
 
 Both fronts stage images: the terminal via ``/image`` and the ACP worker via
-the same command arriving as prompt text.  Reading, sniffing and bounding the
-bytes is front-independent, so it lives here once; only the presentation of
-the resulting ``StagedImage`` differs.
+the same command arriving as prompt text. Read also returns images during a
+tool continuation. All three use the same bounded, signature-checked encoding;
+Read supplies its own acquired snapshot so its file observation describes the
+exact bytes sent to the model, not a second lookup of a potentially changed file.
 """
 
 from __future__ import annotations
@@ -52,6 +53,31 @@ def image_media_type(data: bytes) -> str | None:
             and data[8:12] == b"WEBP"):
         return "image/webp"
     return None
+
+
+def image_attachment_from_bytes(path: str, data: bytes, *,
+                                max_bytes: int | None = None) -> StagedImage:
+    """Encode an owned snapshot shared by /image and Read; never reopen its name.
+
+    Signature checks identify supported formats, not whether the complete image
+    decodes. Decoding and visual preprocessing remain the provider's job.
+    """
+    limit = IMAGE_ATTACHMENT_MAX_BYTES if max_bytes is None else max_bytes
+    if limit < 1:
+        raise ValueError("image attachment limit must be positive")
+    if len(data) > limit:
+        raise ImageAttachmentError(
+            f"image exceeds the {limit}-byte maximum")
+    media_type = image_media_type(data)
+    if media_type is None:
+        raise ImageAttachmentError(
+            "unsupported image data; expected PNG, JPEG, GIF, or WebP")
+    return StagedImage(
+        path=path,
+        media_type=media_type,
+        encoded_data=base64.b64encode(data).decode("ascii"),
+        byte_size=len(data),
+    )
 
 
 def image_argument_path(argument: str) -> str:
@@ -107,16 +133,4 @@ def load_image_attachment(path_text: str, *,
         if fd is not None:
             os.close(fd)
 
-    if len(data) > limit:
-        raise ImageAttachmentError(
-            f"image exceeds the {limit}-byte maximum")
-    media_type = image_media_type(data)
-    if media_type is None:
-        raise ImageAttachmentError(
-            "unsupported image data; expected PNG, JPEG, GIF, or WebP")
-    return StagedImage(
-        path=path,
-        media_type=media_type,
-        encoded_data=base64.b64encode(data).decode("ascii"),
-        byte_size=len(data),
-    )
+    return image_attachment_from_bytes(path, data, max_bytes=limit)

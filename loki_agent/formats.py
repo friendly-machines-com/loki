@@ -1951,21 +1951,45 @@ def items_to_openai_chat_messages(events, target=None):
             messages.extend(_chat_response_messages(
                 event, call_info, target=target))
         elif event_type == "tool_result":
-            call = call_info.get(event.get("call_id"), {})
-            native_call = _protocol_fields(call, OPENAI_CHAT)
-            content = _plain_content(event.get("content", []), "OpenAI Chat")
-            if native_call.get("legacy"):
-                messages.append({
-                    "role": "function",
-                    "name": event.get("name") or call.get("name"),
-                    "content": content,
-                })
-            else:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": event.get("call_id"),
-                    "content": content,
-                })
+            # Chat tool/function replies accept text, unlike Anthropic/Responses
+            # tool results. Project images into a linked user message only on
+            # the wire, after the WHOLE reply batch: inserting it between two
+            # replies would interrupt the assistant's parallel tool calls.
+            # Canonical history retains the original result for save/resume and
+            # provider switches; projection neither stages nor duplicates it.
+            image_content = []
+            while index < len(events) and events[index].get("type") == "tool_result":
+                result = events[index]
+                call = call_info.get(result.get("call_id"), {})
+                native_call = _protocol_fields(call, OPENAI_CHAT)
+                text_blocks = []
+                images = []
+                for block in result.get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "image":
+                        images.append(_chat_block(block, False))
+                    else:
+                        text_blocks.append(block)
+                content = _plain_content(text_blocks, "OpenAI Chat")
+                name = result.get("name") or call.get("name")
+                if native_call.get("legacy"):
+                    messages.append({
+                        "role": "function", "name": name, "content": content,
+                    })
+                else:
+                    messages.append({
+                        "role": "tool", "tool_call_id": result.get("call_id"),
+                        "content": content,
+                    })
+                if images:
+                    image_content.append({
+                        "type": "text",
+                        "text": f"Images returned by {name or 'tool'} (call {result.get('call_id')}):",
+                    })
+                    image_content.extend(images)
+                index += 1
+            if image_content:
+                messages.append({"role": "user", "content": image_content})
+            index -= 1
         else:
             raise ProjectionError(
                 f"cannot project event {event_type!r} to OpenAI Chat")

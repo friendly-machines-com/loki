@@ -560,7 +560,7 @@ class ToolOutcome:
     status: str
     executed: bool
     ok: bool
-    content: str
+    content: str | list[dict]
     process_output: dict | None = None
 
     def to_hook_dict(self):
@@ -1105,13 +1105,15 @@ def invalid_input_message(tool_name, issues):
 
 
 def tool_result(ok: bool, content, *, process_output=None) -> dict:
-    """Carry a known tool outcome independently of its arbitrary payload text.
+    """Carry a known outcome with text or canonical content blocks.
 
-    Handlers use this existing envelope for returned outcomes; raised failures
-    are converted by the runtime's exception boundary. ProcessOutput preserves
-    captured channels for presentation, never a second source of status.
+    Read's image results must survive the handler, exception boundary, hooks and
+    final envelope without becoming a textual repr of base64. Copy block lists
+    at these ownership transfers just as the canonical transcript does; ordinary
+    text tools retain their existing conversion. ProcessOutput stays text-only
+    presentation metadata, never model content or a second source of status.
     """
-    result = {"ok": ok, "content": str(content)}
+    result = {"ok": ok, "content": copy.deepcopy(content) if isinstance(content, list) else str(content)}
     if process_output is not None:
         result["process_output"] = process_outputs.ProcessOutput.from_dict(process_output).to_dict()
     return result

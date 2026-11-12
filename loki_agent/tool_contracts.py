@@ -1,5 +1,7 @@
 """Model-facing tool definitions shared without importing execution backends."""
 
+from .attachments import IMAGE_ATTACHMENT_MAX_BYTES
+
 # Each process may own two children, and only three descendant generations
 # may exist. Thus one root process can have at most 2 + 4 + 8 active
 # descendants instead of allowing recursive Agent calls to grow without bound.
@@ -47,7 +49,8 @@ TOOLS = [
                 f"- Reads up to {READ_DEFAULT_LINES} lines by default.",
                 "- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters",
                 "- Results are returned using cat -n format, with line numbers starting at 1",
-                "- Reads images (PNG, JPG/JPEG, GIF, WEBP) and presents them visually.",
+                "- Reads images (PNG, JPG/JPEG, GIF, WEBP) as visual input; requires an image-capable model.",
+                f"- Images are read in full, up to {IMAGE_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MiB. The offset/limit parameters apply only to text.",
                 "- Reading a directory, a missing file, or an empty file returns an error or system reminder rather than content.",
                 "- Do NOT re-read a file you just edited to verify -- Edit/Write would have errored if the change failed, and the harness tracks file state for you.",
             ]),

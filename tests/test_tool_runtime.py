@@ -50,13 +50,31 @@ class ExplicitToolResultTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_status_is_independent_of_content(self):
         for ok, content in [[True, 'Error: quoted successful data'],
                             [True, 'Failed is a word in the answer'],
-                            [False, 'No interactive user is available']]:
+                            [False, 'No interactive user is available'],
+                            [True, [formats.text_block('Image result'), {
+                                'type': 'image', 'source': {
+                                    'type': 'base64', 'media_type': 'image/png', 'data': 'AAAA'}}]],
+                            [False, [formats.text_block('Explicit failure')]]]:
             async def operation():
                 return tool_runtime.tool_result(ok, content)
 
             with self.subTest(ok=ok, content=content):
                 result = await loki.with_exception_to_tool_result_async('test', operation)
                 self.assertEqual(result, {'ok': ok, 'content': content})
+
+    async def test_structured_result_owns_its_content_snapshot(self):
+        blocks = [formats.text_block('image'), {'type': 'image', 'source': {
+            'type': 'base64', 'media_type': 'image/png', 'data': 'AAAA'}}]
+        result = tool_runtime.tool_result(True, blocks)
+        blocks[-1]['source']['data'] = 'changed'
+        self.assertEqual(result['content'][-1]['source']['data'], 'AAAA')
+
+        async def operation():
+            return result
+
+        wrapped = await loki.with_exception_to_tool_result_async('test', operation)
+        result['content'][-1]['source']['data'] = 'changed again'
+        self.assertEqual(wrapped['content'][-1]['source']['data'], 'AAAA')
 
     async def test_bare_handler_output_is_not_a_status_contract(self):
         async def operation():
@@ -618,10 +636,12 @@ class ExternalHookTests(unittest.TestCase):
         self.assertEqual(result, {"held": [0, 1, 2]})
 
     def test_external_post_hook_can_only_append_note(self):
+        contents = ["real result", [formats.text_block("real result"), {
+            "type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]]
         script = (
             "import json, sys; "
             "p=json.load(sys.stdin); "
-            "assert p['outcome']['content']=='real result'; "
+            f"assert p['outcome']['content'] in {contents!r}; "
             "json.dump({'note':'post note'}, sys.stdout)"
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -635,22 +655,23 @@ class ExternalHookTests(unittest.TestCase):
                     f"command.2 = {script}\n"
                     f"cwd = {directory}\n")
             pipeline = load_hooks(config_path)
-            invocation = tool_runtime.ToolInvocation(
-                call_id="call_external",
-                tool_name="Example",
-                raw_arguments={"values": []},
-                original_arguments={"values": []},
-                effective_arguments={"values": []},
-                schema=ARRAY_SCHEMA,
-                cwd=directory,
-            )
-            outcome = tool_runtime.ToolOutcome(
-                "success", True, True, "real result")
-            invocation, outcome = asyncio.run(
-                pipeline.finish(invocation, outcome))
-
-        self.assertEqual(outcome.content, "real result")
-        self.assertEqual(invocation.notes, ["post note"])
+            for content in contents:
+                with self.subTest(content=content):
+                    invocation = tool_runtime.ToolInvocation(
+                        call_id="call_external",
+                        tool_name="Example",
+                        raw_arguments={"values": []},
+                        original_arguments={"values": []},
+                        effective_arguments={"values": []},
+                        schema=ARRAY_SCHEMA,
+                        cwd=directory,
+                    )
+                    outcome = tool_runtime.ToolOutcome(
+                        "success", True, True, copy.deepcopy(content))
+                    invocation, outcome = asyncio.run(
+                        pipeline.finish(invocation, outcome))
+                    self.assertEqual(outcome.content, content)
+                    self.assertEqual(invocation.notes, ["post note"])
 
     def test_windows_hook_bootstrap_path_does_not_expand_the_credential_environment(self):
         environment = {'SystemRoot': 'C:/Windows', 'PATH': 'tools', 'TEMP': 'scratch',

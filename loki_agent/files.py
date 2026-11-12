@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from . import executables, private_files, process_outputs, tool_contracts, tool_runtime
+from . import attachments, executables, private_files, process_outputs, tool_contracts, tool_runtime
 
 
 READ_CHAR_CAP = 10 * 1024 * 1024
@@ -343,34 +343,47 @@ def run_read(file_path: str, offset: int | None = None, limit: int | None = None
     file_path = resolve_path(file_path, cwd)
     file_key = file_path
 
-    def remember(observation, text, process_output=None):
+    def remember(observation, content, process_output=None):
         _remember_observation(observations, file_key, observation)
-        # Empty/binary/image notices are successful observations too. Their
-        # wording must never be asked to supply the tool's success flag.
+        # Empty/binary notices are successful observations too. Their wording
+        # must never be asked to supply the tool's success flag.
         if structured:
-            return tool_runtime.tool_result(True, text, process_output=process_output)
-        return text
+            return tool_runtime.tool_result(True, content, process_output=process_output)
+        return content
 
     ext = os.path.splitext(file_path)[1].lower()
     image = ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']
     facts = os.stat(file_path)
     content = None
-    if not image:
-        try:
-            # The standard text reader owns UTF-8 and universal-newline
-            # decoding. There is no need for a second decoder coordinator
-            # merely to record a model's bounded view of the file.
-            with _open_regular_file(file_path) as source:
-                if _stat_identity(os.fstat(source.fileno())) != _stat_identity(facts):
-                    raise OSError('file changed while it was being read')
+    snapshot = None
+    # Inspect the binary buffer before the text wrapper has decoded anything.
+    # This also recognizes images with missing/misleading suffixes. A recognized
+    # image is read and hashed from this one acquired object; reopening through
+    # _file_observation could record bytes other than those sent to the model.
+    with _open_regular_file(file_path) as source:
+        if _stat_identity(os.fstat(source.fileno())) != _stat_identity(facts):
+            raise OSError('file changed while it was being read')
+        if image or attachments.image_media_type(source.buffer.peek(12)):
+            maximum = attachments.IMAGE_ATTACHMENT_MAX_BYTES
+            if facts.st_size > maximum:
+                raise attachments.ImageAttachmentError(
+                    f"image is {facts.st_size} bytes; maximum is {maximum} bytes")
+            data = source.buffer.read(maximum + 1)
+            snapshot = attachments.image_attachment_from_bytes(file_path, data)
+        else:
+            try:
+                # The standard reader still owns UTF-8/universal newlines.
                 content = source.read(READ_CHAR_CAP + 1)
-                if _stat_identity(os.fstat(source.fileno())) != _stat_identity(facts):
-                    raise OSError('file changed while it was being read')
-        except UnicodeDecodeError:
-            pass  # Binary files are still observed before Write may replace them.
+            except UnicodeDecodeError:
+                pass  # Binary files are observed before Write may replace them.
+        if _stat_identity(os.fstat(source.fileno())) != _stat_identity(facts):
+            raise OSError('file changed while it was being read')
+    if snapshot is not None:
+        observation = FileObservation(hashlib.sha256(data).hexdigest(), len(data))
+        notice = f"File {file_path} is an image ({snapshot.media_type}, {snapshot.byte_size} bytes)."
+        blocks = [{"type": "text", "text": notice}, snapshot.content_block()]
+        return remember(observation, blocks if structured else notice)
     observation = _file_observation(file_path, expected_stat=facts)
-    if image:
-        return remember(observation, f"File {file_path} is an image ({observation.size} bytes). Visual content rendering not supported in this environment; reading the file is acknowledged.")
     if content is None or "\x00" in content:
         return remember(observation, f"File {file_path} is binary ({observation.size} bytes); cannot display as text.")
     if not content:

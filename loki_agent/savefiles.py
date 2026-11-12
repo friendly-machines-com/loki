@@ -302,12 +302,7 @@ class ResumeTranscriptRenderer:
         for content in item.get("content", []):
             if not isinstance(content, dict):
                 continue
-            marker = {
-                "image": "[Image content]",
-                "file": "[File content]",
-                "document": "[File content]",
-                "audio": "[Audio content]",
-            }.get(content.get("type"))
+            marker = process_outputs.MEDIA_PLACEHOLDERS.get(content.get("type"))
             if marker:
                 blocks.append(("message", [("literal", marker)]))
         return blocks
@@ -336,11 +331,12 @@ class ResumeTranscriptRenderer:
     def _tool_result_blocks(self, item: dict):
         name = item.get("name") or item.get("call_id") or "<unknown>"
         label = "Tool error" if item.get("is_error") else "Tool result"
-        text = formats.item_text(item).strip()
+        content = item.get("content", [])
+        text = process_outputs.presentation_text(content).strip()
         if (self.show_bash_stdout is not None or self.show_read_stdout is not None
                 or self.show_skill_stdout is not None):
             text = process_outputs.presentation_text(
-                text, item.get("process_output"),
+                content, item.get("process_output"),
                 show_bash_stdout=True if self.show_bash_stdout is None else self.show_bash_stdout,
                 show_read_stdout=True if self.show_read_stdout is None else self.show_read_stdout,
                 show_skill_stdout=True if self.show_skill_stdout is None else self.show_skill_stdout,

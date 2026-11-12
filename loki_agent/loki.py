@@ -1311,7 +1311,9 @@ def _read_default_notes(invocation):
 def _prepend_tool_notes(content, notes):
     useful = [str(note).strip() for note in notes if str(note).strip()]
     if not useful:
-        return str(content)
+        return content
+    if isinstance(content, list):
+        return [formats.text_block("\n\n".join(useful))] + content
     return "\n\n".join(useful + [str(content)])
 
 
@@ -1451,7 +1453,12 @@ async def execute_tool_call_async(
                 process_output=result.get("process_output"),
             )
 
-    default_notes, defaults = _read_default_notes(invocation)
+    # Structured Read results are whole images, not line-oriented text. Do not
+    # claim that omitted offset/limit values selected lines from an image.
+    if fn_name == "Read" and isinstance(outcome.content, list):
+        default_notes, defaults = [], []
+    else:
+        default_notes, defaults = _read_default_notes(invocation)
     if outcome.executed:
         if invocation.adjustments:
             invocation.notes.insert(
@@ -1472,7 +1479,8 @@ async def execute_tool_call_async(
         # Rejections, errors and Read notices contain diagnostics, not stdout.
         # Preserve that distinction for terminal display and transcript replay.
         outcome.process_output = process_outputs.ProcessOutput(
-            outcome.content, "", "", shell=fn_name == "Bash", read=fn_name == "Read").to_dict()
+            process_outputs.presentation_text(outcome.content), "", "",
+            shell=fn_name == "Bash", read=fn_name == "Read").to_dict()
     outcome.content = _prepend_tool_notes(
         outcome.content, invocation.notes)
     if not outcome.executed:

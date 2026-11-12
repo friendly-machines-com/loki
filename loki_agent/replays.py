@@ -16,7 +16,7 @@ never dropped.
 
 from __future__ import annotations
 
-from . import formats
+from . import formats, process_outputs
 
 
 def _message_text(item: dict) -> str:
@@ -33,8 +33,7 @@ def classify_message(item: dict):
         return []
     text = _message_text(item)
     if not text and not any(
-            isinstance(c, dict) and c.get("type") in
-            ("image", "file", "document", "audio")
+            isinstance(c, dict) and c.get("type") in process_outputs.MEDIA_PLACEHOLDERS
             for c in item.get("content", [])):
         return []
     blocks = []
@@ -44,14 +43,8 @@ def classify_message(item: dict):
     for content in item.get("content", []):
         if not isinstance(content, dict):
             continue
-        ctype = content.get("type")
-        if ctype in ["image", "file", "document", "audio"]:
-            label = {
-                "image": "[Image content]",
-                "file": "[File content]",
-                "document": "[File content]",
-                "audio": "[Audio content]",
-            }[ctype]
+        label = process_outputs.MEDIA_PLACEHOLDERS.get(content.get("type"))
+        if label is not None:
             blocks.append(("agent" if role != "user" else "user", label,
                            ("message", role)))
     return blocks
@@ -92,7 +85,7 @@ def classify_tool_result(item: dict):
     """Classify a top-level `tool_result` event."""
     name = item.get("name") or item.get("call_id") or "<unknown>"
     label = "Tool error" if item.get("is_error") else "Tool result"
-    text = _message_text(item)
+    text = process_outputs.presentation_text(item.get("content", [])).strip()
     return [("tool", f"{label}: {name}" + (f"\n{text}" if text else ""),
              item.get("call_id"))]
 

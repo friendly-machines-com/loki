@@ -98,6 +98,14 @@ image is limited to 20 MiB and is snapshotted when `/image` is entered, so a
 later change to the file does not change the conversation. The selected
 provider and model must support image input.
 
+The model can also use `Read` on a local image during its turn. Read sends the
+image snapshot as visual tool-result content immediately, using the same formats
+and size limit as `/image`; no extra user prompt is needed. Image formats are
+identified by their file signatures. Line `offset`/`limit` apply only to text.
+The terminal, ACP and replay show a short image notice, while the model request
+and saved conversation retain the actual image. Neither command captures the
+terminal framebuffer or performs local OCR, resizing or pixel decoding.
+
 Loki reads credentials at startup and removes variables ending in `_KEY`,
 `_TOKEN`, or `_PAT` from the environment inherited by tools and hooks. On Linux,
 Loki also hides `$XDG_CONFIG_HOME/loki/credentials` from tools and subagents.
@@ -351,7 +359,11 @@ literal, not shell quoting. INI trims surrounding whitespace; `%` is literal.
 Hook programs receive JSON on stdin and use stdout for their hook reply, not
 log messages. Send logs to stderr. The bundled
 [`contrib/hooks/retries.py`](contrib/hooks/retries.py) is a working example.
-Hooks do not receive Loki's API credentials.
+Hooks do not receive Loki's API credentials. In a `post_tool_call` payload,
+`outcome.content` is either a text string or a list of canonical content blocks.
+Image Read results include `text` blocks and an `image` block with a base64
+`source` (`type`, `media_type`, `data`). Hooks may append a text `note`, not replace
+the executed result; notes do not turn image blocks into text.
 
 A failing before-tool hook blocks the tool by default. A failing after-tool
 hook reports the problem but cannot undo work the tool has already done.

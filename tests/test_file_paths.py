@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 from config_fixtures import setUpModule as set_up_config
 from response_header_fixtures import setUpModule as set_up_response_headers
+from image_fixtures import PNG_BYTES
 
 from loki_agent import loki, private_files, savefiles, sessions, terminal_frontend
 from loki_agent import files as file_operations
@@ -32,7 +33,7 @@ class FileObservationTests(unittest.TestCase):
                     ['binary', b'\xff\x00binary', 'binary (8 bytes)'],
                     ['incomplete', b'\xc3', 'binary (1 bytes)'],
                     ['empty', b'', 'is empty'],
-                    ['image.png', b'\xffimage', 'is an image (6 bytes)'],
+                    ['image.png', PNG_BYTES, f'is an image (image/png, {len(PNG_BYTES)} bytes)'],
                     ['capped', b'visible\r\n' + b'x' * 65526 + b'\xff', '1\tvisible']]:
                 path = os.path.join(directory, name)
                 with open(path, 'wb') as stream:

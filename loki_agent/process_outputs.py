@@ -1,15 +1,24 @@
 """Captured stream identity for tool-result presentation.
 
-The ordinary tool content remains the existing bounded text consumed by models,
-hooks and ACP. This snapshot keeps the captured channels available to terminal
-renderers and saved-transcript replay, even when that text projection truncates
-before stderr. Nothing here executes commands or trusts saved presentation data
-as process state.
+Tool content is text or canonical text/media blocks consumed by models and
+hooks. ProcessOutput keeps captured text channels available to renderers and
+saved-transcript replay. When no captured channels exist, presentation_text
+supplies text and media placeholders, not a repr of inline image data. The TUI,
+ACP notifications and replay borrow this projection; the canonical model/history
+content remains intact. Nothing here trusts presentation data as process state.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
+
+
+MEDIA_PLACEHOLDERS = {
+    "image": "[Image content]",
+    "file": "[File content]",
+    "document": "[File content]",
+    "audio": "[Audio content]",
+}
 
 
 @dataclass(frozen=True)
@@ -63,11 +72,28 @@ def presentation_text(content, process_output=None, *, show_bash_stdout=False,
             return output.render(show_stdout=show_skill_stdout)
         if output.shell:
             return output.render(show_stdout=show_bash_stdout)
+    media = []
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            marker = MEDIA_PLACEHOLDERS.get(block.get("type"))
+            if marker is not None:
+                media.append(marker)
+                parts.append(marker)
+            elif block.get("type") in ["text", "input_text", "output_text", "refusal"]:
+                text = block.get("text", block.get("refusal", ""))
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        text = "\n".join(parts)
+    else:
+        text = str(content)
     if legacy_bash and not show_bash_stdout:
-        return "Older combined Bash output is hidden; enable show_bash_stdout to display it."
+        return "\n".join(media) or "Older combined Bash output is hidden; enable show_bash_stdout to display it."
     if legacy_read and not show_read_stdout:
-        return "Older combined Read output is hidden; enable show_read_stdout to display it."
-    return str(content)
+        return "\n".join(media) or "Older combined Read output is hidden; enable show_read_stdout to display it."
+    return text
 
 
 def truncate_text(s: str, max_chars: int) -> str:
