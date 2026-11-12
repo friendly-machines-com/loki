@@ -1450,8 +1450,14 @@ os.execv(sys.argv[3], sys.argv[3:])
         # while shutting down so pipe backpressure cannot prevent the join.
         while await process.stdout.read(65536):
             pass
-        await process.wait()
-        await diagnostics
+        status = await process.wait()
+        errors = await diagnostics
+        if status != 0:
+            # This join is the last chance to retain startup/native-crash
+            # evidence before the fixture removes its workspace. Report only;
+            # each test still owns its expected exit status and assertions.
+            print(f"ACP front pid={process.pid} exited with status {status}; stderr:\n"
+                  + errors.decode('utf-8', errors='backslashreplace'), file=sys.stderr)
 
     async def _response(self, front, request_id):
         preceding = []
@@ -2043,22 +2049,53 @@ if "--worker" in sys.argv:
         traces = [name for name in os.listdir(tmpdir) if name.startswith("trace-")]
         self.assertEqual(traces, ["trace-%d" % front.pid])
 
+    async def test_failed_front_startup_keeps_exit_status_and_stderr(self):
+        # A real startup rejection exercises the diagnostic owner independently
+        # of intermittent EOF. It must not be mistaken for a protocol response.
+        tmpdir = self.enterContext(tempfile.TemporaryDirectory())
+        env = self._front_env(tmpdir)
+        env['LOKI_LOG_CONFIG'] = '.'  # A directory is not a logging INI file.
+        front, diagnostics = await self._front(
+            env, _configured_workspace(tmpdir), cleanup=self.addAsyncCleanup)
+        self.assertEqual(await front.stdout.readline(), b'')
+        captured = io.StringIO()
+        with mock.patch.object(sys, 'stderr', captured):
+            await self._close_front(front, diagnostics)
+        self.assertEqual(front.returncode, 2)
+        self.assertIn('exited with status 2', captured.getvalue())
+        self.assertIn('Logging configuration error:', captured.getvalue())
+        self.assertIn(b'Logging configuration error:', await diagnostics)
+
     async def test_unknown_session_is_error(self):
         async with AsyncExitStack() as cleanup:
             tmpdir = cleanup.enter_context(tempfile.TemporaryDirectory())
             env = self._front_env(tmpdir)
-            front, _diagnostics = await self._front(
+            front, diagnostics = await self._front(
                 env, _configured_workspace(tmpdir), cleanup=cleanup.push_async_callback)
             # Negative replies stay raw: _response deliberately requires success.
-            front.stdin.write((json.dumps({
-                "jsonrpc": "2.0", "id": 9,
-                "method": "session/prompt",
-                "params": {"sessionId": "nope",
-                           "prompt": [{"type": "text", "text": "x"}]},
-            }) + "\n").encode())
-            await front.stdin.drain()
-            line = await front.stdout.readline()
-            reply = json.loads(line)
+            line = None
+            try:
+                front.stdin.write((json.dumps({
+                    "jsonrpc": "2.0", "id": 9,
+                    "method": "session/prompt",
+                    "params": {"sessionId": "nope",
+                               "prompt": [{"type": "text", "text": "x"}]},
+                }) + "\n").encode())
+                await front.stdin.drain()
+                line = await front.stdout.readline()
+                reply = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError, BrokenPipeError, ConnectionResetError):
+                # A rerun must not erase the failure evidence. Use the existing
+                # close/join owner and its one stderr reader, not a second read
+                # or a timeout: stdout EOF can precede process reaping, and a
+                # malformed reply can leave the front waiting for more stdin.
+                status_at_reply = front.returncode
+                await self._close_front(front, diagnostics)
+                errors = (await diagnostics).decode('utf-8', errors='backslashreplace')
+                self.fail(
+                    f"ACP front returned invalid unknown-session reply {line!r}; "
+                    f"pid={front.pid}, exit at reply={status_at_reply}, "
+                    f"exit after join={front.returncode}\nstderr:\n{errors}")
             self.assertEqual(reply["id"], 9)
             self.assertIn("error", reply)
 
