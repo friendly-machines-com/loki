@@ -1046,16 +1046,17 @@ def _report_unavailable_reasoning_preference():
 
 async def run_session_picker_async(session):
     async with session.modal() as modal:
-        picked = await savefiles.run_session_picker_async(
-            input_fn=modal.prompt,
-            chat_log_dir=_core.CHAT_LOG_DIR,
-            text_writer=terminal.write_text)
-        # Finish the picker's output cleanup while the modal still owns the
-        # terminal. Only then may the normal input producer resume.
-        terminal.goto_position(1, 1)
-        terminal.clear_to_end_of_screen()
-        terminal.flush()
-    return picked
+        try:
+            return await savefiles.run_session_picker_async(
+                input_fn=modal.prompt,
+                chat_log_dir=_core.CHAT_LOG_DIR,
+                text_writer=terminal.write_text)
+        finally:
+            # Also restore after interruption/failure, while this modal still
+            # owns the terminal. Releasing it first could repaint normal input.
+            terminal.goto_position(1, 1)
+            terminal.clear_to_end_of_screen()
+            terminal.flush()
 
 
 async def confirm_saved_connection_async(
@@ -2053,8 +2054,16 @@ async def _run_frontend(args) -> int:
             if not headless:
                 initialize_terminal_overlay(terminal)
             exit_status = await run_with_session_cleanup()
+        except KeyboardInterrupt:
+            # Modal readers raise this for the raw Ctrl-C key. Handle it INSIDE
+            # the existing session-operation task: escaping to asyncio.run first
+            # aborts the reactor and turns normal interruption into tracebacks.
+            # Do not treat it as empty picker input, which would start a new chat.
+            exit_status = 130
         finally:
             clean_up()
+    if exit_status == 130:
+        print("\nCancelled.", file=sys.stderr)
     if exit_status == 0 and cleanup_failed:
         return 1
     return exit_status

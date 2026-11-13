@@ -3049,6 +3049,52 @@ class FrontendOutputOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.initialize.assert_called_once_with(terminal_frontend.terminal)
         self.restore.assert_called_once()
 
+    async def _resume_interrupt(self, arguments):
+        class InterruptInput(ScriptedInputSession):
+            async def prompt(self, *args, **options):
+                raise KeyboardInterrupt
+
+        inputs = InterruptInput([])
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(terminal_frontend.terminals, 'open_terminal_stdin'), \
+                mock.patch.object(terminal_frontend, 'input_session', return_value=inputs), \
+                mock.patch.object(terminal_frontend.savefiles, 'filtered_chat_log_entries', return_value=[]), \
+                mock.patch.object(terminal_frontend, 'new_chat_log') as new_chat, \
+                mock.patch.object(terminal_frontend, 'load_chat_log') as load_chat, \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            # The real runtime also puts the frontend in an owned task. A raw
+            # KeyboardInterrupt escaping it would abort asyncio before this await.
+            operation = asyncio.create_task(terminal_frontend._run_frontend(arguments))
+            self.assertEqual(await operation, 130)
+        new_chat.assert_not_called()
+        load_chat.assert_not_called()
+        self.assertFalse(self.session.active)
+        self.save.assert_called_once_with()
+        self.initialize.assert_called_once_with(terminal_frontend.terminal)
+        self.restore.assert_called_once()
+        self.assertIn('Cancelled.', errors.getvalue())
+        self.assertNotIn('Traceback', output.getvalue() + errors.getvalue())
+
+    async def test_resume_ctrl_c_exits_without_a_traceback_or_new_chat(self):
+        await self._resume_interrupt(['resume'])
+
+    async def test_bare_resume_option_ctrl_c_exits_without_a_new_chat(self):
+        await self._resume_interrupt(['--resume'])
+
+    async def test_task_cancellation_is_not_reclassified_as_keyboard_interrupt(self):
+        with mock.patch.object(terminal_frontend, 'async_main', new=mock.AsyncMock(side_effect=asyncio.CancelledError)):
+            with self.assertRaises(asyncio.CancelledError):
+                await terminal_frontend._run_frontend(['resume'])
+        self.assertFalse(self.session.active)
+        self.restore.assert_called_once()
+
+    async def test_unexpected_frontend_error_is_not_hidden_as_cancellation(self):
+        with mock.patch.object(terminal_frontend, 'async_main', new=mock.AsyncMock(side_effect=RuntimeError('real failure'))):
+            with self.assertRaisesRegex(RuntimeError, 'real failure'):
+                await terminal_frontend._run_frontend(['resume'])
+        self.assertFalse(self.session.active)
+        self.restore.assert_called_once()
+
 
 class ExitStatusTests(unittest.TestCase):
     # These real frontend probes need the existing caller-selected command
@@ -5250,6 +5296,37 @@ class SessionPickerTests(unittest.TestCase):
             self.assertIn("owned", rendered)
             for control in ["\x1b", "\x07", "\x9b", "\ud800"]:
                 self.assertNotIn(control, rendered)
+
+    def test_picker_restores_its_screen_before_releasing_modal_on_interrupt_or_error(self):
+        for error in [KeyboardInterrupt(), asyncio.CancelledError(), OSError('input failed')]:
+            with self.subTest(error=type(error).__name__):
+                events = []
+
+                @contextlib.asynccontextmanager
+                async def modal():
+                    events.append('acquire')
+                    try:
+                        yield types.SimpleNamespace(prompt=mock.AsyncMock(side_effect=error))
+                    finally:
+                        events.append('release')
+
+                def restore(name):
+                    def called(*args, **options):
+                        self.assertNotIn('release', events)
+                        events.append(name)
+                    return called
+
+                async def attempt():
+                    with self.assertRaises(type(error)):
+                        await terminal_frontend.run_session_picker_async(types.SimpleNamespace(modal=modal))
+
+                with mock.patch.object(terminal_frontend.savefiles, 'filtered_chat_log_entries', return_value=[]), \
+                        mock.patch.object(terminal_frontend.terminal, 'goto_position', side_effect=restore('position')), \
+                        mock.patch.object(terminal_frontend.terminal, 'clear_to_end_of_screen', side_effect=restore('clear')), \
+                        mock.patch.object(terminal_frontend.terminal, 'flush', side_effect=restore('flush')), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    asyncio.run(attempt())
+                self.assertEqual(events, ['acquire', 'position', 'clear', 'flush', 'release'])
 
     def test_picker_unrecognized_input_keeps_filter(self):
         with tempfile.TemporaryDirectory() as tmpdir:
