@@ -1265,6 +1265,124 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
     async def test_acp_v1_cancel_settles_all_controls_without_another_operation(self):
         await self._acp_control_journey(cancel=True)
 
+    async def _v2_control_journey(self, *, failure=False, cancel=False):
+        self.idle_routing = False
+        self.ordinary_outputs = [self.tool_batch()]
+        self.mode = "missing" if failure else "valid"
+        messages = []
+        worker = acp_worker.Worker(self.session, messages.append)
+        worker.protocol_version = 2
+        self.addAsyncCleanup(worker.close)
+        self.event = worker.cancel_event
+        self.pipeline.turn_end_hooks = [object()]
+        self.pipeline.finish_turn = mock.AsyncMock()
+        sampling_ready, sampling_release = asyncio.Event(), asyncio.Event()
+        compact_ready, compact_release = asyncio.Event(), asyncio.Event()
+
+        @contextlib.asynccontextmanager
+        async def controlled(method, url, **kwargs):
+            compact = json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger"
+            first = not self.sent
+            if compact:
+                self.assertEqual(self.session.transcript_items[-1]["type"], "tool_result")
+                self.before = copy.deepcopy(self.session.transcript_items)
+            async with self.streaming(method, url, **kwargs) as response:
+                if compact or first:
+                    ready, release = [compact_ready, compact_release] if compact else [sampling_ready, sampling_release]
+                    ready.set()
+                    await release.wait()
+                yield response
+
+        with mock.patch.object(http_client, "async_http_stream", new=controlled):
+            await worker.handle(acps.request(1, "session/prompt", self.params("work")))
+            owner = worker._prompt_task
+            try:
+                await observe_fixture(sampling_ready.wait(), owner)
+                for identifier in [2, 3]:
+                    await worker.handle(acps.request(identifier, "session/prompt", self.params("/compact")))
+                shared = worker.compaction_requests.pending
+                self.assertIs(worker._prompt_task, owner)
+                self.assertEqual([message["id"] for message in messages if "result" in message], [1, 2, 3])
+                sampling_release.set()
+                await observe_fixture(compact_ready.wait(), owner)
+                await worker.handle(acps.request(4, "session/prompt", self.params("/compact")))
+                self.assertIs(worker.compaction_requests.pending, shared)
+                if cancel:
+                    await worker.dispatch("session/cancel", {})
+                    self.assertFalse(shared.done(), "the executing operation owns its final outcome")
+                compact_release.set()
+                await owner
+            finally:
+                sampling_release.set()
+                compact_release.set()
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+        replies = [message for message in messages if message.get("id") in [1, 2, 3, 4]]
+        self.assertEqual(len(replies), 4)
+        self.assertTrue(all(list(message["result"]) == ["messageId"] for message in replies))
+        self.assertEqual(len({message["result"]["messageId"] for message in replies}), 4)
+        updates = [message["params"]["update"] for message in messages if message.get("method") == "session/update"]
+        lifecycle = [update for update in updates if update["sessionUpdate"] == "compaction_update"]
+        self.assertEqual([update["status"] for update in lifecycle],
+                         ["in_progress", "failed" if failure else "cancelled" if cancel else "completed"])
+        self.assertEqual(lifecycle[0]["compactionId"], lifecycle[1]["compactionId"])
+        self.assertEqual(updates[-1]["state"], "idle")
+        self.assertEqual(updates[-1]["stopReason"], "error" if failure else "cancelled" if cancel else "end_turn")
+        self.assertEqual(len(self.sent), 2 if failure or cancel else 3)
+        self.assertEqual(self.pipeline.finish_turn.await_count, 1)
+        self.assertIsNone(worker.compaction_requests.pending)
+        self.assertNotIn('"text": "/compact"', json.dumps(self.session.transcript_items))
+        users = [update for update in updates if update["sessionUpdate"] == "user_message_chunk"]
+        self.assertEqual({update["messageId"] for update in users}, {message["result"]["messageId"] for message in replies})
+        self.assertTrue(all("messageId" in update for update in updates
+                            if update["sessionUpdate"] in ["agent_message_chunk", "agent_thought_chunk"]))
+
+    async def test_v2_midturn_compaction_acks_immediately_and_coalesces_one_operation(self):
+        await self._v2_control_journey()
+
+    async def test_v2_compaction_failure_ends_foreground_without_replacing_any_insertion_ack(self):
+        await self._v2_control_journey(failure=True)
+
+    async def test_v2_cancel_during_compaction_waits_for_the_executor_outcome(self):
+        await self._v2_control_journey(cancel=True)
+
+    async def test_v2_busy_ordinary_prompts_insert_then_execute_fifo_and_cancel_has_a_cutoff(self):
+        messages = []
+        worker = acp_worker.Worker(self.session, messages.append)
+        worker.protocol_version = 2
+        self.addAsyncCleanup(worker.close)
+        ready, release = asyncio.Event(), asyncio.Event()
+        consumed = []
+
+        async def prompt(params, thinking, acp_message=None):
+            text = worker._prompt_text(params)
+            consumed.append(text)
+            if text == "first":
+                ready.set()
+                await release.wait()
+            return {"stopReason": "cancelled" if worker.cancel_event.is_set() else "end_turn"}
+
+        with mock.patch.object(worker, "_prompt", new=prompt):
+            await worker.handle(acps.request(1, "session/prompt", self.params("first")))
+            owner = worker._prompt_task
+            try:
+                await observe_fixture(ready.wait(), owner)
+                for identifier, text in [[2, "discard"], [3, "also discard"]]:
+                    await worker.handle(acps.request(identifier, "session/prompt", self.params(text)))
+                self.assertEqual(len([message for message in messages if "result" in message]), 3)
+                await worker.dispatch("session/cancel", {})
+                for identifier, text in [[4, "later"], [5, "last"]]:
+                    await worker.handle(acps.request(identifier, "session/prompt", self.params(text)))
+                release.set()
+                await owner
+            finally:
+                release.set()
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+        self.assertEqual(consumed, ["first", "later", "last"])
+        self.assertFalse(worker._v2_pending)
+        self.assertEqual(len([message for message in messages if "result" in message]), 5)
+
     async def test_real_precompact_process_uses_sanitized_existing_runner(self):
         program = "import json,os,sys; p=json.load(sys.stdin); assert p['event']=='pre_compact'; assert 'COMPACTION_SECRET_TOKEN' not in os.environ; print('{}')"
         definition = settings.HookSettings("pre_compact", "real-policy", [sys.executable, "-c", program],

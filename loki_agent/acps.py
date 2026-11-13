@@ -27,7 +27,7 @@ class TransportError(Exception):
 
 # Enable a major only together with its wire/lifecycle implementation. Selection
 # understands newer requests without pretending a version-constant change is v2.
-SUPPORTED_PROTOCOL_VERSIONS = [1]
+SUPPORTED_PROTOCOL_VERSIONS = [1, 2]
 
 
 def negotiate_protocol_version(params):

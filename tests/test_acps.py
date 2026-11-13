@@ -799,6 +799,7 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
     async def test_buffered_restore_close_settles_unstarted_request(self):
         responses = []
         front = acp.Front(lambda: None, responses.append, CredentialStore({}))
+        front.initialize({"protocolVersion": 1})
         source = _FrontInput(front)
         self.addAsyncCleanup(source.close)
         with mock.patch.object(front.credential_supervisor, 'delegate',
@@ -855,6 +856,7 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
 
         front = acp.Front(
             lambda: None, write, CredentialStore({}))
+        front.initialize({"protocolVersion": 1})
         owner = front._reserve_session("session")
         owner.channel = Channel()
         owner.state = "active"

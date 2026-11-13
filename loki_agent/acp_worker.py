@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import copy
 import json
 import os
 import sys
+import uuid
 from dataclasses import dataclass
 
 from . import compactions, connections, model_requests, paths, savefiles
@@ -46,6 +48,14 @@ class PendingSessionOpen:
     open_method: str
 
 
+@dataclass(frozen=True)
+class SubmittedPrompt:
+    # ACP insertion is already acknowledged; execution/model consumption may
+    # wait. Keep presentation identity with its input, never another transcript.
+    params: dict
+    acp_message: dict
+
+
 class TurnFailure(Exception):
     """A turn or explicit-operation failure requiring an ACP v1 request error."""
 
@@ -53,8 +63,13 @@ class TurnFailure(Exception):
 class Worker:
     def __init__(self, session: Session, write, session_id: str = "worker"):
         self.session = session
-        self.write = write
+        self._write = write
         self.session_id = session_id
+        # Chosen only by the live front's prepare-open envelope, never a log.
+        self.protocol_version = 1
+        self._v2_pending = collections.deque()
+        self._foreground_state = "idle"
+        self._v2_cancelled_compaction = None
         # The session reuses one event, cleared only when admitting a new
         # prompt. session/cancel and close set it; requests query is_set, and
         # tools/recovery wait on the same state. Replays must never clear it.
@@ -86,6 +101,120 @@ class Worker:
         self._pending_open: PendingSessionOpen | None = None
         # Images staged by /image, attached to the next real-turn prompt.
         self._pending_images: list = []
+
+    def write(self, message):
+        if self.protocol_version == 2 and message.get("method") == "session/update":
+            params = message["params"]
+            message = {**message, "params": {**params, "update": acp_events.update_v2(params["update"])}}
+        self._write(message)
+
+    def _state(self, state, *, stop_reason=None, error=None, snapshot=False):
+        if self.protocol_version != 2:
+            return
+        if self._foreground_state == state and stop_reason is None and not snapshot:
+            return
+        self._foreground_state = state
+        update = {"sessionUpdate": "state_update", "state": state}
+        if stop_reason is not None:
+            update["stopReason"] = stop_reason
+        if error is not None:
+            update["error"] = {"code": getattr(error, "code", acps.INTERNAL_ERROR), "message": str(error)}
+            if getattr(error, "data", None) is not None:
+                update["error"]["data"] = error.data
+        self.write(acps.notification("session/update", {"sessionId": self.session_id, "update": update}))
+
+    def _v2_insert(self, message, admitted):
+        """Logically insert a live ACP message, not a model prompt or receipt ACK.
+
+        Preflight all envelopes before insertion. The caller-owned record marks
+        the actual insertion boundary even if a subsequent writer fails, so an
+        already-inserted request can never get a second/error response. Local
+        commands remain live-only; ordinary user IDs are retained with their one
+        canonical message when the shared interpreter consumes it.
+        """
+        message_id = str(uuid.uuid4())
+        content = copy.deepcopy(message["params"]["prompt"])
+        reply = acps.response(message["id"], {"messageId": message_id})
+        updates = [acps.notification("session/update", {"sessionId": self.session_id, "update": {
+            "sessionUpdate": "user_message_chunk", "messageId": message_id, "content": block}}) for block in content]
+        for packet in [reply, *updates]:
+            for encoded in acps.encoded_messages(packet):
+                del encoded
+        admitted.update(messageId=message_id, content=content)
+        self.write(reply)
+        for packet in updates:
+            self.write(packet)
+
+    def _cancel_v2_pending(self):
+        # These messages were inserted and ACKed, not held before insertion.
+        # Cancellation stops their queued execution; it cannot send a second
+        # error response or erase the user's live ACP message.
+        self._v2_pending.clear()
+
+    async def _run_v2_prompts(self):
+        """The existing foreground owner serializes work, not insertion replies.
+
+        Valid submissions insert immediately; ordinary model consumption queues
+        in receipt order, while compaction controls share the same turn-owned
+        operation. Queue cancellation covers then-pending execution, not insertion
+        or later input. Settings freeze at actual runtime-turn admission.
+        This is neither another inference engine nor a task per control.
+        """
+        try:
+            while self.session.active:
+                if self.compaction_requests.pending is not None:
+                    self.cancel_event.clear()
+                    self._state("running")
+                    outcome = await self._perform_idle_compaction()
+                    if outcome["type"] == "compaction_failed":
+                        self._state("idle", stop_reason="error", error=outcome["error"])
+                    else:
+                        self._state("idle", stop_reason="cancelled" if outcome["type"] == "compaction_cancelled" else "end_turn")
+                    continue
+                if not self._v2_pending:
+                    break
+                submitted = self._v2_pending.popleft()
+                self.cancel_event.clear()
+                self._state("running")
+                try:
+                    thinking = loki.capture_turn_settings()
+                    result = await self._prompt(submitted.params, thinking, acp_message=submitted.acp_message)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    self._state("idle", stop_reason="error", error=error)
+                else:
+                    self._state("idle", stop_reason=result["stopReason"])
+        finally:
+            self._cancel_v2_pending()
+            self._v2_cancelled_compaction = None
+            if not self.session.active or asyncio.current_task().cancelling():
+                self.compaction_requests.finish_pending(cancelled=True)
+            if self._foreground_state != "idle":
+                self._state("idle", stop_reason="cancelled" if self.cancel_event.is_set() else "error")
+
+    def _handle_v2_prompt(self, message):
+        admitted = {}
+        first = self._prompt_task is None or self._prompt_task.done()
+        try:
+            compact = self._is_compact_control(message.get("params") or {})
+            if first:
+                self.cancel_event.clear()
+                self._state("running")
+            self._v2_insert(message, admitted)
+            if compact:
+                self.compaction_requests.request()
+            else:
+                self._v2_pending.append(SubmittedPrompt(message["params"], admitted))
+            if first:
+                self._prompt_task = asyncio.create_task(self._run_v2_prompts(), name="acp-worker-v2-foreground")
+        except acps.TransportError as error:
+            if "messageId" in admitted:
+                raise
+            self.write(acps.error_response(message["id"], {
+                "code": -32800 if not self.session.active else error.code, "message": str(error)}))
+            if first:
+                self._state("idle", stop_reason="error", error=error)
 
     def _is_compact_control(self, params):
         if not self.session.active:
@@ -124,7 +253,9 @@ class Worker:
     def _event_updates(self, event, state):
         if event.get("type") == "compaction_failed":
             event = {**event, "text": "Context compaction failed: " + compactions.format_error(event["error"])}
-        return acp_events.map_event(self.session_id, event, state, compaction=self.can_report_compaction)
+        return acp_events.map_event(self.session_id, event, state,
+                                    compaction=self.protocol_version == 2 or self.can_report_compaction,
+                                    protocol_version=self.protocol_version)
 
     async def _perform_idle_compaction(self, thinking=None):
         # The admitting owner captures settings and resets cancellation once. A joining control
@@ -157,6 +288,9 @@ class Worker:
         method = message.get("method")
         request_id = message.get("id")
         if method is None or request_id is None:
+            return
+        if self.protocol_version == 2 and method == "session/prompt":
+            self._handle_v2_prompt(message)
             return
         if method == "session/prompt":
             try:
@@ -193,6 +327,7 @@ class Worker:
             self.session.begin_close()
         finally:
             self.cancel_event.set()
+            self._cancel_v2_pending()
             for future in list(self._reverse_requests.values()):
                 if not future.done():
                     future.set_exception(acps.TransportError(
@@ -213,6 +348,10 @@ class Worker:
                     self.compaction_requests.finish_pending(cancelled=True)
             else:
                 self.compaction_requests.finish_pending(cancelled=True)
+            # A close can cancel the foreground task before its first byte of
+            # execution; that task's finally cannot then publish completion.
+            if self._foreground_state != "idle":
+                self._state("idle", stop_reason="cancelled")
 
     async def _answer(
             self, message: dict,
@@ -252,6 +391,10 @@ class Worker:
                 thinking=thinking,
             )
         if method == "session/cancel":
+            if self.protocol_version == 2:
+                self._v2_cancelled_compaction = self.compaction_requests.pending
+                self.compaction_requests.finish_pending(cancelled=True, expected=self._v2_cancelled_compaction)
+                self._cancel_v2_pending()
             self.cancel_event.set()
             return {}
         if method == "session/prepare_open":
@@ -533,8 +676,12 @@ class Worker:
         self.session_id = session_id
         # The front relays whether its client can render questions. Saved
         # conversation data cannot supply this live capability.
+        version = params.get('protocolVersion', 1)
+        if isinstance(version, bool) or not isinstance(version, int) or version not in acps.SUPPORTED_PROTOCOL_VERSIONS:
+            raise acps.TransportError('unsupported worker protocol version', code=acps.INVALID_PARAMS)
+        self.protocol_version = version
         self.can_ask_user = params.get('formElicitation') is True
-        self.can_report_compaction = params.get('compaction') is True
+        self.can_report_compaction = version == 2 or params.get('compaction') is True
         saved_descriptor = None
         connection_update = _UNCHANGED
         if open_method != "session/new":
@@ -654,6 +801,7 @@ class Worker:
         if pending.open_method == "session/load":
             self._replay_transcript()
             self._publish_context_usage()
+        self._state(self._foreground_state, snapshot=True)
         return {
             "configOptions": self.config_options(),
             # Fresh monitor state follows the session reply, including on
@@ -759,9 +907,31 @@ class Worker:
         # Keep each canonical event available while rendering its blocks: the
         # flat text projection loses is_error. Replay must use that existing
         # flag, just like live updates, not infer status from a formatted title.
-        for event in self.session.transcript_items:
+        user_ids = set()
+        for index, event in enumerate(self.session.transcript_items):
             blocks = replays.classify_event(
                 event, show_reasoning=self.session.reasoning_traces == 'on')
+            if self.protocol_version == 2 and event.get('type') == 'message' and event.get('role') == 'user':
+                native = event.get('protocol_data')
+                metadata = native.get('loki') if isinstance(native, dict) else None
+                metadata = metadata if isinstance(metadata, dict) else {}
+                message_id = metadata.get('acp_message_id', f'history-user-{index}')
+                if not isinstance(message_id, str) or not message_id or message_id in user_ids:
+                    raise formats.TranscriptFormatError('saved ACP user message identity is invalid or duplicated')
+                user_ids.add(message_id)
+                content = metadata.get('acp_content')
+                if content is None:
+                    content = ([formats.text_block(block[1]) for block in blocks if block[0] == 'user']
+                               if 'acp_message_id' not in metadata else event['content'])
+                if not isinstance(content, list) or any(not isinstance(block, dict) for block in content):
+                    raise formats.TranscriptFormatError('saved ACP user content is invalid')
+                self.write(acps.notification('session/update', {'sessionId': self.session_id, 'update': {
+                    'sessionUpdate': 'user_message', 'messageId': message_id, 'content': []}}))
+                for block in content:
+                    self.write(acps.notification('session/update', {'sessionId': self.session_id, 'update': {
+                        'sessionUpdate': 'user_message_chunk', 'messageId': message_id, 'content': block}}))
+                previous_kind = 'user'
+                continue
             for kind, text, key in blocks:
                 if kind == 'thought' and previous_kind == 'thought':
                     text = '\n\n' + text
@@ -786,6 +956,11 @@ class Worker:
                         'sessionUpdate': 'agent_thought_chunk' if kind == 'thought' else 'agent_message_chunk',
                         'content': {'type': 'text', 'text': text},
                     }
+                    if self.protocol_version == 2:
+                        update['messageId'] = str(uuid.uuid4())
+                        self.write(acps.notification('session/update', {'sessionId': self.session_id, 'update': {
+                            'sessionUpdate': 'agent_thought' if kind == 'thought' else 'agent_message',
+                            'messageId': update['messageId'], 'content': []}}))
                 self.write(acps.notification('session/update', {
                     'sessionId': self.session_id,
                     'update': update,
@@ -839,8 +1014,12 @@ class Worker:
 
     async def _ask_user(self, question: str, options: list, *,
                         multi_select: bool = False) -> dict:
-        outcome = await self.request_input(
-            question, options, multi_select=multi_select)
+        self._state("requires_action")
+        try:
+            outcome = await self.request_input(question, options, multi_select=multi_select)
+        finally:
+            if self.session.active and not self.cancel_event.is_set():
+                self._state("running")
         if (isinstance(outcome, dict)
                 and outcome.get("action") == "answered"
                 and self.cancel_event.is_set()):
@@ -957,7 +1136,7 @@ class Worker:
                 finally:
                     self._prompt_task = None
 
-    async def _prompt(self, params, thinking):
+    async def _prompt(self, params, thinking, acp_message=None):
         user_text = self._prompt_text(params)
         self.session_id = params.get("sessionId") or self.session_id
 
@@ -986,6 +1165,8 @@ class Worker:
                 outcome = await acp_commands.run(
                     user_text, self.session, cancel_event=self.cancel_event)
             except Exception as error:  # noqa: BLE001 - answered, not fatal
+                if self.protocol_version == 2:
+                    raise
                 outcome = acp_commands.Outcome(
                     text=f"Command failed: {error}")
         if outcome is not None:
@@ -1010,8 +1191,16 @@ class Worker:
         user_content.extend(
             image.content_block() for image in self._pending_images)
         self._pending_images.clear()
-        self.session.transcript_items.append(
-            formats.message_item("user", user_content))
+        user_event = formats.message_item("user", user_content)
+        if acp_message is not None:
+            # ACP insertion identity must survive retained-user replay. Keep
+            # original resource/command presentation only when runtime expansion
+            # differs; none of this metadata becomes provider input or authority.
+            metadata = {"acp_message_id": acp_message["messageId"]}
+            if acp_message["content"] != user_content:
+                metadata["acp_content"] = acp_message["content"]
+            user_event["protocol_data"] = {"loki": metadata}
+        self.session.transcript_items.append(user_event)
         loki.mark_chat_log_dirty()
         events = []
         mapper_state: dict = {}
@@ -1084,8 +1273,14 @@ class Worker:
         finally:
             # No await before sealing this loop. Later controls are serviced
             # after the original save/hook/reply by _answer's idle tail.
-            self.compaction_requests.finish_pending(
-                cancelled=self.cancel_event.is_set() or not self.session.active)
+            if self.protocol_version == 2 and self.cancel_event.is_set() and self.session.active:
+                # A command inserted AFTER session/cancel is a later operation,
+                # not covered by that notification's admission cutoff.
+                if self._v2_cancelled_compaction is not None:
+                    self.compaction_requests.finish_pending(cancelled=True, expected=self._v2_cancelled_compaction)
+            else:
+                self.compaction_requests.finish_pending(
+                    cancelled=self.cancel_event.is_set() or not self.session.active)
 
     @staticmethod
     def _turn_failure(events: list) -> str | None:

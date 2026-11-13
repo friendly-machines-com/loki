@@ -19,6 +19,7 @@ import uuid
 
 from . import (
     __version__,
+    acp_events,
     acps,
     credential_supervisors,
     authentications,
@@ -83,6 +84,9 @@ class WorkerChannel:
         self.reverse_handler = reverse_handler
         self.credential_delegation = credential_delegation
         self._pending: dict[str, asyncio.Future] = {}
+        # Only v2 prompts need withdrawal before their insertion ACK. Keep the
+        # external/internal ID spaces distinct; neither ID is executable state.
+        self._cancellable_prompts: dict = {}
         self._next_request_id = 0
         self._write_lock = asyncio.Lock()
         self._closed = False
@@ -93,7 +97,7 @@ class WorkerChannel:
 
     async def request(
             self, method: str, params: dict,
-            forwarded: asyncio.Event | None = None):
+            forwarded: asyncio.Event | None = None, *, cancellation_id=None):
         if self._closed or self.process.returncode is not None:
             raise acps.TransportError(
                 f"worker for {self.session_id} is not running")
@@ -102,6 +106,9 @@ class WorkerChannel:
             f"front-{self.session_id}-{self._next_request_id}")
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
+        insertion = {"sent": False, "cancelled": False}
+        if cancellation_id is not None:
+            self._cancellable_prompts[cancellation_id] = insertion
         try:
             message = acps.request(request_id, method, params)
             encoded = acps.encode_message(message)
@@ -109,13 +116,33 @@ class WorkerChannel:
                 if self._closed or self.process.stdin is None:
                     raise acps.TransportError(
                         f"worker for {self.session_id} is closed")
+                if insertion["cancelled"]:
+                    raise acps.TransportError("Request cancelled before insertion", code=-32800)
                 self.process.stdin.write(encoded)
+                insertion["sent"] = True
                 await self.process.stdin.drain()
             if forwarded is not None:
                 forwarded.set()
-            return await future
+            return await future if cancellation_id is None else await asyncio.shield(future)
+        except asyncio.CancelledError:
+            if cancellation_id is None or not insertion["sent"]:
+                raise
+            # Close sends EOF before joining operations. Even cancellation in
+            # drain() must await the worker's insertion decision, not manufacture
+            # an error for a message already inserted on the other side.
+            return await finish_cleanup(future, preserve_failure=True)
         finally:
             self._pending.pop(request_id, None)
+            if cancellation_id is not None:
+                self._cancellable_prompts.pop(cancellation_id, None)
+
+    def cancel_prompt(self, cancellation_id):
+        # The worker inserts synchronously on receipt. Withdrawals while waiting
+        # for this channel's write lock can still prevent insertion; after send,
+        # wire order commits the prompt before any subsequent cancellation.
+        insertion = self._cancellable_prompts.get(cancellation_id)
+        if insertion is not None and not insertion["sent"]:
+            insertion["cancelled"] = True
 
     async def respond(self, request_id, result=None, error=None):
         """Answer one worker-initiated reverse request.
@@ -316,6 +343,9 @@ class Front:
         # Failed repeated initialization cannot replace the last success.
         self.protocol_version = None
         self._initialization_locked = False
+        # Withdrawal before forwarding is distinct from cancelling an already
+        # inserted prompt. This lookup borrows live RPC ownership, not a log.
+        self._v2_prompt_cancellations: dict = {}
 
     @property
     def workers(self) -> dict[str, WorkerChannel]:
@@ -327,6 +357,13 @@ class Front:
     async def run(self):
         try:
             async for message in self.read():
+                if self.protocol_version is None and message.get("method") not in [None, "initialize"]:
+                    # The wire connection has no dialect/capabilities yet.
+                    # Direct resource-owner methods remain usable internally;
+                    # uninitialized peers cannot create workers or send controls.
+                    if message.get("id") is not None:
+                        self._error(message, acps.TransportError("initialize is required first", code=acps.INVALID_REQUEST))
+                    continue
                 self.handle(message)
         finally:
             await self.shutdown()
@@ -418,9 +455,13 @@ class Front:
             return
         if not self._connected:
             return
-        if request_id is None and method not in [
-                "session/cancel", "session/close"]:
+        if ((self.protocol_version == 2 or method == "initialize")
+                and "id" in message and request_id is None):
+            self.write(acps.error_response(None, {"code": acps.INVALID_REQUEST, "message": "request id must not be null"}))
             return
+        if request_id is None and method not in ["session/cancel", "session/close"]:
+            if self.protocol_version != 2 or method != "$/cancel_request":
+                return
         params = message.get("params") or {}
         owner = None
         predecessor = None
@@ -438,6 +479,25 @@ class Front:
                 return
             if self.protocol_version is not None and request_id is not None:
                 self._initialization_locked = True
+            if self.protocol_version == 2:
+                if method == "$/cancel_request":
+                    target = params.get("requestId")
+                    if not isinstance(target, bool) and (isinstance(target, str) or isinstance(target, int)):
+                        pending = self._v2_prompt_cancellations.get(target)
+                        if pending is not None:
+                            pending["cancelled"] = True
+                            channel = pending["owner"].channel
+                            if channel is not None:
+                                channel.cancel_prompt(target)
+                    return
+                if method == "session/load":
+                    raise acps.TransportError("use session/resume with replayFrom", code=acps.METHOD_NOT_FOUND)
+                if method == "session/resume":
+                    cursor = params.get("replayFrom")
+                    if cursor is not None and (not isinstance(cursor, dict) or cursor.get("type") != "start"):
+                        raise acps.TransportError("unsupported replayFrom cursor", code=acps.INVALID_PARAMS)
+                if method == "session/set_config_option" and (params.get("type") != "id" or not isinstance(params.get("value"), str)):
+                    raise acps.TransportError("this config option requires type id and a string value", code=acps.INVALID_PARAMS)
             if method == "session/new" or method in RESTORE_METHODS:
                 self._validate_session_setup(params)
                 self._working_directory(params)
@@ -452,7 +512,8 @@ class Front:
                 if owner is None or owner.state == "closing":
                     raise acps.TransportError(
                         f"unknown session {session_id!r}",
-                        code=acps.INVALID_PARAMS)
+                        code=-32002 if self.protocol_version == 2 else acps.INVALID_PARAMS,
+                        data={"sessionId": session_id} if self.protocol_version == 2 else None)
                 if method == "session/close":
                     self._begin_close(owner)
                     self._start_task(
@@ -468,9 +529,20 @@ class Front:
                 if owner.state != "active":
                     raise acps.TransportError(
                         f"unknown session {session_id!r}",
-                        code=acps.INVALID_PARAMS)
+                        code=-32002 if self.protocol_version == 2 else acps.INVALID_PARAMS,
+                        data={"sessionId": session_id} if self.protocol_version == 2 else None)
+                if self.protocol_version == 2 and method == "session/cancel":
+                    # Receipt defines the cancellation cutoff, including prompts
+                    # still waiting at the front rather than already inserted by
+                    # the worker. Other sessions and later submissions survive.
+                    for identifier, pending in self._v2_prompt_cancellations.items():
+                        if pending["owner"] is owner:
+                            pending["cancelled"] = True
+                            owner.channel.cancel_prompt(identifier)
                 predecessor = owner.forwarded
                 if method == "session/prompt":
+                    if self.protocol_version == 2 and request_id in self._v2_prompt_cancellations:
+                        raise acps.TransportError("request id is already pending", code=acps.INVALID_REQUEST)
                     forwarded = asyncio.Event()
                     owner.forwarded = forwarded
                 changing = method == "session/set_config_option"
@@ -479,6 +551,8 @@ class Front:
             task = self._start_task(
                 self._operate(message, owner, predecessor, forwarded, changing),
                 name=f"acp-client-request-{request_id}", owner=owner)
+            if self.protocol_version == 2 and method == "session/prompt":
+                self._v2_prompt_cancellations[request_id] = {"owner": owner, "cancelled": False}
             task.add_done_callback(
                 lambda task: self._cancelled_before_start(task, message, forwarded))
         except Exception as error:
@@ -492,8 +566,10 @@ class Front:
         if task.cancelled():
             if forwarded is not None:
                 forwarded.set()
+            self._v2_prompt_cancellations.pop(message.get("id"), None)
             self._error(message, acps.TransportError(
-                "session operation was closed"))
+                "session operation was closed",
+                code=-32800 if self.protocol_version == 2 and message.get("method") == "session/prompt" else acps.INTERNAL_ERROR))
 
     async def _operate(self, message, owner, predecessor, forwarded, changing):
         try:
@@ -509,11 +585,14 @@ class Front:
             await self._answer(message, forwarded=forwarded, owner=owner)
         except asyncio.CancelledError:
             self._error(message, acps.TransportError(
-                "session operation was closed"))
+                "session operation was closed",
+                code=-32800 if self.protocol_version == 2 and message.get("method") == "session/prompt" else acps.INTERNAL_ERROR))
             return
         except Exception as error:
             self._error(message, error)
         finally:
+            if self.protocol_version == 2 and message.get("method") == "session/prompt":
+                self._v2_prompt_cancellations.pop(message.get("id"), None)
             if forwarded is not None:
                 forwarded.set()
             if changing:
@@ -531,22 +610,28 @@ class Front:
         # publish a worker or write a pin after this close wins admission.
         owner.state = "closing"
         try:
-            if owner.delegation is not None:
-                owner.delegation.revoke_now()
+            if self.protocol_version == 2 and owner.channel is not None and owner.channel.process.stdin is not None:
+                # EOF ends worker admission before we join insertion requests.
+                # Otherwise a held v2 prompt and cleanup could await each other.
+                owner.channel.process.stdin.close()
         finally:
-            # A checked native close can fail during revocation. Publication of
-            # the existing cleanup owner is mandatory on that path as well.
-            for request_id in owner.client_requests:
-                future = self._client_requests.pop(request_id, None)
-                if future is not None:
-                    future.cancel()
-            tasks = list(owner.tasks)
-            for task in tasks:
-                if not task.cancelling():
-                    task.cancel()
-            owner.cleanup = self._start_task(
-                self._finish_close(owner, tasks),
-                name=f"acp-session-close-{owner.session_id}")
+            try:
+                if owner.delegation is not None:
+                    owner.delegation.revoke_now()
+            finally:
+                # Every independent revocation/retirement survives a prior close
+                # failure. Retain the same cleanup owner, never another closer.
+                for request_id in owner.client_requests:
+                    future = self._client_requests.pop(request_id, None)
+                    if future is not None:
+                        future.cancel()
+                tasks = list(owner.tasks)
+                for task in tasks:
+                    if not task.cancelling():
+                        task.cancel()
+                owner.cleanup = self._start_task(
+                    self._finish_close(owner, tasks),
+                    name=f"acp-session-close-{owner.session_id}")
         return owner.cleanup
 
     async def _finish_close(self, owner, tasks):
@@ -594,6 +679,14 @@ class Front:
         updates = None
         if isinstance(result, dict):
             updates = result.pop("lokiUpdates", None)
+            if self.protocol_version == 2:
+                if "configOptions" in result:
+                    result["configOptions"] = acp_events.config_options_v2(result["configOptions"])
+                if method in ["session/new", "session/resume"] and updates:
+                    for update in updates:
+                        if update.get("sessionUpdate") == "available_commands_update":
+                            result["availableCommands"] = acp_events.commands_v2(update["availableCommands"])
+                    updates = [update for update in updates if update.get("sessionUpdate") != "available_commands_update"]
         outgoing = [acps.response(request_id, result=result)]
         if updates:
             # The client learns the session before commands and current plan.
@@ -606,7 +699,7 @@ class Front:
                 for update in updates:
                     outgoing.append(acps.notification("session/update", {
                         "sessionId": session_id,
-                        "update": update,
+                        "update": acp_events.update_v2(update) if self.protocol_version == 2 else update,
                     }))
         try:
             # Check the whole publication before acknowledging success. The
@@ -650,11 +743,18 @@ class Front:
         selected = acps.negotiate_protocol_version(params)
         if self._initialization_locked:
             raise acps.TransportError("initialize cannot be repeated after another request", code=acps.INVALID_REQUEST)
-        client_capabilities = params.get("clientCapabilities")
+        if selected == 2 and params["protocolVersion"] == 2:
+            info = params.get("info")
+            if (not isinstance(info, dict) or not isinstance(info.get("name"), str)
+                    or not isinstance(info.get("version"), str)):
+                raise acps.TransportError("v2 info requires name and version strings", code=acps.INVALID_PARAMS)
+        # A newer requested schema may not carry the selected version's fields;
+        # ignore unparseable downgrade data and let the client reinitialize.
+        client_capabilities = params.get("capabilities" if selected == 2 else "clientCapabilities")
         if not isinstance(client_capabilities, dict):
             client_capabilities = {}
         session_capabilities = client_capabilities.get("session")
-        compaction = (
+        compaction = selected == 2 or (
             isinstance(session_capabilities, dict)
             and isinstance(session_capabilities.get("compaction"), dict))
         elicitation = client_capabilities.get("elicitation")
@@ -665,6 +765,9 @@ class Front:
         self.protocol_version = selected
         self._client_supports_compaction = compaction
         self._client_supports_form_elicitation = form_elicitation
+        if selected == 2:
+            return {"protocolVersion": 2, "info": dict(AGENT_INFO),
+                    "capabilities": {"session": {}}, "authMethods": []}
         return {
             "protocolVersion": selected,
             "agentInfo": AGENT_INFO,
@@ -1097,6 +1200,7 @@ class Front:
                     "sessionId": session_id,
                     "cwd": cwd,
                     "openMethod": open_method,
+                    "protocolVersion": self.protocol_version or 1,
                     # The worker advertises its ask-the-user tool only when
                     # the client can actually answer it, so the model is
                     # never given a question tool that always fails.
@@ -1177,7 +1281,7 @@ class Front:
         self._validate_session_setup(params)
         _, worker_reply = await self._open_worker(
             cwd=self._working_directory(params),
-            open_method=method,
+            open_method=("session/load" if self.protocol_version == 2 and params.get("replayFrom") is not None else method),
             session_id=saved_id,
             restore_request_id=request_id,
             owner=owner,
@@ -1274,6 +1378,11 @@ class Front:
             await self._approve_config_endpoint(
                 channel, params, request_id, owner=owner)
         self._check_owner(owner)
+        if self.protocol_version == 2 and method == "session/prompt":
+            pending = self._v2_prompt_cancellations.get(request_id)
+            if pending is not None and pending["cancelled"]:
+                raise acps.TransportError("Request cancelled before insertion", code=-32800)
+            return await channel.request(method, params, forwarded=forwarded, cancellation_id=request_id)
         return await channel.request(
             method, params, forwarded=forwarded)
 

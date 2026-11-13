@@ -35,6 +35,10 @@ class Requests:
 
     def __init__(self, on_result=None):
         self.pending = None
+        # V2 cancellation can settle unstarted intent immediately, but an
+        # executing attempt owns its cleanup and final publication outcome.
+        # This borrowed Future identifies that executor, not another busy Task.
+        self.running = None
         self.on_result = on_result
 
     def request(self):
@@ -51,8 +55,9 @@ class Requests:
             self.on_result(outcome)
         return outcome
 
-    def finish_pending(self, *, cancelled=False):
-        if self.pending is None:
+    def finish_pending(self, *, cancelled=False, expected=None):
+        if (self.pending is None or self.running is self.pending
+                or (expected is not None and self.pending is not expected)):
             return
         if cancelled:
             outcome = {"type": "compaction_cancelled", "text": "Context compaction cancelled."}
@@ -65,6 +70,7 @@ class Requests:
         if self.pending is None:
             return None
         future = self.pending
+        self.running = future
         emit = on_event if on_event is not None else lambda event: None
         compaction_id = None
         outcome = None
@@ -90,13 +96,16 @@ class Requests:
                        else {"type": "compaction_failed", "error": error})
             raise
         finally:
-            if outcome is not None:
-                if compaction_id is not None:
-                    outcome["compaction_id"] = compaction_id
-                try:
-                    emit(outcome)
-                finally:
-                    self._finish(future, outcome)
+            try:
+                if outcome is not None:
+                    if compaction_id is not None:
+                        outcome["compaction_id"] = compaction_id
+                    try:
+                        emit(outcome)
+                    finally:
+                        self._finish(future, outcome)
+            finally:
+                self.running = None
         return outcome
 
 

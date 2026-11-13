@@ -6,6 +6,9 @@ client-facing meaning).  The worker applies the sessionId and sends.
 
 from __future__ import annotations
 
+import copy
+import uuid
+
 from . import process_outputs
 
 TOOL_KINDS = {
@@ -110,7 +113,7 @@ def tool_call_update(session_id: str, tool_call_id: str, content,
     return {"sessionId": session_id, "update": update}
 
 
-def map_event(session_id: str, event: dict, state: dict, *, compaction=False) -> list:
+def map_event(session_id: str, event: dict, state: dict, *, compaction=False, protocol_version=1) -> list:
     """Translate one Loki on_event into zero or more update params.
 
     ``state`` carries turn-local bookkeeping. Provider call ids are preserved
@@ -133,22 +136,35 @@ def map_event(session_id: str, event: dict, state: dict, *, compaction=False) ->
             return [{"sessionId": session_id, "update": update}]
         return [agent_message_chunk(session_id, event.get("text", "Compacting context."))]
     if kind == "reasoning_start":
+        if protocol_version == 2:
+            state["thought_id"] = str(uuid.uuid4())
+            return []
         if state.get("last_content_kind") == "thought":
             return [{"sessionId": session_id, "update": {
                 "sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "\n\n"}}}]
         return []
     if kind == "reasoning_delta":
         state["last_content_kind"] = "thought"
-        return [{"sessionId": session_id, "update": {
-            "sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": event.get("text", "")}}}]
+        update = {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": event.get("text", "")}}
+        if protocol_version == 2:
+            update["messageId"] = state.get("thought_id") or state.setdefault("thought_id", str(uuid.uuid4()))
+        return [{"sessionId": session_id, "update": update}]
     if kind in ["assistant_start", "assistant_delta", "assistant_message", "tool_call", "tool_result", "tool_rejected"]:
         state["last_content_kind"] = "other"
     if kind == "assistant_start":
         state["message_id"] = state.get("message_counter", 0) + 1
         state["message_counter"] = state["message_id"]
+        if protocol_version == 2:
+            state["agent_message_id"] = str(uuid.uuid4())
+        return []
+    if kind == "assistant_end":
+        state.pop("agent_message_id", None)
         return []
     if kind == "assistant_delta":
-        return [agent_message_chunk(session_id, event.get("content", ""))]
+        packet = agent_message_chunk(session_id, event.get("content", ""))
+        if protocol_version == 2:
+            packet["update"]["messageId"] = state.get("agent_message_id") or state.setdefault("agent_message_id", str(uuid.uuid4()))
+        return [packet]
     if kind == "assistant_message":
         return [agent_message_chunk(session_id, event.get("content", ""))]
     if kind == "tool_call":
@@ -173,8 +189,12 @@ def map_event(session_id: str, event: dict, state: dict, *, compaction=False) ->
         # inline base64 here would also exceed its frame cap for large images.
         text = process_outputs.presentation_text(event.get("content"))
         status = "failed" if event.get("is_error") else "completed"
-        return [tool_call_update(
-            session_id, call_id, _content(text), status=status)]
+        packet = tool_call_update(session_id, call_id, _content(text), status=status)
+        if protocol_version == 2:
+            # V1 defaults an omitted result status to completed; v2 omission
+            # preserves in_progress from the first tool update instead.
+            packet["update"]["status"] = status
+        return [packet]
     if kind == "tool_error":
         # A tool_result event follows with the same real call id and complete
         # content. Sending both produces duplicate terminal updates.
@@ -205,6 +225,51 @@ def map_event(session_id: str, event: dict, state: dict, *, compaction=False) ->
     # transcript_error, response_incomplete/failed: no per-event update;
     # the stopReason or an error response carries them.
     return []
+
+
+def config_options_v2(options):
+    """Project owned configuration facts; never change selection/approval policy."""
+    result = copy.deepcopy(options)
+    for option in result:
+        if "id" in option:
+            option["configId"] = option.pop("id")
+        for entry in option.get("options", []):
+            if "group" in entry:
+                entry["groupId"] = entry.pop("group")
+    return result
+
+
+def commands_v2(commands):
+    result = copy.deepcopy(commands)
+    for command in result:
+        command.setdefault("type", "command")
+        if isinstance(command.get("input"), dict):
+            command["input"].setdefault("type", "text")
+    return result
+
+
+def update_v2(update):
+    """One dialect projection for live, local-command and replay producers.
+
+    Runtime execution stays shared with v1. The worker owns stream IDs at actual
+    event boundaries; a standalone readable status gets its own ID here. These
+    are presentation identities, never tool execution or credential authority.
+    """
+    result = copy.deepcopy(update)
+    kind = result.get("sessionUpdate")
+    if kind == "tool_call":
+        result["sessionUpdate"] = "tool_call_update"
+    elif kind == "plan":
+        # Existing todos are one conversation-owned plan, not a plan registry.
+        result = {"sessionUpdate": "plan_update", "plan": {
+            "type": "items", "planId": "loki-plan", "entries": result.get("entries", [])}}
+    elif kind == "config_option_update":
+        result["configOptions"] = config_options_v2(result.get("configOptions", []))
+    elif kind == "available_commands_update":
+        result["availableCommands"] = commands_v2(result.get("availableCommands", []))
+    elif kind in ["user_message_chunk", "agent_message_chunk", "agent_thought_chunk"] and "messageId" not in result:
+        result["messageId"] = str(uuid.uuid4())
+    return result
 
 
 def _fallback_call_id(state: dict) -> str:
