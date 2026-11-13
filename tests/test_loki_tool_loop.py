@@ -3318,6 +3318,43 @@ class StatusTextTests(unittest.TestCase):
                 self.assertNotIn("\033[0m", rendered)
                 self.assertNotIn("\033[", terminal_frontend.status_text(activity))
 
+    def test_compact_bold_tracks_running_compaction_without_styling_punctuation(self):
+        for turn_running in [False, True]:
+            for compacting in [False, True]:
+                with self.subTest(turn=turn_running, compaction=compacting):
+                    activity = terminal_frontend.TerminalActivityStatus(
+                        turn_running=turn_running, compaction_running=compacting)
+                    with mock.patch.object(terminal_frontend, "_terminal_activity", activity), \
+                            contextlib.redirect_stdout(io.StringIO()) as output:
+                        terminal_frontend._write_status_text()
+                        plain = terminal_frontend.status_text()
+                    rendered = output.getvalue()
+                    expected = "\033[1m/compact\033[22m" if compacting else "/compact"
+                    self.assertIn(f"; {expected}, /model", rendered)
+                    self.assertEqual(rendered.replace("\033[1m", "").replace("\033[22m", ""), plain)
+                    self.assertNotIn("\033[0m", rendered)
+                    self.assertNotIn("\033[", plain)
+
+    def test_compaction_events_refresh_activity_before_output_and_reset_at_every_outcome(self):
+        activity = terminal_frontend.TerminalActivityStatus()
+        repaints, outputs = [], []
+        with mock.patch.object(terminal_frontend, "_terminal_activity", activity), \
+                mock.patch.object(terminal_frontend, "_redraw_status", side_effect=lambda: repaints.append(activity.compaction_running)), \
+                mock.patch.object(terminal_frontend, "_emit_immediate_output", side_effect=lambda *args: outputs.append(activity.compaction_running)):
+            for kind in ["compaction_completed", "compaction_failed", "compaction_cancelled"]:
+                terminal_frontend._terminal_agent_event({"type": "compaction_started"})
+                self.assertTrue(activity.compaction_running)
+                terminal_frontend._terminal_agent_event({"type": kind, "text": "finished", "error": ValueError("failure")})
+                self.assertFalse(activity.compaction_running)
+            activity.set_compaction_running(True)
+            count = len(repaints)
+            activity.set_compaction_running(True)
+            self.assertEqual(len(repaints), count)
+            activity.reset()
+        self.assertEqual(outputs, [True, False] * 3)
+        self.assertIn(True, repaints)
+        self.assertFalse(activity.compaction_running)
+
     def test_ps_bold_tracks_running_jobs_and_stops_at_the_command(self):
         finished = types.SimpleNamespace(
             status="exited", group_active=False,

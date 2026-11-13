@@ -748,11 +748,14 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                 self.before_archive = self.session.transcript_items
                 self.assertTrue(inputs.on_submit("/compact"))
                 self.assertTrue(inputs.on_submit("/compact"))
+                self.assertFalse(terminal_frontend._terminal_activity.compaction_running)
         self.mutate = receive
 
         @contextlib.asynccontextmanager
         async def inspect(method, url, **kwargs):
-            if json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger":
+            compact = json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger"
+            self.assertEqual(terminal_frontend._terminal_activity.compaction_running, compact)
+            if compact:
                 self.assertEqual(self.session.transcript_items[-1]["type"], "tool_result")
                 self.before = copy.deepcopy(self.session.transcript_items)
             async with self.streaming(method, url, **kwargs) as response:
@@ -773,6 +776,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Compaction already requested", output.getvalue())
         self.assertNotIn('"text": "/compact"', json.dumps(self.session.transcript_items))
         self.assertFalse(terminal_frontend._terminal_activity.turn_running)
+        self.assertFalse(terminal_frontend._terminal_activity.compaction_running)
         with open(self.session.chat_log_path, encoding="utf-8") as stream:
             saved, _todos, _state, _tools = savefiles.read_chat_log(stream)
         if failure:

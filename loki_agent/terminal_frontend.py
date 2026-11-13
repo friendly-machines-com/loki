@@ -475,6 +475,10 @@ def _image_command_path(command_text: str) -> str:
 @dataclass
 class TerminalActivityStatus:
     turn_running: bool = False
+    # Actual compaction events own this display-only interval. Pending receipt
+    # and turn_running cover different lifetimes; neither means work has begun.
+    # Reuse status-only redraws so an idle prompt's draft/caret stay untouched.
+    compaction_running: bool = False
     queued_prompts: int = 0
     queued_images: int = 0
 
@@ -487,6 +491,9 @@ class TerminalActivityStatus:
     def set_turn_running(self, running: bool):
         self._set("turn_running", bool(running))
 
+    def set_compaction_running(self, running: bool):
+        self._set("compaction_running", bool(running))
+
     def set_queued_prompts(self, count: int):
         self._set("queued_prompts", max(0, int(count)))
 
@@ -495,6 +502,7 @@ class TerminalActivityStatus:
 
     def reset(self):
         self.turn_running = False
+        self.compaction_running = False
         self.queued_prompts = 0
         self.queued_images = 0
 
@@ -729,6 +737,7 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
             _print_repr_line("  Shell CWD: ", event["cwd"])
         terminal.reset_colors_and_flags()
     elif kind in ["compaction_started", "compaction_completed", "compaction_failed", "compaction_cancelled"]:
+        _terminal_activity.set_compaction_running(kind == "compaction_started")
         if kind == "compaction_started":
             text = "Compacting context."
         elif kind == "compaction_failed":
@@ -883,7 +892,13 @@ def _write_status_text_lines():
         terminal.write_text(fields["effort"])
     print(", Context: ", end="")
     terminal.write_text(fields["context"])
-    print("; /compact, /model", end="")
+    print("; ", end="")
+    if _terminal_activity.compaction_running:
+        print(terminals.BOLD, end="")
+    print("/compact", end="")
+    if _terminal_activity.compaction_running:
+        print(terminals.BOLD_OFF, end="")
+    print(", /model", end="")
     print(", /thinking, /trace thinking, /status, /account", end="")
     terminal.enable_autowrap()
     # CR makes the next line start at column one even when LNM is reset;
