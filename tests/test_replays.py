@@ -125,7 +125,7 @@ class ReplayFidelityTests(unittest.TestCase):
         self.assertIn("Tool error", classified[0][1])
         self.assertIn("boom", classified[0][1])
 
-    def replay_tool_status(self, *, is_error, text):
+    def replay_tool_status(self, *, is_error, text, protocol_version):
         from loki_agent.acp_worker import Worker
 
         updates = []
@@ -133,15 +133,23 @@ class ReplayFidelityTests(unittest.TestCase):
             'type': 'tool_result', 'call_id': 'result-status', 'name': 'Read',
             'is_error': is_error, 'content': [{'type': 'text', 'text': text}],
         }])
-        worker = types.SimpleNamespace(session=session, session_id='replay', write=updates.append)
-        Worker._replay_transcript(worker)
-        return updates[0]['params']['update']['status']
+        worker = Worker(session, updates.append, session_id='replay')
+        worker.protocol_version = protocol_version
+        worker._replay_transcript()
+        update = updates[0]['params']['update']
+        self.assertEqual(update['sessionUpdate'], 'tool_call_update' if protocol_version == 2 else 'tool_call')
+        self.assertEqual(update['toolCallId'], 'result-status')
+        return update['status']
 
     def test_acp_replay_preserves_canonical_failure_status(self):
-        self.assertEqual(self.replay_tool_status(is_error=True, text='operation refused'), 'failed')
+        for version in [1, 2]:
+            with self.subTest(version=version):
+                self.assertEqual(self.replay_tool_status(is_error=True, text='operation refused', protocol_version=version), 'failed')
 
     def test_acp_replay_does_not_guess_from_successful_content(self):
-        self.assertEqual(self.replay_tool_status(is_error=False, text='Error: quoted file text'), 'completed')
+        for version in [1, 2]:
+            with self.subTest(version=version):
+                self.assertEqual(self.replay_tool_status(is_error=False, text='Error: quoted file text', protocol_version=version), 'completed')
 
     def test_provider_tool_call_variant_renders_name(self):
         # Provider-executed tools (execution != "client") still classify as
