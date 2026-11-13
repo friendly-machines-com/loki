@@ -5,7 +5,7 @@ written through an injected text writer, and resume presentation is returned
 as typed text segments for a front-end to render.
 """
 
-from contextlib import contextmanager
+from contextlib import aclosing, contextmanager
 import json
 import os
 import re
@@ -16,14 +16,9 @@ import uuid
 from pprint import pformat
 
 from . import formats
+from . import json_streams
 from . import process_outputs
 from . import texts
-
-
-_PREVIEW_RE = re.compile(
-    r'"role"\s*:\s*"user".*?"text"\s*:\s*"((?:\\.|[^"\\])*)',
-    re.DOTALL,
-)
 
 
 _CHAT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
@@ -125,21 +120,177 @@ def text_for(path: str) -> str:
         return ""
 
 
-def preview(text: str) -> str:
-    # Snatch a one-line preview from the first user message. The chat log's
-    # first "text" field is always the system instruction ("You are a helpful
-    # system agent..."), which is useless for distinguishing chats, so we anchor
-    # on "role":"user" and grab the next "text" after it. Not JSON -- regex on
-    # the decoded text, tolerant of anything weird mid-file.
-    m = _PREVIEW_RE.search(text)
-    snippet = m.group(1) if m else ""
-    snippet = re.sub(r'\s+', ' ', snippet).strip()
-    if len(snippet) > 80:
-        snippet = snippet[:77] + "..."
-    return snippet
+_PREVIEW_CHARS = 80
 
 
-def format_picker_row(idx: int, entry: os.DirEntry[str]) -> str:
+class _PreviewText:
+    # One string's bounded, normalized prefix. Pending whitespace is committed
+    # only when followed by text, so huge trailing/leading whitespace stays small.
+    def __init__(self):
+        self.chars = []
+        self.space = False
+        self.complete = False
+
+    @property
+    def determined(self):
+        return self.complete or len(self.chars) > _PREVIEW_CHARS
+
+    def add(self, part):
+        if self.determined:
+            return
+        for char in part:
+            if char.isspace():
+                self.space = bool(self.chars)
+                continue
+            if self.space:
+                self.chars.append(' ')
+                self.space = False
+                if self.determined:
+                    return
+            self.chars.append(char)
+            if self.determined:
+                return
+
+    def render(self):
+        return (''.join(self.chars[:_PREVIEW_CHARS - 3]) + '...'
+                if len(self.chars) > _PREVIEW_CHARS else ''.join(self.chars))
+
+
+class _PreviewEvent:
+    # Field order is not semantic. Keep one candidate while type/role may still
+    # follow content, not a parsed event or a second retained conversation.
+    def __init__(self):
+        self.kind = None
+        self.role = None
+        self.text = None
+
+    @property
+    def is_user(self):
+        return self.kind == 'message' and self.role == 'user'
+
+    @property
+    def ready(self):
+        return self.is_user and self.text is not None and self.text.determined
+
+
+async def _preview_scalar(reader):
+    if await reader.kind() == '"':
+        return await reader.read_string(json_streams.FIELD_CHARS)
+    await reader.skip()
+    return None
+
+
+async def _preview_block(reader, event):
+    if await reader.kind() != '{':
+        await reader.skip()
+        return
+    await reader.expect('{')
+    first = True
+    kind = None
+    text = None
+    while (key := await reader.key(first=first)) is not None:
+        first = False
+        if key == 'type':
+            kind = await _preview_scalar(reader)
+        elif key == 'text' and text is None and kind in [None, 'text'] and await reader.kind() == '"':
+            text = _PreviewText()
+            if kind == 'text':
+                event.text = text
+            async with aclosing(reader.string_chunks()) as chunks:
+                async for part in chunks:
+                    text.add(part)
+                    if event.ready:
+                        return
+            text.complete = True
+        else:
+            await reader.skip()
+        if kind == 'text' and text is not None:
+            event.text = text
+        if event.ready:
+            return
+
+
+async def _preview_content(reader, event):
+    if await reader.kind() != '[':
+        await reader.skip()
+        return
+    await reader.expect('[')
+    first = True
+    while await reader.item(first=first):
+        first = False
+        if event.text is None:
+            await _preview_block(reader, event)
+        else:
+            await reader.skip()
+        if event.ready:
+            return
+
+
+async def _preview_event(reader, event):
+    if await reader.kind() != '{':
+        await reader.skip()
+        return
+    await reader.expect('{')
+    first = True
+    while (key := await reader.key(first=first)) is not None:
+        first = False
+        if key == 'type':
+            event.kind = await _preview_scalar(reader)
+        elif key == 'role':
+            event.role = await _preview_scalar(reader)
+        elif key == 'content' and event.kind in [None, 'message'] and event.role in [None, 'user']:
+            await _preview_content(reader, event)
+        else:
+            await reader.skip()
+        if event.ready:
+            return
+
+
+async def preview(stream, *, chunk_size=json_streams.CHUNK_SIZE) -> str:
+    """Read a historical first-user excerpt, not the active compaction window.
+
+    Picker rows previously used regex on text_for(), reading the entire log before
+    examining its prefix. A selective cursor instead skips unknown metadata and
+    non-user events without materializing them, and stops once the first user's
+    first text block is determined. Captures remain bounded even with late role
+    fields, huge strings, or future metadata. No schema/format change or cache.
+
+    This is best-effort display of an untrusted prefix, not log validation: an
+    unread tail may be incomplete/invalid (or contain duplicate keys). Resume
+    still uses read_chat_log for authoritative decoding/validation. The caller
+    owns the borrowed stream; cancellation propagates through its existing scope.
+    """
+    reader = json_streams.Reader(stream, chunk_size=chunk_size)
+    event = None
+    try:
+        await reader.expect('{')
+        first = True
+        while (key := await reader.key(first=first)) is not None:
+            first = False
+            if key != 'events' or await reader.kind() != '[':
+                await reader.skip()
+                continue
+            await reader.expect('[')
+            first_event = True
+            while await reader.item(first=first_event):
+                first_event = False
+                event = _PreviewEvent()
+                await _preview_event(reader, event)
+                if event.is_user:
+                    return event.text.render() if event.text is not None else ''
+            return ''
+    except json_streams.Error:
+        # A writer may have stopped partway through a recognizable user string.
+        # Return only the decoded prefix, never raw JSON fragments or other roles.
+        if event is not None and event.is_user and event.text is not None:
+            return event.text.render()
+    return ''
+
+
+async def format_picker_row(idx: int, entry: os.DirEntry[str]) -> str:
+    # The picker owns this one checked open through early success, parse errors
+    # and cancellation. Keep the enumerated pathname verbatim; the lexer has no
+    # filesystem authority and the existing terminal writer escapes its output.
     chat_id = _saved_chat_id(entry.name)
     if chat_id is None:
         raise ValueError('saved conversation name is invalid')
@@ -148,13 +299,19 @@ def format_picker_row(idx: int, entry: os.DirEntry[str]) -> str:
     except OSError:
         mtime = 0
     when = time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))
-    return f"  {idx}. {when}  {chat_id[:8]}  {preview(text_for(entry.path))}"
+    snippet = ''
+    try:
+        with open_chat_log(entry.path, errors='replace') as (stream, _facts):
+            snippet = await preview(stream)
+    except OSError:
+        pass
+    return f"  {idx}. {when}  {chat_id[:8]}  {snippet}"
 
 
 def filtered_chat_log_entries(query: str, chat_log_dir: str) -> list[os.DirEntry[str]]:
-    # Match by whole-file substring, not parsed JSON -- fast, tolerant of
-    # partially-written logs. mtime ordering puts the most recently touched
-    # conversation at the bottom of the list.
+    # Full-text filtering still searches the entire serialized log, unlike
+    # bounded previews. Preserve substring semantics and partial-log tolerance;
+    # mtime ordering puts the most recently touched conversation at the bottom.
     words = query.lower().split()
     entries = chat_log_entries(chat_log_dir)
     if not words:
@@ -183,7 +340,7 @@ async def run_session_picker_async(
         print("bare \"filter\" clears it; a number selects that row; empty cancels.")
         if matches:
             for i, entry in enumerate(matches, 1):
-                text_writer(format_picker_row(i, entry))
+                text_writer(await format_picker_row(i, entry))
                 print()
         else:
             print("  (no chats match -- broaden your filter, or type \"filter\" to clear)")

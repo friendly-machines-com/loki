@@ -5184,6 +5184,21 @@ class SessionPickerTests(unittest.TestCase):
             # Only the aaa log contains both "beta" and "alpha".
             self.assertTrue(result.endswith("chat-aaa.json"))
 
+    def test_picker_filter_still_searches_after_the_preview(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with tempfile.NamedTemporaryFile(dir=tmpdir, prefix="chat-", suffix=".json", delete=False,
+                                             mode="w", encoding="utf-8") as resource:
+                name = resource.name
+                json.dump({"events": [{"type": "message", "role": "user", "content": [
+                    {"type": "text", "text": "origin preview"}]}],
+                    "future_metadata": "search-word-after-the-preview"}, resource)
+            with self._make_picker(tmpdir, ["filter search-word-after-the-preview", "1"]) as session, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
+            self.assertEqual(result, name)
+            self.assertIn("origin preview", output.getvalue())
+            self.assertNotIn("no chats match", output.getvalue())
+
     def test_picker_filter_404_matches_literal_digits(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_chat(tmpdir, "aaa", '{"text":"error 404 in nginx"}', mtime=1000)
@@ -5211,14 +5226,30 @@ class SessionPickerTests(unittest.TestCase):
             self.assertIsNone(result)
 
     def test_picker_preview_handles_partial_json(self):
-        # A truncated/garbled log file must not crash preview extraction.
+        # The first-user excerpt remains usable before a writer finishes the log.
         with tempfile.TemporaryDirectory() as tmpdir:
-            self._write_chat(
-                tmpdir, "broken", '{"text":"hi there this is truncated', mtime=1000)
-            # No closing quote, no closing brace -- regex should still grab "hi there...".
-            with self._make_picker(tmpdir, ["1"]) as session:
+            with tempfile.NamedTemporaryFile(dir=tmpdir, prefix="chat-", suffix=".json", delete=False,
+                                             mode="w", encoding="utf-8") as resource:
+                name = resource.name
+                resource.write('{"events":[{"type":"message","role":"user",'
+                               '"content":[{"type":"text","text":"hi there this is truncated')
+            with self._make_picker(tmpdir, ["1"]) as session, contextlib.redirect_stdout(io.StringIO()) as output:
                 result = asyncio.run(terminal_frontend.run_session_picker_async(session))
-            self.assertTrue(result.endswith("chat-broken.json"))
+            self.assertEqual(result, name)
+            self.assertIn("hi there this is truncated", output.getvalue())
+
+    def test_decoded_preview_preserves_the_terminal_escape_boundary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with tempfile.NamedTemporaryFile(dir=tmpdir, prefix="chat-", suffix=".json", delete=False,
+                                             mode="w", encoding="utf-8") as resource:
+                json.dump({"events": [{"type": "message", "role": "user", "content": [
+                    {"type": "text", "text": "hello \x1b]0;owned\x07 \x9b31m \ud800"}]}]}, resource)
+            with self._make_picker(tmpdir, [""]) as session, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertIsNone(asyncio.run(terminal_frontend.run_session_picker_async(session)))
+            rendered = output.getvalue()
+            self.assertIn("owned", rendered)
+            for control in ["\x1b", "\x07", "\x9b", "\ud800"]:
+                self.assertNotIn(control, rendered)
 
     def test_picker_unrecognized_input_keeps_filter(self):
         with tempfile.TemporaryDirectory() as tmpdir:

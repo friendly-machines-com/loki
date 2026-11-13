@@ -1,5 +1,6 @@
 """Saved-conversation identifier, lookup, and picker validation."""
 
+import asyncio
 import os
 import tempfile
 import unittest
@@ -46,7 +47,7 @@ class SavedConversationNameTests(unittest.TestCase):
                    for value in ['', 'bad name', 'bad\u2603', '\x1b[31m', '\x9b31m', '\udc9b31m',
                                  'bad\nname', 'chat-safe.json']]
         with mock.patch.object(savefiles.os, 'scandir') as scan, \
-                mock.patch.object(savefiles, 'text_for') as read, \
+                mock.patch.object(savefiles, 'open_chat_log') as read, \
                 mock.patch.object(savefiles.os.path, 'getmtime') as metadata:
             scan.return_value.__enter__.return_value = [allowed, *invalid]
             self.assertEqual(savefiles.chat_log_entries('unused'), [allowed])
@@ -55,7 +56,7 @@ class SavedConversationNameTests(unittest.TestCase):
                 with self.subTest(name=entry.name):
                     self.assertIsNone(savefiles.saved_chat_log_path('unused', entry.name[5:-5]))
                     with self.assertRaisesRegex(ValueError, 'conversation name'):
-                        savefiles.format_picker_row(1, entry)
+                        asyncio.run(savefiles.format_picker_row(1, entry))
             read.assert_not_called()
             metadata.assert_not_called()
 
