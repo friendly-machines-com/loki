@@ -404,7 +404,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
     async def test_bad_checkpoint_responses_leave_context_uninstalled(self):
         for mode in ["missing", "duplicate", "empty", "incomplete"]:
             self.mode = mode
-            with self.subTest(mode=mode), self.assertRaises(compactions.CompactionError):
+            with self.subTest(mode=mode), self.assertRaises(protocols.ProtocolError):
                 await loki.compact_context_async(cancel_event=self.event)
             self.assertIs(self.session.transcript_items, self.before_archive)
             self.assertEqual(self.session.transcript_items, self.before)
@@ -527,6 +527,251 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(policy.await_count, 1)
         self.assertEqual(len(attempts), 2)
         self.assertEqual(attempts[0], attempts[1])
+
+    def enable_compaction_recovery(self, *, retry_limit=5, delay=0):
+        # Observe a real configured process through its existing diagnostic pipe,
+        # not a writable file in the hook's deliberately read-only filesystem.
+        observed = []
+        program = '''import json,sys
+payload = json.load(sys.stdin)
+print(json.dumps(payload), file=sys.stderr)
+result = {}
+if payload['event'] == 'turn_error':
+    result = ({'action': 'retry', 'delay_seconds': float(sys.argv[2])}
+              if payload['retry_count'] < int(sys.argv[1]) else {'action': 'finish'})
+print(json.dumps(result))
+'''
+        command = [sys.executable, "-c", program, str(retry_limit), str(delay)]
+        definitions = [settings.HookSettings(phase, name, command, self.session.shell_cwd)
+                       for phase, name in [["pre_compact", "once"], ["turn_error", "retry"]]]
+        self.pipeline = tool_runtime.build_hook_pipeline(
+            definitions, create_exec=loki._tool_process_creator(),
+            stderr_reporter=lambda command, text: observed.extend(json.loads(line) for line in text.splitlines()))
+        self.enterContext(mock.patch.object(loki, "TOOL_HOOK_PIPELINE", self.pipeline))
+        return observed
+
+    async def test_sampling_compaction_and_continuation_share_one_real_retry_hook_counter(self):
+        observed = self.enable_compaction_recovery()
+        self.idle_routing = False
+        self.ordinary_outputs = [self.tool_batch()]
+        requests = compactions.Requests()
+        events, attempts = [], []
+        counts = {"initial": 0, "compact": 0, "continuation": 0}
+
+        def request():
+            if len(self.sent) == 1:
+                requests.request()
+        self.mutate = request
+
+        @contextlib.asynccontextmanager
+        async def scripted(method, url, **kwargs):
+            compact = json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger"
+            stage = "compact" if compact else "initial" if not self.sent else "continuation"
+            counts[stage] += 1
+            attempts.append([stage, kwargs["body"], kwargs["headers_in"]["Idempotency-Key"]])
+            if stage == "initial" and counts[stage] == 1:
+                raise ConnectionResetError(errno.ECONNRESET, "initial node disappeared")
+            if stage == "continuation" and counts[stage] == 1:
+                raise model_requests.StreamingApiError(url, 503, "Unavailable", '{"error":{"message":"new node unavailable"}}')
+            if compact:
+                self.before = copy.deepcopy(self.session.transcript_items)
+                self.mode = "missing" if counts[stage] == 1 else "valid"
+            async with self.streaming(method, url, **kwargs) as response:
+                yield response
+
+        with mock.patch.object(http_client, "async_http_stream", new=scripted), contextlib.redirect_stderr(io.StringIO()):
+            text = await loki.run_tool_loop_async(
+                self.session.transcript_items, cancel_event=self.event, recovery=loki.make_turn_recovery(self.event),
+                stream_chat=True, max_loops=2, compaction_requests=requests, on_event=events.append)
+        self.assertEqual(text, "ordinary answer")
+        self.assertEqual(counts, {"initial": 2, "compact": 2, "continuation": 2})
+        policy = observed
+        failures = [entry for entry in policy if entry["event"] == "turn_error"]
+        self.assertEqual([entry["retry_count"] for entry in failures], [0, 1, 2])
+        self.assertEqual([entry["error_type"] for entry in failures], ["network_error", "provider_error", "api_error"])
+        self.assertTrue(all(entry["recovery_point"] == "request_replay" and not entry["output_started"] for entry in failures))
+        self.assertEqual(sum(entry["event"] == "pre_compact" for entry in policy), 1)
+        for stage in counts:
+            pair = [entry[1:] for entry in attempts if entry[0] == stage]
+            self.assertEqual(pair[0], pair[1])
+        self.assertEqual(len({entry[2] for entry in attempts}), 3)
+        self.assertEqual([event["call_id"] for event in events if event["type"] == "tool_result"], ["step-one", "step-two"])
+        self.assertEqual([event["type"] for event in events if event["type"].startswith("compaction_")],
+                         ["compaction_started", "compaction_completed"])
+        self.assertEqual(sum(event["type"] == "context_replace" for event in self.session.transcript_items), 1)
+
+    async def test_checkpoint_validation_retries_ignored_deltas_with_precompact_once(self):
+        initial = copy.deepcopy(self.before)
+        for mode in ["missing", "duplicate", "empty", "incomplete"]:
+            with self.subTest(mode=mode):
+                observed = self.enable_compaction_recovery()
+                self.session.transcript_items = copy.deepcopy(initial)
+                self.before_archive = self.session.transcript_items
+                self.before = copy.deepcopy(initial)
+                self.sent.clear()
+                attempts = []
+
+                @contextlib.asynccontextmanager
+                async def repaired(method, url, **kwargs):
+                    attempts.append([kwargs["body"], kwargs["headers_in"]["Idempotency-Key"]])
+                    self.idle_routing = len(attempts) == 1
+                    self.assertEqual(kwargs["headers_in"].get(model_requests.CODEX_TURN_STATE_HEADER),
+                                     None if self.idle_routing else "operation-state")
+                    self.mode = mode if len(attempts) == 1 else "valid"
+                    async with self.streaming(method, url, **kwargs) as response:
+                        async def chunks():
+                            # No displayed assistant/thought content or history
+                            # exists for these speculative provider deltas.
+                            yield b'data: {"type":"response.output_text.delta","delta":"ignored text"}\n\n'
+                            async for chunk in response.body:
+                                yield chunk
+                        yield http_client.HttpStreamResponse(url, response.status, response.reason, response.headers, chunks())
+
+                with mock.patch.object(http_client, "async_http_stream", new=repaired), contextlib.redirect_stderr(io.StringIO()):
+                    await loki.compact_context_async(cancel_event=self.event, recovery=loki.make_turn_recovery(self.event))
+                self.assertEqual(attempts[0], attempts[1])
+                policy = observed
+                self.assertEqual([entry["event"] for entry in policy], ["pre_compact", "turn_error"])
+                self.assertEqual(policy[1]["retry_count"], 0)
+                self.assertFalse(policy[1]["output_started"])
+                self.assertNotIn("ignored text", json.dumps(self.session.transcript_items))
+
+    async def test_native_failed_checkpoint_diagnostics_reach_policy_for_sse_and_json(self):
+        data = {"object": "response", "status": "failed", "output": [],
+                "error": {"code": "server_error", "message": "Assigned cluster node failed"}}
+        for streaming in [False, True]:
+            with self.subTest(streaming=streaming):
+                observed = self.enable_compaction_recovery(retry_limit=0)
+
+                @contextlib.asynccontextmanager
+                async def failed(method, url, **kwargs):
+                    async def chunks():
+                        if streaming:
+                            yield b'data: {"type":"response.output_text.delta","delta":"discarded"}\n\n'
+                            yield ("data: " + json.dumps({"type": "response.failed", "response": data}) + "\n\n").encode()
+                        else:
+                            yield json.dumps(data).encode()
+                    yield http_client.HttpStreamResponse(url, 200, "OK", {
+                        "content-type": "text/event-stream" if streaming else "application/json"}, chunks())
+
+                with mock.patch.object(http_client, "async_http_stream", new=failed):
+                    with self.assertRaises(protocols.ResponseApiError):
+                        await loki.compact_context_async(cancel_event=self.event, recovery=loki.make_turn_recovery(self.event))
+                self.assertEqual([entry["event"] for entry in observed], ["pre_compact", "turn_error"])
+                self.assertEqual(observed[1]["provider_code"], "server_error")
+                self.assertEqual(observed[1]["error_details"], data["error"])
+                self.assertEqual(self.session.transcript_items, self.before)
+
+    async def test_compaction_retry_decline_does_not_stack_fixed_transport_attempts(self):
+        observed = self.enable_compaction_recovery(retry_limit=0)
+        attempts = []
+
+        @contextlib.asynccontextmanager
+        async def failed(method, url, **kwargs):
+            attempts.append(kwargs["body"])
+            raise ConnectionResetError(errno.ECONNRESET, "declined by policy")
+            yield
+
+        with mock.patch.object(http_client, "async_http_stream", new=failed):
+            with self.assertRaises(ConnectionResetError):
+                await loki.compact_context_async(cancel_event=self.event, recovery=loki.make_turn_recovery(self.event))
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual([entry["event"] for entry in observed], ["pre_compact", "turn_error"])
+        self.assertEqual(self.session.transcript_items, self.before)
+
+    async def test_compaction_cancel_during_retry_backoff_settles_controls_without_publication(self):
+        observed = self.enable_compaction_recovery(delay=3600)
+        requests = compactions.Requests()
+        accepted = requests.request()
+        ready = asyncio.Event()
+        events = []
+        notice = recoveries._retry_notice
+
+        def waiting(*args):
+            ready.set()
+            return notice(*args)
+
+        @contextlib.asynccontextmanager
+        async def failed(method, url, **kwargs):
+            raise ConnectionResetError(errno.ECONNRESET, "cancel during backoff")
+            yield
+
+        with mock.patch.object(http_client, "async_http_stream", new=failed), \
+                mock.patch.object(recoveries, "_retry_notice", side_effect=waiting), contextlib.redirect_stderr(io.StringIO()):
+            owner = asyncio.create_task(loki.run_tool_loop_async(
+                self.session.transcript_items, cancel_event=self.event, recovery=loki.make_turn_recovery(self.event),
+                stream_chat=True, compaction_requests=requests, on_event=events.append))
+            try:
+                await observe_fixture(ready.wait(), owner)
+                self.event.set()
+                await owner
+            finally:
+                self.event.set()
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+        self.assertEqual(accepted.result()["type"], "compaction_cancelled")
+        self.assertEqual(self.session.transcript_items, self.before)
+        self.assertEqual([entry["event"] for entry in observed], ["pre_compact", "turn_error"])
+        self.assertIsNone(requests.pending)
+
+    async def test_local_compaction_failures_are_never_offered_to_retry_policy(self):
+        initial = copy.deepcopy(self.before)
+        config = copy.deepcopy(self.session.runtime_config)
+        for stage in ["initial_save", "precompact", "stale", "candidate_save", "projection", "unsupported"]:
+            with self.subTest(stage=stage), contextlib.ExitStack() as patches:
+                self.session.transcript_items = copy.deepcopy(initial)
+                self.before_archive = self.session.transcript_items
+                self.before = copy.deepcopy(initial)
+                self.session.runtime_config = copy.deepcopy(config)
+                self.mutate = None
+                self.sent.clear()
+                policy = mock.AsyncMock(return_value=recoveries.RetryDecision(0))
+                recovery = recoveries.TurnRecovery(policy, self.event)
+                if stage == "initial_save":
+                    patches.enter_context(mock.patch.object(loki, "save_chat_log", side_effect=OSError("initial save failed")))
+                elif stage == "precompact":
+                    patches.enter_context(mock.patch.object(self.pipeline, "prepare_compaction", new=mock.AsyncMock(
+                        side_effect=tool_runtime.HookExecutionError("gate denied"))))
+                elif stage == "stale":
+                    self.mutate = lambda: setattr(self.session.runtime_config, "model", "changed")
+                elif stage == "candidate_save":
+                    save = loki.save_chat_log
+
+                    def saving(*args, **kwargs):
+                        if kwargs.get("on_published") is not None:
+                            raise OSError("candidate save failed")
+                        return save(*args, **kwargs)
+                    patches.enter_context(mock.patch.object(loki, "save_chat_log", side_effect=saving))
+                elif stage == "projection":
+                    patches.enter_context(mock.patch.object(compactions, "build_v2_window", side_effect=formats.ProjectionError("projection failed")))
+                else:
+                    self.session.runtime_config.model = ""
+                expected = {"initial_save": OSError, "precompact": tool_runtime.HookExecutionError,
+                            "stale": compactions.CompactionError, "candidate_save": OSError,
+                            "projection": formats.ProjectionError, "unsupported": compactions.CompactionError}
+                with self.assertRaises(expected[stage]):
+                    await loki.compact_context_async(cancel_event=self.event, recovery=recovery)
+                policy.assert_not_awaited()
+                self.assertFalse(any(event["type"] == "context_replace" for event in self.session.transcript_items))
+
+    async def test_idle_compaction_does_not_borrow_a_configured_turn_retry_hook(self):
+        observed = self.enable_compaction_recovery(retry_limit=0)
+        attempts = []
+
+        @contextlib.asynccontextmanager
+        async def retry(method, url, **kwargs):
+            attempts.append(kwargs["body"])
+            if len(attempts) == 1:
+                raise ConnectionResetError(errno.ECONNRESET, "idle transport replay")
+            async with self.streaming(method, url, **kwargs) as response:
+                yield response
+
+        with mock.patch.object(http_client, "async_http_stream", new=retry), \
+                mock.patch.object(http_client, "HTTP_RETRY_BASE_DELAY_S", 0), \
+                mock.patch.object(http_client, "HTTP_RETRY_MAX_JITTER_S", 0):
+            await loki.compact_context_async(cancel_event=self.event)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual([entry["event"] for entry in observed], ["pre_compact"])
 
     async def test_model_change_during_gate_stops_before_remote_billing(self):
         definition = settings.HookSettings("pre_compact", "stale", ["policy"], self.session.shell_cwd, on_error="deny")
@@ -732,7 +977,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"text": "/compact"', json.dumps(self.session.transcript_items))
         self.assertIn("/compact", terminal_frontend.status_text())
 
-    async def _tui_running_control(self, failure=False):
+    async def _tui_running_control(self, failure=False, *, compaction_retries=0):
         from test_loki_tool_loop import ScriptedInputSession
         inputs = ScriptedInputSession(["perform work", "/quit"])
         self.idle_routing = False
@@ -769,7 +1014,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(http_client, "async_http_stream", new=inspect), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
-        self.assertEqual(len(self.sent), 2 if failure else 3)
+        self.assertEqual(len(self.sent), (2 if failure else 3) + compaction_retries)
         self.assertEqual(self.pipeline.finish_turn.await_count, 1)
         self.assertEqual(self.pipeline.finish_turn.call_args.args[0]["reason"], "error" if failure else "completed")
         self.assertIs(self.session.transcript_items, self.before_archive)
@@ -784,6 +1029,24 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Context compaction failed", output.getvalue())
         else:
             self.assertEqual(formats.item_text(formats.active_events(saved)[-1]), "ordinary answer")
+
+    async def test_tui_compaction_recovery_keeps_status_active_and_finalizes_once(self):
+        observed = self.enable_compaction_recovery()
+        streaming = self.streaming
+        attempts = 0
+
+        @contextlib.asynccontextmanager
+        async def repaired(method, url, **kwargs):
+            nonlocal attempts
+            if json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger":
+                attempts += 1
+                self.mode = "missing" if attempts == 1 else "valid"
+            async with streaming(method, url, **kwargs) as response:
+                yield response
+
+        with mock.patch.object(self, "streaming", new=repaired):
+            await self._tui_running_control(compaction_retries=1)
+        self.assertEqual([entry["event"] for entry in observed], ["pre_compact", "turn_error"])
 
     async def test_tui_receipt_during_sampling_coalesces_and_saves_same_turn_continuation(self):
         await self._tui_running_control()
@@ -1269,7 +1532,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
     async def test_acp_v1_cancel_settles_all_controls_without_another_operation(self):
         await self._acp_control_journey(cancel=True)
 
-    async def _v2_control_journey(self, *, failure=False, cancel=False):
+    async def _v2_control_journey(self, *, failure=False, cancel=False, compaction_retries=0):
         self.idle_routing = False
         self.ordinary_outputs = [self.tool_batch()]
         self.mode = "missing" if failure else "valid"
@@ -1332,7 +1595,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lifecycle[0]["compactionId"], lifecycle[1]["compactionId"])
         self.assertEqual(updates[-1]["state"], "idle")
         self.assertEqual(updates[-1]["stopReason"], "error" if failure else "cancelled" if cancel else "end_turn")
-        self.assertEqual(len(self.sent), 2 if failure or cancel else 3)
+        self.assertEqual(len(self.sent), (2 if failure or cancel else 3) + compaction_retries)
         self.assertEqual(self.pipeline.finish_turn.await_count, 1)
         self.assertIsNone(worker.compaction_requests.pending)
         self.assertNotIn('"text": "/compact"', json.dumps(self.session.transcript_items))
@@ -1340,6 +1603,24 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({update["messageId"] for update in users}, {message["result"]["messageId"] for message in replies})
         self.assertTrue(all("messageId" in update for update in updates
                             if update["sessionUpdate"] in ["agent_message_chunk", "agent_thought_chunk"]))
+
+    async def test_v2_compaction_recovery_preserves_single_insertion_replies_and_lifecycle(self):
+        observed = self.enable_compaction_recovery()
+        streaming = self.streaming
+        attempts = 0
+
+        @contextlib.asynccontextmanager
+        async def repaired(method, url, **kwargs):
+            nonlocal attempts
+            if json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger":
+                attempts += 1
+                self.mode = "missing" if attempts == 1 else "valid"
+            async with streaming(method, url, **kwargs) as response:
+                yield response
+
+        with mock.patch.object(self, "streaming", new=repaired), contextlib.redirect_stderr(io.StringIO()):
+            await self._v2_control_journey(compaction_retries=1)
+        self.assertEqual([entry["event"] for entry in observed], ["pre_compact", "turn_error"])
 
     async def test_v2_midturn_compaction_acks_immediately_and_coalesces_one_operation(self):
         await self._v2_control_journey()

@@ -1694,7 +1694,7 @@ async def run_tool_loop_async(
         outcome = await compaction_requests.run(
             lambda started: compact_context_async(
                 cancel_event=cancel_event, thinking=thinking, context=compaction_context,
-                tools=compaction_tools, codex_turn_state=codex_turn_state, on_start=started),
+                tools=compaction_tools, codex_turn_state=codex_turn_state, on_start=started, recovery=recovery),
             on_event)
         if outcome["type"] == "compaction_cancelled":
             on_event({"type": "response_cancelled", "partial": False, "saved": True})
@@ -2832,7 +2832,7 @@ def save_chat_log(*, events=None, on_published=None):
 
 
 async def compact_context_async(*, cancel_event, thinking=None, allowed=None, allow_ask=False,
-                                context=None, tools=None, codex_turn_state=None, on_start=None):
+                                context=None, tools=None, codex_turn_state=None, on_start=None, recovery=None):
     """Shared explicit operation; the existing turn/idle task retains execution.
 
     Ordinary tool turns append responses before dispatch and ordinary clean saves
@@ -2846,7 +2846,9 @@ async def compact_context_async(*, cancel_event, thinking=None, allowed=None, al
 
     Publish existing history first, even when clean, to reject an unsaveable session
     before billing rather than trusting a pathname/access precheck. PreCompact runs
-    once with saved-log metadata, outside prepared transport retries. Its declared
+    once with saved-log metadata, outside prepared request retries. Active turns
+    lend their existing recovery object/counter only to that request; idle commands
+    and post-turn tails have no turn policy to borrow. PreCompact's declared
     filesystem effects are not rolled back. All candidate state stays local across
     hook/request awaits. Immediately after final checks, save the explicit candidate
     and install its record in the EXISTING archive at the writer's publication
@@ -2857,6 +2859,8 @@ async def compact_context_async(*, cancel_event, thinking=None, allowed=None, al
     """
     if not isinstance(cancel_event, asyncio.Event):
         raise TypeError("cancel_event must be an asyncio.Event")
+    if recovery is not None and recovery.cancel_event is not cancel_event:
+        raise ValueError("recovery and compaction must share the owning turn event")
     session = current_session()
     if cancel_event.is_set() or not session.active:
         raise recoveries.Cancelled()
@@ -2911,7 +2915,7 @@ async def compact_context_async(*, cancel_event, thinking=None, allowed=None, al
         cancel_event=cancel_event, file_observations=session.file_observations)
     recheck()
     checkpoint = await compactions.request_v2(
-        context, active, tools, thinking, cancelled, codex_turn_state=codex_turn_state)
+        context, active, tools, thinking, cancelled, codex_turn_state=codex_turn_state, recovery=recovery)
     window = compactions.build_v2_window(active, checkpoint)
     # Projection validates origin/profile compatibility before a candidate can
     # replace history. The provider owns framing; saved provenance cannot choose it.

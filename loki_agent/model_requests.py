@@ -794,7 +794,16 @@ async def async_chat_stream_request(
         codex_turn_state=None,
         opencode_session_id=None, on_reasoning_delta=None,
         *, context: RequestContext,
-        recovery: recoveries.TurnRecovery | None = None) -> protocols.ProviderResponse:
+        recovery: recoveries.TurnRecovery | None = None,
+        validate_response=None, discard_deltas=False) -> protocols.ProviderResponse:
+    # Compaction owns an unpublished candidate, unlike ordinary model output.
+    # Its validator runs INSIDE this existing prepared replay boundary: successful
+    # SSE transport alone cannot establish a usable checkpoint. It may discard
+    # deltas, allowing replay after ignored output without weakening ordinary
+    # inference's output guard. Validation has no history/tool/save side effects;
+    # the caller alone publishes its candidate after this request has returned.
+    if discard_deltas and (on_text_delta is not None or on_reasoning_delta is not None):
+        raise ValueError("discarded deltas cannot have output callbacks")
     # The shared user-turn policy may authorize a prepared replay only before
     # output. After output, the model/tool loop must decide continuation from
     # its valid history instead. Both sites borrow one object/counter; this loop
@@ -806,13 +815,13 @@ async def async_chat_stream_request(
 
     def callback(text):
         nonlocal output_started
-        output_started = output_started or bool(text)
+        output_started = output_started or (bool(text) and not discard_deltas)
         if on_text_delta is not None:
             on_text_delta(text)
 
     def reasoning_callback(key, kind, text):
         nonlocal output_started
-        output_started = output_started or bool(text)
+        output_started = output_started or (bool(text) and not discard_deltas)
         if on_reasoning_delta is not None:
             on_reasoning_delta(key, kind, text)
 
@@ -856,6 +865,10 @@ async def async_chat_stream_request(
                 stream_kwargs["on_reasoning_delta"] = reasoning_callback
             response = await _async_chat_stream_request_once(
                 request_url, payload, headers_to_use, callback, cancel, **stream_kwargs)
+            if cancel():
+                raise recoveries.Cancelled()
+            if validate_response is not None:
+                validate_response(response)
             break
         except http_client.HttpRequestCancelled:
             raise recoveries.Cancelled()

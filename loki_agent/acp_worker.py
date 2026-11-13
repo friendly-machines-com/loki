@@ -118,7 +118,9 @@ class Worker:
         if stop_reason is not None:
             update["stopReason"] = stop_reason
         if error is not None:
-            update["error"] = {"code": getattr(error, "code", acps.INTERNAL_ERROR), "message": str(error)}
+            code = getattr(error, "code", None)
+            update["error"] = {"code": code if isinstance(code, int) and not isinstance(code, bool) else acps.INTERNAL_ERROR,
+                               "message": str(error)}
             if getattr(error, "data", None) is not None:
                 update["error"]["data"] = error.data
         self.write(acps.notification("session/update", {"sessionId": self.session_id, "update": update}))

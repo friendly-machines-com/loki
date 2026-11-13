@@ -164,6 +164,18 @@ class ChannelInsertionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len([message for message in messages if "result" in message]), 1)
         self.assertIsNone(worker.compaction_requests.pending)
 
+    async def test_provider_error_codes_do_not_replace_jsonrpc_error_codes(self):
+        from loki_agent import protocols
+        session = Session()
+        self.addAsyncCleanup(session.close_state)
+        messages = []
+        worker = acp_worker.Worker(session, messages.append)
+        worker.protocol_version = 2
+        error = protocols.ResponseApiError("Try another node", code="cluster_unavailable")
+        worker._state("idle", stop_reason="error", error=error)
+        self.assertEqual(messages[-1]["params"]["update"]["error"], {
+            "code": acps.INTERNAL_ERROR, "message": "Try another node"})
+
     def channel(self):
         session = Session()
         self.addAsyncCleanup(session.close_state)
