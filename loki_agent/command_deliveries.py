@@ -7,11 +7,10 @@ Command text is classified here and nowhere else: frontends consult
 ``terminal_immediate``/``classify`` instead of comparing command names at
 their admission points.
 
-This table owns terminal delivery only. ACP commands use ordinary prompt
-admission in ``acp_worker._prepare_prompt``, which rejects overlap rather
-than queueing. There is deliberately no unused ACP delivery flag here:
-``agent_message_chunk`` has no message boundary, so ACP immediacy needs an
-out-of-band output channel before that gate can be changed (decision D2).
+This table owns terminal monitor delivery only. ``compact_argument`` shares
+just the explicit-control grammar: receipt records intent, never executes a
+compactor or emits ACP text during streaming. Ordinary ACP prompts still reject
+overlap; its narrow compaction control retains independent v1 reply ownership.
 """
 
 from __future__ import annotations
@@ -22,6 +21,20 @@ from typing import Callable
 
 PROMPT = "prompt"
 IMMEDIATE = "immediate"
+
+
+def compact_argument(text: str) -> str | None:
+    """Recognize explicit compaction without making it a monitor operation.
+
+    TUI receipt and ACP parsing share whitespace/name boundaries. An empty string
+    is the valid control; other arguments receive local usage/busy handling, never
+    a new model prompt. Lookalikes remain ordinary text.
+    """
+    stripped = text.strip()
+    if stripped == "/compact" or (stripped.startswith("/compact")
+                                  and len(stripped) > 8 and stripped[8].isspace()):
+        return stripped[8:].strip()
+    return None
 
 
 @dataclass(frozen=True)

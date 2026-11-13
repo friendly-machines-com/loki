@@ -1615,7 +1615,8 @@ async def run_tool_loop_async(
         cancel_event: asyncio.Event | None = None,
         ask_user=None,
         reasoning_effort=_UNSET,
-        thinking: model_requests.TurnThinkingSettings | None = None) -> str:
+        thinking: model_requests.TurnThinkingSettings | None = None,
+        compaction_requests=None) -> str:
     """Run the model/tool loop over canonical session events.
 
     Mutates ``transcript_items`` by appending one ``model_response`` for each
@@ -1674,6 +1675,37 @@ async def run_tool_loop_async(
         on_event = lambda event: None
     if on_response is None:
         on_response = lambda turn, event: None
+    # The foreground owner lends explicit intent, not a concurrent compactor.
+    # Capture the same admitted inputs once; pending UI preferences cannot alter
+    # a rollover or its continuation. Helpers/headless callers lend no intake.
+    compaction_context = None
+    compaction_tools = None
+    if compaction_requests is not None:
+        compaction_context = replace(_model_request_context(), config=copy.deepcopy(session.runtime_config))
+        compaction_tools = (advertised_tools if advertised_tools is not None else
+                            offered_tools(allowed, allow_ask=ask_user is not None))
+
+    async def service_compaction():
+        if compaction_requests is None or compaction_requests.pending is None:
+            return True
+        if cancel_check():
+            on_event({"type": "response_cancelled", "partial": False, "saved": True})
+            return False
+        outcome = await compaction_requests.run(
+            lambda started: compact_context_async(
+                cancel_event=cancel_event, thinking=thinking, context=compaction_context,
+                tools=compaction_tools, codex_turn_state=codex_turn_state, on_start=started),
+            on_event)
+        if outcome["type"] == "compaction_cancelled":
+            on_event({"type": "response_cancelled", "partial": False, "saved": True})
+            return False
+        return outcome["type"] != "compaction_failed"
+
+    async def finish_settled(text):
+        # Tool-less follow-up and final responses do not pass through the batch
+        # loop-back. Service accepted intent here without inventing another sample.
+        return text if await service_compaction() else ""
+
     if max_loops < 1:
         raise ValueError("max_loops must be at least 1")
 
@@ -1691,6 +1723,10 @@ async def run_tool_loop_async(
     def append_turn(turn):
         response_event = turn.to_event()
         transcript_items.append(response_event)
+        if transcript_items is session.transcript_items:
+            # A mid-turn checkpoint just saved/cleared dirty state. The next
+            # real response must become saveable even without new user input.
+            mark_chat_log_dirty()
         if advertised_tools is not None:
             # The sampler owns the offered snapshot; terminal and ACP must
             # record that same snapshot, not independently rebuild it later.
@@ -1743,6 +1779,11 @@ async def run_tool_loop_async(
                 "partial": False,
                 "saved": False,
             })
+            return ""
+        # Every continuation reaches this settled boundary after ALL prior tool
+        # results/hooks, never inside prepared-body replay or an unresolved Ask.
+        # Compaction is not a model response and must not consume this counter.
+        if not await service_compaction():
             return ""
         loop_count += 1
         live_text_started = False
@@ -1916,7 +1957,7 @@ async def run_tool_loop_async(
                 and not tool_calls):
             if loop_count >= max_loops:
                 on_event({"type": "max_loops"})
-                return assistant_text
+                return await finish_settled(assistant_text)
             # Anthropic server tools require the paused assistant response to
             # be sent back unchanged in the next request. No synthetic user or
             # tool-result event belongs between the two provider responses.
@@ -1925,7 +1966,7 @@ async def run_tool_loop_async(
         if turn.metadata.get("end_turn") is False and not tool_calls:
             if loop_count >= max_loops:
                 on_event({"type": "max_loops"})
-                return assistant_text
+                return await finish_settled(assistant_text)
             # Responses-Lite can explicitly say that a completed response is
             # not the end of the logical turn.  Preserve the real response
             # boundary, then let the provider continue from that history
@@ -1933,12 +1974,12 @@ async def run_tool_loop_async(
             continue
 
         if not turn.items:
-            return ""
+            return await finish_settled("")
         if not assistant_items and not tool_calls:
-            return ""
+            return await finish_settled("")
 
         if not tool_calls:
-            return assistant_text
+            return await finish_settled(assistant_text)
 
         if cancel_check():
             reason = "Tool call not executed because the user cancelled the turn."
@@ -1956,7 +1997,7 @@ async def run_tool_loop_async(
                 f"{max_loops}-response autonomous loop limit.")
             append_unexecuted_results(tool_calls, reason)
             on_event({"type": "max_loops"})
-            return assistant_text
+            return await finish_settled(assistant_text)
 
         for call_index, tc in enumerate(tool_calls):
             result, execution = await execute_tool_call_async(
@@ -2407,7 +2448,8 @@ async def run_turn_end_hooks_async(events, text="", *, error=None):
     pipeline = TOOL_HOOK_PIPELINE
     if not pipeline.turn_end_hooks or not current_session().active:
         return
-    error_kinds = recoveries.MODEL_FAILURE_TYPES | {"transcript_error"}
+    # Compaction failure is final notification input, never retry eligibility.
+    error_kinds = recoveries.MODEL_FAILURE_TYPES | {"transcript_error", "compaction_failed"}
     failure = next((event for event in events
                     if event.get("type") in error_kinds), None)
     kinds = {event.get("type") for event in events}
@@ -2728,17 +2770,15 @@ def new_chat_log(filename):
     session.chat_log_dirty = True
 
 
-def save_chat_log(*, events=None):
-    """Publish current history or an explicit, still-uninstalled candidate.
+def save_chat_log(*, events=None, on_published=None):
+    """Publish ordinary history or a candidate without temporary installation.
 
-    compact_context_async must save before changing Session.transcript_items;
-    temporarily installing history or marking dirty would expose an uncommitted
-    window to other consumers. An explicit candidate therefore bypasses the clean
-    shortcut, requires a selected path and reports actual publication. Reuse the
-    atomic writer and CURRENT preference/todo serialization, not reset/resume APIs.
-    Exceptions leave candidate installation to the caller (which must not install
-    on failure); filesystem effects already exposed by a failing writer are not
-    claimed rolled back. No await splits publication and caller installation.
+    An explicit candidate bypasses the clean shortcut. The existing writer's
+    synchronous publication callback reconciles CURRENT saved preferences/dirty
+    state and installs a prepared selection before post-rename cleanup can fail.
+    A raised cleanup error therefore cannot leave disk and RAM selecting different
+    contexts. No await splits publication and installation; no rollback, reset,
+    second writer or power-loss durability guarantee is introduced.
     """
     session = current_session()
 
@@ -2779,15 +2819,21 @@ def save_chat_log(*, events=None):
         state,
         toolsets=session.session_toolsets,
     )
-    files.atomic_write_text(session.chat_log_path, content)
+
+    def published():
+        session.session_state = state
+        session.chat_log_dirty = False
+        if on_published is not None:
+            on_published()
+
+    files.atomic_write_text(session.chat_log_path, content, on_published=published)
     savefiles.report_chat_log_saved(session.chat_log_path)
-    session.session_state = state
-    session.chat_log_dirty = False
     return True
 
 
-async def compact_context_async(*, cancel_event, thinking=None, allowed=None, allow_ask=False):
-    """Session-owned manual operation; frontends retain admission/busy ownership.
+async def compact_context_async(*, cancel_event, thinking=None, allowed=None, allow_ask=False,
+                                context=None, tools=None, codex_turn_state=None, on_start=None):
+    """Shared explicit operation; the existing turn/idle task retains execution.
 
     Ordinary tool turns append responses before dispatch and ordinary clean saves
     may skip: neither can commit a checkpoint candidate safely. Capture identity,
@@ -2803,7 +2849,8 @@ async def compact_context_async(*, cancel_event, thinking=None, allowed=None, al
     once with saved-log metadata, outside prepared transport retries. Its declared
     filesystem effects are not rolled back. All candidate state stays local across
     hook/request awaits. Immediately after final checks, save the explicit candidate
-    THEN install it with no await between them. That is cancellation's commit boundary:
+    and install its record in the EXISTING archive at the writer's publication
+    notification, before cleanup can fail. That is cancellation's commit boundary:
     a later cancellation cannot relabel success or undo publication. Preserve todos,
     cwd, jobs, staged input, file observations (except declared hook effects), model,
     conversation identity and current preferences; reset/resume helpers would not.
@@ -2811,21 +2858,31 @@ async def compact_context_async(*, cancel_event, thinking=None, allowed=None, al
     if not isinstance(cancel_event, asyncio.Event):
         raise TypeError("cancel_event must be an asyncio.Event")
     session = current_session()
-    original_config = session.runtime_config
-    context = replace(_model_request_context(), config=copy.deepcopy(original_config))
-    compactions.require_v2(context)
-    path = session.chat_log_path
-    if not isinstance(path, str) or not path:
-        raise compactions.CompactionError("Select a saved conversation before compacting context.")
+    if cancel_event.is_set() or not session.active:
+        raise recoveries.Cancelled()
     archive = session.transcript_items
     length = len(archive)
     active = copy.deepcopy(formats.active_events(archive))
     formats.validate_replacement(active)
-    identity = session.conversation_id
-    authority = session.credential_authority
+    # An idle startup already contains instructions. Adding a checkpoint when
+    # nothing can be omitted only breaks the first mode announcement's prefix.
+    # A running caller reaches here only after its whole current batch settles.
+    if len(compactions.retained_messages(active)) == len(active):
+        return "Nothing to compact."
+    original_config = session.runtime_config
+    if context is None:
+        context = replace(_model_request_context(), config=copy.deepcopy(original_config))
+    compactions.require_v2(context)
+    path = session.chat_log_path
+    if not isinstance(path, str) or not path:
+        raise compactions.CompactionError("Select a saved conversation before compacting context.")
+    identity = context.conversation_id
+    authority = context.credential_authority
     pipeline = TOOL_HOOK_PIPELINE
     thinking = thinking if thinking is not None else capture_turn_settings()
-    tools = copy.deepcopy(offered_tools(allowed, allow_ask=allow_ask))
+    tools = copy.deepcopy(tools if tools is not None else offered_tools(allowed, allow_ask=allow_ask))
+    if codex_turn_state is None:
+        codex_turn_state = model_requests.CodexTurnState()
     task = asyncio.current_task()
 
     def cancelled():
@@ -2841,6 +2898,8 @@ async def compact_context_async(*, cancel_event, thinking=None, allowed=None, al
             raise compactions.CompactionError("The conversation or selected model changed; context was not compacted.")
 
     recheck()
+    if on_start is not None:
+        on_start()
     if not save_chat_log(events=archive):
         raise compactions.CompactionError("The conversation could not be saved; context was not compacted.")
     await pipeline.prepare_compaction(
@@ -2851,7 +2910,8 @@ async def compact_context_async(*, cancel_event, thinking=None, allowed=None, al
          "model": context.config.model, "provider": context.config.chat_provider.provider_id},
         cancel_event=cancel_event, file_observations=session.file_observations)
     recheck()
-    checkpoint = await compactions.request_v2(context, active, tools, thinking, cancelled)
+    checkpoint = await compactions.request_v2(
+        context, active, tools, thinking, cancelled, codex_turn_state=codex_turn_state)
     window = compactions.build_v2_window(active, checkpoint)
     # Projection validates origin/profile compatibility before a candidate can
     # replace history. The provider owns framing; saved provenance cannot choose it.
@@ -2859,10 +2919,13 @@ async def compact_context_async(*, cancel_event, thinking=None, allowed=None, al
     record = formats.context_replace_event(window)
     candidate = archive + [record]
     recheck()
-    if not save_chat_log(events=candidate):
+
+    def install():
+        archive.append(record)
+        session.context_snapshot(live=True)
+
+    if not save_chat_log(events=candidate, on_published=install):
         raise compactions.CompactionError("The compacted context could not be saved; previous context remains active.")
-    session.transcript_items = candidate
-    session.context_snapshot(live=True)
     return "Context compacted. Earlier messages remain in the transcript."
 
 

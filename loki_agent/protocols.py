@@ -856,23 +856,11 @@ class Provider:
                     payload, spec.effort_field, reasoning_effort)
             return payload
         if self.kind == OPENAI_RESPONSES:
-            # Subscription instruction messages use the developer channel; Lite
-            # rejects system messages. Prefix-only conversion used to cover an
-            # initial mode announcement, but /compact before that first turn puts
-            # a checkpoint ahead of it; /cd and later mode changes can append
-            # instructions too. Keep one subscription mapping for both profiles
-            # while generic Responses retains its literal roles. Formats keeps
-            # position/canonical authority; saved provenance never selects framing.
-            system_role = "developer" if self.provider_id == "openai-subscription" else "system"
+            # Keep the established instruction-prefix contract. Compaction must
+            # not invent a subscription-wide translation for legitimate later
+            # instructions; empty startup compaction is a local no-op instead.
             instructions, input_items = (
-                formats.items_to_openai_responses_parts(
-                    items, target=target, system_role=system_role))
-            # Only top-level LOCAL instructions use the mapping. Do not repair
-            # provider-returned system output into local authority, or silently
-            # discard it: refuse invalid native data before transport instead.
-            if system_role == "developer" and any(
-                    item.get("type", "message") == "message" and item.get("role") == "system" for item in input_items):
-                raise formats.ProjectionError("The selected connection cannot use saved provider output with a system message role.")
+                formats.items_to_openai_responses_parts(items, target=target))
             payload = {
                 "model": model,
                 "input": input_items,
@@ -943,13 +931,13 @@ class Provider:
                 if lite_tools:
                     prefix.append({
                         "type": "additional_tools",
-                        "role": system_role,
+                        "role": "developer",
                         "tools": lite_tools,
                     })
                 if instructions:
                     prefix.append({
                         "type": "message",
-                        "role": system_role,
+                        "role": "developer",
                         "content": [{
                             "type": "input_text",
                             "text": instructions,

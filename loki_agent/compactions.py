@@ -1,20 +1,114 @@
 """Native checkpoint requests and explicit retained-window policy, not Session I/O.
 
-The manual terminal/ACP operation is the current caller. An ordinary tool-loop
-turn would execute returned calls and create assistant/task history; a V2 request
-must only produce a validated candidate. Borrow an explicit RequestContext and
+Terminal and ACP v1 explicit requests borrow their existing idle/turn execution
+owner. An ordinary tool-loop response would execute calls and create task history;
+a V2 request must only produce a validated candidate. Borrow an explicit RequestContext and
 its existing credential leases, exact-URL authorization, cancellation and bounded
 prepared-request transport retries. There is no second client/retry controller,
 ambient credential lookup, summary fallback, endpoint or profile switch here.
 """
 
+import asyncio
 import copy
+import uuid
 
-from . import authentications, formats, model_requests, recoveries
+from . import authentications, formats, model_requests, protocols, recoveries
+from .tool_runtime import HookExecutionError
 
 
 class CompactionError(ValueError):
-    """A refused operation or unusable candidate; old Session context stays active."""
+    """A refused operation or unusable candidate, not permission for a fallback."""
+
+
+class Requests:
+    """One frontend-owned explicit request, shared through pending and execution.
+
+    TUI receipt and ACP control replies need to coalesce before FIFO delivery;
+    ordinary prompt admission cannot do that while a turn is running. The existing
+    turn/idle task executes run(), never this intake object or a second Task.
+    One Future carries a terminal DATA outcome, so abandoned observers cannot leave
+    unobserved exception Futures. ACP's on_result flushes its existing request IDs
+    synchronously; neither callback nor duplicate creates another model turn.
+    Owners finish unserviced intent before their turn-finalization awaits. Later
+    receipt then belongs to their next-idle tail, not a loop which has returned.
+    """
+
+    def __init__(self, on_result=None):
+        self.pending = None
+        self.on_result = on_result
+
+    def request(self):
+        if self.pending is None:
+            self.pending = asyncio.get_running_loop().create_future()
+        return self.pending
+
+    def _finish(self, future, outcome):
+        if self.pending is future:
+            self.pending = None
+        if not future.done():
+            future.set_result(outcome)
+        if self.on_result is not None:
+            self.on_result(outcome)
+        return outcome
+
+    def finish_pending(self, *, cancelled=False):
+        if self.pending is None:
+            return
+        if cancelled:
+            outcome = {"type": "compaction_cancelled", "text": "Context compaction cancelled."}
+        else:
+            outcome = {"type": "compaction_failed", "error": CompactionError(
+                "The turn ended before context compaction could run.")}
+        self._finish(self.pending, outcome)
+
+    async def run(self, operation, on_event=None):
+        if self.pending is None:
+            return None
+        future = self.pending
+        emit = on_event if on_event is not None else lambda event: None
+        compaction_id = None
+        outcome = None
+
+        def started():
+            nonlocal compaction_id
+            compaction_id = str(uuid.uuid4())
+            emit({"type": "compaction_started", "compaction_id": compaction_id})
+
+        try:
+            text = await operation(started)
+            outcome = {"type": "compaction_completed", "text": text}
+        except recoveries.Cancelled:
+            outcome = {"type": "compaction_cancelled", "text": "Context compaction cancelled."}
+        except (CompactionError, formats.TranscriptFormatError, protocols.ProtocolError,
+                model_requests.ApiError, authentications.CredentialError, OSError, HookExecutionError) as error:
+            outcome = {"type": "compaction_failed", "error": error}
+        except BaseException as error:
+            # Task cancellation and programming failures retain their semantics,
+            # but every accepted control still acquires one terminal outcome.
+            outcome = ({"type": "compaction_cancelled", "text": "Context compaction cancelled."}
+                       if isinstance(error, asyncio.CancelledError)
+                       else {"type": "compaction_failed", "error": error})
+            raise
+        finally:
+            if outcome is not None:
+                if compaction_id is not None:
+                    outcome["compaction_id"] = compaction_id
+                try:
+                    emit(outcome)
+                finally:
+                    self._finish(future, outcome)
+        return outcome
+
+
+def retained_messages(active_events):
+    """The V2 retention rule also owns its empty-operation predicate.
+
+    Startup already has instructions, so a literal empty-list check is wrong.
+    Keeping this selection shared prevents a no-op from silently evicting data a
+    changed window policy would retain. Checkpoints are responses, not empty input.
+    """
+    return [event for event in active_events if event.get("type") == "message"
+            and event.get("role") in ["system", "developer", "user"]]
 
 
 def format_error(error):
@@ -53,14 +147,15 @@ def require_v2(context):
         raise CompactionError("Select a model before compacting context.")
 
 
-async def request_v2(context, active_events, tools, thinking, cancel_check):
+async def request_v2(context, active_events, tools, thinking, cancel_check, *, codex_turn_state):
     """Produce one checkpoint, never a continuation or live transcript mutation.
 
     Build the complete active history, saved instructions, ordinary offered tools
     and captured thinking before appending the FINAL trigger after profile framing.
     Always stream: the subscription contract requires it even when display streaming
-    is off. A fresh routing owner belongs to this manual operation; conversation
-    and cache identity remain unchanged. Completion, item count and encrypted-state
+    is off. Routing is borrowed from the actual owner: a running turn retains its
+    existing state and an idle operation supplies a fresh one. Conversation/cache
+    identity remain unchanged. Completion, item count and encrypted-state
     checks are independent of SSE transport success. Ignore all other returned
     items/instructions; only the whole native checkpoint is decoded and copied into
     its origin-bound response. No returned tool can execute through this path.
@@ -79,7 +174,7 @@ async def request_v2(context, active_events, tools, thinking, cancel_check):
     payload["input"].append({"type": "compaction_trigger"})
     response = await model_requests.async_chat_stream_request(
         provider.chat_url, payload, request_headers=provider.headers, context=context,
-        codex_turn_state=model_requests.CodexTurnState(), cancel_check=cancel_check)
+        codex_turn_state=codex_turn_state, cancel_check=cancel_check)
     if cancel_check():
         raise recoveries.Cancelled()
     data = response.payload
@@ -118,8 +213,7 @@ def build_v2_window(active_events, checkpoint_response):
             or len(checkpoint_response.get("items", [])) != 1
             or checkpoint_response["items"][0].get("type") != "compaction"):
         raise CompactionError("Context compaction returned an invalid response.")
-    events = [event for event in active_events if event.get("type") == "message"
-              and event.get("role") in ["system", "developer", "user"]]
+    events = retained_messages(active_events)
     window = copy.deepcopy(events + [checkpoint_response])
     formats.validate_replacement(window)
     return window

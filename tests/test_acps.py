@@ -622,6 +622,20 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FrontSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compaction_reporting_uses_v1_client_capability_object_not_elicitation(self):
+        front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
+        self.addAsyncCleanup(front.shutdown)
+        for session, expected in [[None, False], [{}, False], [{"compaction": None}, False],
+                                  [{"compaction": True}, False], [{"compaction": []}, False],
+                                  [{"compaction": {}}, True]]:
+            result = front.initialize({"protocolVersion": 1, "clientCapabilities": {
+                "session": session, "elicitation": {"form": {}}}})
+            self.assertEqual(result["protocolVersion"], 1)
+            self.assertIn("agentCapabilities", result)
+            self.assertNotIn("capabilities", result)
+            self.assertEqual(front._client_supports_compaction, expected)
+            self.assertTrue(front._client_supports_form_elicitation)
+
     async def test_revoke_failure_still_closes_and_joins_every_session(self):
         from loki_agent import windows_api
 

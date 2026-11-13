@@ -443,7 +443,7 @@ def open_append_at(directory, name: str):
 
 # -- publish and remove ---------------------------------------------------
 
-def replace_at(directory, temporary: str, name: str) -> None:
+def replace_at(directory, temporary: str, name: str, *, on_published=None) -> None:
     _check_name(temporary)
     _check_name(name)
     # Delete access on the source is what a rename needs; the source handle
@@ -457,6 +457,11 @@ def replace_at(directory, temporary: str, name: str) -> None:
             windows_api.nt_rename(source, directory, name)
         except windows_api.WindowsApiError as error:
             _raise_oserror(error)
+        # Rename already published even if closing this source subsequently
+        # fails. The existing editor/chat owner must relinquish its old name
+        # and install prepared state before that failure can escape.
+        if on_published is not None:
+            on_published()
     finally:
         close(source)
 

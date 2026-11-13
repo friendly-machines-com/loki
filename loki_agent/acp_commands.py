@@ -9,17 +9,15 @@ Skills are advertised but not intercepted.  Their execution belongs to the
 model's Skill tool in both fronts, so listing them makes ``/<skill>``
 discoverable and lets the existing tool-calling path handle it.
 
-Delivery: every command here uses ordinary ACP prompt admission; the worker
-rejects it while another prompt is running rather than queueing it. Do not
-route these around ``acp_worker._prepare_prompt`` without an out-of-band
-output channel: agent_message_chunk would splice monitor output into the
-streaming agent message (decision D2). The separate terminal delivery policy
-in command_deliveries does not change this gate.
+Delivery: ordinary commands retain ACP prompt admission and busy rejection.
+The worker separately claims exact /compact controls as intent, preserving the
+original turn and each control's v1 reply. Actual execution/status comes from
+its settled turn/idle owner, never monitor text spliced into a live stream.
 """
 
 from __future__ import annotations
 
-from . import attachments, loki, provider_controls, skills
+from . import attachments, command_deliveries, loki, provider_controls, skills
 
 
 class Outcome:
@@ -73,8 +71,9 @@ def parse(text: str):
         return ("!", body) if body else None
     if not stripped.startswith("/"):
         return None
-    if stripped == "/compact" or (stripped.startswith("/compact") and len(stripped) > 8 and stripped[8].isspace()):
-        return "compact", stripped[8:].strip()
+    compact = command_deliveries.compact_argument(stripped)
+    if compact is not None:
+        return "compact", compact
     head, _separator, argument = stripped.partition(" ")
     name = head[1:]
     if name not in _LOCAL_NAMES:
@@ -82,7 +81,7 @@ def parse(text: str):
     return name, argument.strip()
 
 
-async def run(text: str, session, *, cancel_event=None, thinking=None, allow_ask=False):
+async def run(text: str, session, *, cancel_event=None, thinking=None, allow_ask=False, on_start=None):
     """Execute TEXT if it is a local command, else return None."""
     parsed = parse(text)
     if parsed is None:
@@ -97,7 +96,7 @@ async def run(text: str, session, *, cancel_event=None, thinking=None, allow_ask
         if argument:
             return Outcome(text="Usage: /compact")
         return Outcome(text=await loki.compact_context_async(
-            cancel_event=cancel_event, thinking=thinking, allow_ask=allow_ask))
+            cancel_event=cancel_event, thinking=thinking, allow_ask=allow_ask, on_start=on_start))
     if name == "status" and argument == "save":
         return await _status_save(argument, session)
     handler = _HANDLERS[name]

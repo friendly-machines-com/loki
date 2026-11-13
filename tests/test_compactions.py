@@ -16,7 +16,7 @@ from unittest import mock
 from process_lifecycle_fixtures import observe_fixture
 from loki_agent import acp_commands, acp_events, acp_worker, acps, authentications, compactions, connections, formats
 from loki_agent import http_client, loki, model_requests, openai_models, protocols, recoveries
-from loki_agent import replays, response_headers, savefiles, settings, sse, terminal_frontend, tool_runtime, usages
+from loki_agent import replays, response_headers, savefiles, settings, sse, terminal_frontend, terminals, tool_runtime, usages
 from loki_agent.sessions import Session
 
 
@@ -220,6 +220,10 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             loki, "_tool_bootstrap_command",
             return_value=[os.environ.get("LOKI_LAUNCHER", "./loki.py"), "--tool-exec"]))
         self.sent = []
+        self.headers = []
+        self.ordinary_outputs = []
+        self.end_turns = []
+        self.idle_routing = True
         self.mutate = None
         self.mode = "valid"
         self.before_archive = self.session.transcript_items
@@ -233,13 +237,15 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(url, authentications.OPENAI_CHATGPT_RESPONSES_URL)
         self.assertEqual(kwargs["headers_in"]["Authorization"], "Bearer access-sentinel")
         self.assertEqual(kwargs["headers_in"][protocols.RESPONSES_LITE_HEADER], "true")
-        self.assertNotIn(model_requests.CODEX_TURN_STATE_HEADER, kwargs["headers_in"])
+        self.headers.append(dict(kwargs["headers_in"]))
+        if self.idle_routing:
+            self.assertNotIn(model_requests.CODEX_TURN_STATE_HEADER, kwargs["headers_in"])
         self.assertIsNone(kwargs["response_timeout"])
         payload = json.loads(kwargs["body"])
         self.sent.append(payload)
-        # Match the actual admitted Lite contract, not just SSE syntax. The
-        # previous stub accepted an illegal late system message after a checkpoint.
-        self.assertNotIn("system", [item.get("role") for item in payload["input"]])
+        # This is a transport/SSE fixture, not independent evidence of the
+        # private server's late-role allowlist. Individual tests pin the known
+        # prefix contract and selected-context contents without inventing one.
         if payload["input"][-1].get("type") == "compaction_trigger":
             self.assertIs(self.session.transcript_items, self.before_archive)
             self.assertEqual(self.session.transcript_items, self.before)
@@ -256,9 +262,8 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                 output += [{"type": "function_call", "call_id": "never-execute", "name": "Write", "arguments": "{}"},
                            {"type": "message", "role": "developer", "content": [{"type": "output_text", "text": "DO-NOT-PROMOTE"}]}]
         else:
-            self.assertNotIn("uncommented-tool-fact", json.dumps(payload))
-            self.assertIn("opaque-state", json.dumps(payload))
-            output = [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ordinary answer"}]}]
+            output = (self.ordinary_outputs.pop(0) if self.ordinary_outputs else
+                      [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ordinary answer"}]}])
         if self.mutate is not None:
             self.mutate()
 
@@ -268,9 +273,11 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                 yield wire[:3]
                 yield wire[3:]
             terminal = "response.incomplete" if self.mode == "incomplete" else "response.completed"
-            yield ("data: " + json.dumps({"type": terminal, "response": {
-                "object": "response", "status": "incomplete" if self.mode == "incomplete" else "completed", "output": [],
-                "usage": {"input_tokens": 800, "output_tokens": 50}}}) + "\n\n").encode()
+            response = {"object": "response", "status": "incomplete" if self.mode == "incomplete" else "completed",
+                        "output": [], "usage": {"input_tokens": 800, "output_tokens": 50}}
+            if payload["input"][-1].get("type") != "compaction_trigger" and self.end_turns:
+                response["end_turn"] = self.end_turns.pop(0)
+            yield ("data: " + json.dumps({"type": terminal, "response": response}) + "\n\n").encode()
         yield http_client.HttpStreamResponse(url, 200, "OK", {
             "content-type": "text/event-stream", model_requests.CODEX_TURN_STATE_HEADER: "operation-state"}, chunks())
 
@@ -281,7 +288,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.session.chat_log_dirty)
         text = await loki.compact_context_async(cancel_event=self.event)
         self.assertIn("Context compacted", text)
-        self.assertIsNot(self.session.transcript_items, self.before_archive)
+        self.assertIs(self.session.transcript_items, self.before_archive)
         self.assertEqual(self.session.transcript_items[:-1], self.before)
         self.assertEqual(self.session.transcript_items[-1]["type"], "context_replace")
         selected = formats.active_events(self.session.transcript_items)
@@ -304,38 +311,48 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             thinking=loki.capture_turn_settings())
         self.assertEqual(formats.item_text(turn.to_event()), "ordinary answer")
         self.assertEqual(len(self.sent), 2)
+        self.assertNotIn("uncommented-tool-fact", json.dumps(self.sent[-1]))
+        self.assertIn("opaque-state", json.dumps(self.sent[-1]))
         self.assertIn("additional_tools", [item.get("type") for item in self.sent[0]["input"]])
         self.assertEqual(self.sent[0]["input"][-1], {"type": "compaction_trigger"})
 
-    async def test_compact_before_first_turn_preserves_mode_guard_and_legal_lite_roles(self):
-        # Reproduce the operator's failed chat: initial saved instructions, then
-        # /compact BEFORE the first ordinary turn records its mode instruction.
+    async def test_startup_noop_preserves_first_mode_prefix_without_any_publication(self):
         self.session.transcript_items = [formats.message_item("system", "saved initial instructions")]
         self.before_archive = self.session.transcript_items
         self.before = copy.deepcopy(self.before_archive)
+        with mock.patch.object(loki, "save_chat_log") as save, \
+                mock.patch.object(self.pipeline, "prepare_compaction", new=mock.AsyncMock()) as policy:
+            self.assertEqual(await loki.compact_context_async(cancel_event=self.event), "Nothing to compact.")
+            save.assert_not_called()
+            policy.assert_not_called()
+        self.assertEqual(self.sent, [])
         self.assertIsNone(self.session.last_instructed_agent_mode)
-        await loki.compact_context_async(cancel_event=self.event)
-        self.assertIsNone(self.session.last_instructed_agent_mode)
+        self.assertEqual(self.session.transcript_items, self.before)
         loki.record_agent_mode_instruction()
         self.session.transcript_items.append(formats.message_item("user", "first normal prompt"))
         before_request = copy.deepcopy(self.session.transcript_items)
         turn = await model_requests.async_chat_completion(
             self.session.transcript_items, None, context=loki._model_request_context(), thinking=loki.capture_turn_settings())
         self.assertEqual(formats.item_text(turn.to_event()), "ordinary answer")
-        self.assertEqual([item.get("type") for item in self.sent[-1]["input"]], ["message", "compaction", "message", "message"])
-        self.assertEqual([item.get("role") for item in self.sent[-1]["input"]], ["developer", None, "developer", "user"])
-        self.assertIn("Normal mode is active", self.sent[-1]["input"][2]["content"][0]["text"])
+        self.assertEqual([item.get("type") for item in self.sent[-1]["input"]], ["message", "message"])
+        self.assertEqual([item.get("role") for item in self.sent[-1]["input"]], ["developer", "user"])
+        self.assertIn("Normal mode is active", self.sent[-1]["input"][0]["content"][0]["text"])
         self.assertEqual(self.session.transcript_items, before_request)
-        self.assertEqual(self.session.transcript_items[-2]["role"], "system")
-        self.assertEqual(self.session.last_instructed_agent_mode, "normal")
         count = len(self.session.transcript_items)
         loki.record_agent_mode_instruction()
         self.assertEqual(len(self.session.transcript_items), count)
         loaded, _todos = formats.load_log_blob(formats.new_log_blob(self.session.transcript_items, []))
         replayed = self.session.runtime_config.chat_provider.streaming_chat_payload(loaded, None, self.session.model)
         self.assertEqual(replayed["input"], self.sent[-1]["input"])
+        # Actual work, unlike startup, is eligible for compaction. Its saved
+        # instruction marker/prefix stays unchanged; no late-role repair exists.
+        self.session.transcript_items.append(turn.to_event())
+        self.before = copy.deepcopy(self.before_archive)
+        await loki.compact_context_async(cancel_event=self.event)
+        self.assertEqual(self.sent[-1]["input"][-1], {"type": "compaction_trigger"})
+        self.assertEqual(self.session.last_instructed_agent_mode, "normal")
 
-    async def test_late_local_instructions_keep_order_and_authority_in_lite_and_full(self):
+    async def test_late_local_roles_are_preserved_not_universally_rewritten(self):
         history = [formats.message_item("system", "prefix instructions"), formats.message_item("user", "earlier user"),
                    formats.model_response_event(formats.OPENAI_RESPONSES, [formats.message_item("assistant", "earlier answer")]),
                    formats.message_item("system", "late cwd or mode instruction"),
@@ -352,7 +369,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(provider.headers.get(protocols.RESPONSES_LITE_HEADER), "true" if provider.responses_lite else None)
             inputs = payload["input"][1:] if provider.responses_lite else payload["input"]
             self.assertEqual([item["role"] for item in inputs],
-                             ["user", "assistant", "developer" if provider.provider_id == "openai-subscription" else "system", "developer", "user"])
+                             ["user", "assistant", "system", "developer", "user"])
             self.assertEqual(inputs[2]["content"][0]["text"], "late cwd or mode instruction")
             self.assertEqual(inputs[3]["content"][0]["text"], "late developer instruction")
             self.assertEqual(history, original)
@@ -362,8 +379,13 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         returned = formats.model_response_event(
             formats.OPENAI_RESPONSES, [formats.message_item("system", "provider instruction must not be promoted")],
             provider=provider.provider_id, endpoint=provider.chat_url, model=self.session.model)
-        with self.assertRaises(formats.ProjectionError):
-            provider.streaming_chat_payload([returned], None, self.session.model)
+        original = copy.deepcopy(returned)
+        payload = provider.streaming_chat_payload([returned], None, self.session.model)
+        self.assertNotIn("instructions", payload)
+        self.assertEqual([item.get("role") for item in payload["input"]], ["system"])
+        self.assertEqual(returned, original)
+        # Preservation is not a claim this private server accepts that role.
+        # Provider output was not hoisted into the local developer prefix.
 
     async def test_display_stream_setting_does_not_disable_compaction_stream(self):
         self.session.runtime_config.stream = False
@@ -426,13 +448,13 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         writer = loki.files.atomic_write_text
         calls = []
 
-        def save(path, content):
+        def save(path, content, *, on_published=None):
             document = json.loads(content)
             self.assertIs(self.session.transcript_items, self.before_archive)
             calls.append(document)
-            if len(calls) == 2:
+            if document["events"][-1].get("type") == "context_replace":
                 raise OSError("candidate save failed")
-            return writer(path, content)
+            return writer(path, content, on_published=on_published)
         with mock.patch.object(loki.files, "atomic_write_text", side_effect=save):
             with self.assertRaisesRegex(OSError, "candidate save"):
                 await loki.compact_context_async(cancel_event=self.event)
@@ -440,10 +462,10 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session.transcript_items, self.before)
         calls.clear()
 
-        def committed(path, content):
-            save_result = writer(path, content)
+        def committed(path, content, *, on_published=None):
+            save_result = writer(path, content, on_published=on_published)
             calls.append(content)
-            if len(calls) == 2:
+            if json.loads(content)["events"][-1].get("type") == "context_replace":
                 self.event.set()
             return save_result
         with mock.patch.object(loki.files, "atomic_write_text", side_effect=committed):
@@ -588,6 +610,14 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
     def params(self, text):
         return {"sessionId": "compact-session", "prompt": [{"type": "text", "text": text}]}
 
+    def tui_inventory(self):
+        return loki.CredentialInventory({
+            "LOKI_API_BASE": authentications.OPENAI_CHATGPT_RESPONSES_URL,
+            "LOKI_PROVIDER": formats.OPENAI_RESPONSES, "LOKI_MODEL": self.session.model,
+            "LOKI_CREDENTIAL_REF": authentications.CredentialRef.openai_subscription().encode(),
+            "LOKI_OPENAI_REQUEST_PROFILE": json.dumps(self.session.runtime_config.chat_provider.openai_request_profile.to_dict()),
+            "LOKI_STREAM": "1"}, self.broker.available())
+
     async def test_compact_is_advertised_and_arguments_cannot_become_model_input(self):
         with mock.patch.object(acp_commands.skills, "available", return_value=[]):
             self.assertIn("compact", [command["name"] for command in acp_commands.advertised_commands()])
@@ -662,8 +692,8 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, [])
         writer = loki.files.atomic_write_text
 
-        def commit(path, content):
-            writer(path, content)
+        def commit(path, content, *, on_published=None):
+            writer(path, content, on_published=on_published)
             if json.loads(content)["events"][-1].get("type") == "context_replace":
                 self.event.set()
         with mock.patch.object(loki.files, "atomic_write_text", side_effect=commit):
@@ -671,7 +701,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.event.is_set())
         self.assertEqual(self.session.transcript_items[-1]["type"], "context_replace")
 
-    async def test_tui_queued_command_runs_before_user_insertion_and_restores_idle(self):
+    async def test_tui_startup_control_is_noop_without_consuming_the_next_prompt(self):
         from test_loki_tool_loop import ScriptedInputSession
         outer = self
 
@@ -683,15 +713,11 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                     inner.reader.cancel_event.set()
                 elif len(inner.messages) == 2:
                     outer.assertFalse(terminal_frontend._terminal_activity.turn_running)
-                    outer.assertEqual(outer.session.transcript_items[-1]["type"], "context_replace")
+                    outer.assertFalse(any(event["type"] == "context_replace" for event in outer.session.transcript_items))
+                    outer.assertEqual(outer.sent, [])
                 return await super().get()
         inputs = Inputs(["/compact", "after compact", "/quit"])
-        inventory = loki.CredentialInventory({
-            "LOKI_API_BASE": authentications.OPENAI_CHATGPT_RESPONSES_URL,
-            "LOKI_PROVIDER": formats.OPENAI_RESPONSES, "LOKI_MODEL": self.session.model,
-            "LOKI_CREDENTIAL_REF": authentications.CredentialRef.openai_subscription().encode(),
-            "LOKI_OPENAI_REQUEST_PROFILE": json.dumps(self.session.runtime_config.chat_provider.openai_request_profile.to_dict()),
-            "LOKI_STREAM": "1"}, self.broker.available())
+        inventory = self.tui_inventory()
         output = io.StringIO()
         with mock.patch.object(loki, "CREDENTIALS", inventory), \
                 mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
@@ -701,10 +727,543 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
         self.assertFalse(terminal_frontend._terminal_activity.turn_running)
-        self.assertEqual(len(self.sent), 2)
-        self.assertIn("Context compacted", output.getvalue())
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Nothing to compact", output.getvalue())
         self.assertNotIn('"text": "/compact"', json.dumps(self.session.transcript_items))
         self.assertIn("/compact", terminal_frontend.status_text())
+
+    async def _tui_running_control(self, failure=False):
+        from test_loki_tool_loop import ScriptedInputSession
+        inputs = ScriptedInputSession(["perform work", "/quit"])
+        self.idle_routing = False
+        self.ordinary_outputs = [self.tool_batch()]
+        self.mode = "missing" if failure else "valid"
+        self.pipeline.turn_end_hooks = [object()]
+        self.pipeline.finish_turn = mock.AsyncMock()
+        inventory = self.tui_inventory()
+        output = io.StringIO()
+
+        def receive():
+            if len(self.sent) == 1:
+                self.before_archive = self.session.transcript_items
+                self.assertTrue(inputs.on_submit("/compact"))
+                self.assertTrue(inputs.on_submit("/compact"))
+        self.mutate = receive
+
+        @contextlib.asynccontextmanager
+        async def inspect(method, url, **kwargs):
+            if json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger":
+                self.assertEqual(self.session.transcript_items[-1]["type"], "tool_result")
+                self.before = copy.deepcopy(self.session.transcript_items)
+            async with self.streaming(method, url, **kwargs) as response:
+                yield response
+
+        with mock.patch.object(loki, "CREDENTIALS", inventory), \
+                mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
+                mock.patch.object(terminal_frontend.terminals, "open_terminal_stdin"), \
+                mock.patch.object(terminal_frontend, "new_chat_log_path", return_value=self.session.chat_log_path), \
+                mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
+                mock.patch.object(http_client, "async_http_stream", new=inspect), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
+        self.assertEqual(len(self.sent), 2 if failure else 3)
+        self.assertEqual(self.pipeline.finish_turn.await_count, 1)
+        self.assertEqual(self.pipeline.finish_turn.call_args.args[0]["reason"], "error" if failure else "completed")
+        self.assertIs(self.session.transcript_items, self.before_archive)
+        self.assertIn("Compaction already requested", output.getvalue())
+        self.assertNotIn('"text": "/compact"', json.dumps(self.session.transcript_items))
+        self.assertFalse(terminal_frontend._terminal_activity.turn_running)
+        with open(self.session.chat_log_path, encoding="utf-8") as stream:
+            saved, _todos, _state, _tools = savefiles.read_chat_log(stream)
+        if failure:
+            self.assertFalse(any(event["type"] == "context_replace" for event in saved))
+            self.assertIn("Context compaction failed", output.getvalue())
+        else:
+            self.assertEqual(formats.item_text(formats.active_events(saved)[-1]), "ordinary answer")
+
+    async def test_tui_receipt_during_sampling_coalesces_and_saves_same_turn_continuation(self):
+        await self._tui_running_control()
+
+    async def test_tui_compaction_failure_notifies_once_stops_sampling_and_returns_to_input(self):
+        await self._tui_running_control(failure=True)
+
+    async def test_retained_only_active_window_noops_even_with_archived_tool_history(self):
+        retained = copy.deepcopy(self.before[:2])
+        self.session.transcript_items.append(formats.context_replace_event(retained))
+        original = copy.deepcopy(self.session.transcript_items)
+        with mock.patch.object(loki, "save_chat_log") as save, \
+                mock.patch.object(self.pipeline, "prepare_compaction", new=mock.AsyncMock()) as policy:
+            self.assertEqual(await loki.compact_context_async(cancel_event=self.event), "Nothing to compact.")
+            save.assert_not_called()
+            policy.assert_not_called()
+        self.assertEqual(self.session.transcript_items, original)
+        self.assertEqual(self.sent, [])
+
+    async def test_post_publication_close_error_keeps_disk_and_live_selection_together(self):
+        writer = loki.files.atomic_write_text
+        close = loki.files.private_files.close
+        replace_at = loki.files.private_files.replace_at
+        state = {"candidate": False, "published": False, "raised": False}
+
+        def writing(path, content, *, on_published=None):
+            state["candidate"] = json.loads(content)["events"][-1].get("type") == "context_replace"
+            state["published"] = False
+            return writer(path, content, on_published=on_published)
+
+        def replacing(*args, on_published=None):
+            def published():
+                state["published"] = True
+                on_published()
+            replace_at(*args, on_published=published)
+
+        def closing(handle):
+            close(handle)
+            if state["candidate"] and state["published"] and not state["raised"]:
+                state["raised"] = True
+                raise OSError("close failed after replacement")
+
+        with mock.patch.object(loki.files, "atomic_write_text", side_effect=writing), \
+                mock.patch.object(loki.files.private_files, "replace_at", side_effect=replacing), \
+                mock.patch.object(loki.files.private_files, "close", side_effect=closing):
+            with self.assertRaisesRegex(OSError, "after replacement"):
+                await loki.compact_context_async(cancel_event=self.event)
+        self.assertTrue(state["raised"])
+        self.assertIs(self.session.transcript_items, self.before_archive)
+        self.assertEqual(self.session.transcript_items[-1]["type"], "context_replace")
+        self.assertFalse(self.session.chat_log_dirty)
+        self.assertIsNone(self.session.context_snapshot(live=True).usage)
+        with open(self.session.chat_log_path, encoding="utf-8") as stream:
+            saved, _todos, _state, _tools = savefiles.read_chat_log(stream)
+        self.assertEqual(saved, self.session.transcript_items)
+
+    async def test_publication_inside_replace_primitive_precedes_its_cleanup_failure(self):
+        writer = loki.files.atomic_write_text
+        replace_at = loki.files.private_files.replace_at
+        candidate = False
+
+        def writing(path, content, *, on_published=None):
+            nonlocal candidate
+            candidate = json.loads(content)["events"][-1].get("type") == "context_replace"
+            return writer(path, content, on_published=on_published)
+
+        def rename_then_fail(directory, temporary, name, *, on_published=None):
+            replace_at(directory, temporary, name, on_published=on_published)
+            if candidate:
+                raise OSError("rename primitive cleanup failed")
+
+        with mock.patch.object(loki.files, "atomic_write_text", side_effect=writing), \
+                mock.patch.object(loki.files.private_files, "replace_at", side_effect=rename_then_fail):
+            with self.assertRaisesRegex(OSError, "primitive cleanup"):
+                await loki.compact_context_async(cancel_event=self.event)
+        self.assertIs(self.session.transcript_items, self.before_archive)
+        self.assertEqual(self.session.transcript_items[-1]["type"], "context_replace")
+        with open(self.session.chat_log_path, encoding="utf-8") as stream:
+            saved, _todos, _state, _tools = savefiles.read_chat_log(stream)
+        self.assertEqual(saved, self.session.transcript_items)
+
+    def tool_batch(self):
+        return [{"type": "function_call", "call_id": call_id, "name": "TodoWrite",
+                 "arguments": json.dumps({"todos": [{"content": content, "status": "pending", "priority": "high"}]})}
+                for call_id, content in [["step-one", "first effect"], ["step-two", "second effect"]]]
+
+    async def test_real_loop_coalesces_at_whole_batch_boundary_and_persists_continuation(self):
+        self.idle_routing = False
+        self.ordinary_outputs = [self.tool_batch()]
+        requests = compactions.Requests()
+        accepted = []
+        events = []
+        initial_thinking = loki.capture_turn_settings()
+
+        def request_during_sampling():
+            if len(self.sent) == 1:
+                accepted.extend([requests.request(), requests.request()])
+        self.mutate = request_during_sampling
+
+        def on_event(event):
+            events.append(event)
+            if event["type"] == "tool_call":
+                self.assertEqual(len(self.sent), 1, "compaction must not split the tool batch")
+            if event["type"] == "tool_result":
+                accepted.append(requests.request())
+                self.session.agent_mode = "explore"
+                self.session.reasoning_retention = "preserve"
+                self.before = copy.deepcopy(self.session.transcript_items)
+
+        text = await loki.run_tool_loop_async(
+            self.session.transcript_items, cancel_event=self.event,
+            stream_chat=True, max_loops=2, on_event=on_event,
+            thinking=initial_thinking, compaction_requests=requests)
+        self.assertEqual(text, "ordinary answer")
+        self.assertTrue(all(future is accepted[0] for future in accepted))
+        self.assertEqual(accepted[0].result()["type"], "compaction_completed")
+        self.assertIsNone(requests.pending)
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(self.sent[1]["input"][-1], {"type": "compaction_trigger"})
+        self.assertEqual(self.headers[1][model_requests.CODEX_TURN_STATE_HEADER], "operation-state")
+        self.assertEqual(self.headers[2][model_requests.CODEX_TURN_STATE_HEADER], "operation-state")
+        self.assertEqual(self.sent[0]["input"][0]["tools"], self.sent[1]["input"][0]["tools"])
+        self.assertEqual(self.sent[0]["reasoning"], self.sent[1]["reasoning"])
+        self.assertNotIn("uncommented-tool-fact", json.dumps(self.sent[-1]))
+        self.assertIn("opaque-state", json.dumps(self.sent[-1]))
+        self.assertIs(self.session.transcript_items, self.before_archive)
+        self.assertEqual([event["call_id"] for event in self.session.transcript_items
+                          if event.get("type") == "tool_result" and event["call_id"].startswith("step-")],
+                         ["step-one", "step-two"])
+        self.assertEqual(self.session.session_todos[0]["content"], "second effect")
+        self.assertFalse(any(event["type"] == "max_loops" for event in events))
+        self.assertEqual(self.session.agent_mode, "explore")
+        self.assertIsNone(self.session.last_instructed_agent_mode)
+        self.assertTrue(self.session.chat_log_dirty, "continuation after the checkpoint must be saveable")
+        loki.save_chat_log()
+        with open(self.session.chat_log_path, encoding="utf-8") as stream:
+            saved, _todos, state, _tools = savefiles.read_chat_log(stream)
+        self.assertEqual(saved, self.session.transcript_items)
+        self.assertEqual(state["reasoning_retention"], "preserve")
+        self.assertEqual(formats.item_text(formats.active_events(saved)[-1]), "ordinary answer")
+
+    async def _acp_control_journey(self, *, failure=False, cancel=False):
+        self.idle_routing = False
+        self.ordinary_outputs = [self.tool_batch()]
+        self.mode = "missing" if failure else "valid"
+        messages = []
+        worker = acp_worker.Worker(self.session, messages.append)
+        worker.can_report_compaction = True
+        self.addAsyncCleanup(worker.close)
+        self.event = worker.cancel_event
+        self.pipeline.turn_end_hooks = [object()]
+        self.pipeline.finish_turn = mock.AsyncMock()
+        sampling_ready, sampling_release = asyncio.Event(), asyncio.Event()
+        compact_ready, compact_release = asyncio.Event(), asyncio.Event()
+        final_ready, final_release = asyncio.Event(), asyncio.Event()
+
+        @contextlib.asynccontextmanager
+        async def controlled(method, url, **kwargs):
+            payload = json.loads(kwargs["body"])
+            compact = payload["input"][-1].get("type") == "compaction_trigger"
+            first = not self.sent
+            if compact:
+                self.assertEqual(self.session.transcript_items[-1]["type"], "tool_result")
+                self.assertFalse(any(event["type"] == "context_replace" for event in self.session.transcript_items))
+                self.before = copy.deepcopy(self.session.transcript_items)
+            async with self.streaming(method, url, **kwargs) as response:
+                ready, release = ([compact_ready, compact_release] if compact else
+                                  [sampling_ready, sampling_release] if first else [final_ready, final_release])
+                ready.set()
+                await release.wait()
+                yield response
+
+        with mock.patch.object(http_client, "async_http_stream", new=controlled):
+            await worker.handle({"id": 1, "method": "session/prompt", "params": self.params("do the work")}, concurrent=True)
+            owner = worker._prompt_task
+            try:
+                await observe_fixture(sampling_ready.wait(), owner)
+                staged = object()
+                worker._pending_images.append(staged)
+                for request_id in [2, 3]:
+                    await worker.handle({"id": request_id, "method": "session/prompt", "params": self.params("/compact")}, concurrent=True)
+                shared = worker.compaction_requests.pending
+                self.assertIs(worker._prompt_task, owner)
+                self.assertFalse(self.event.is_set())
+                await worker.handle({"id": 4, "method": "session/prompt", "params": self.params("ordinary overlap")}, concurrent=True)
+                self.assertIn("error", next(message for message in messages if message.get("id") == 4))
+                sampling_release.set()
+                await observe_fixture(compact_ready.wait(), owner)
+                await worker.handle({"id": 5, "method": "session/prompt", "params": self.params("/compact")}, concurrent=True)
+                self.assertIs(worker.compaction_requests.pending, shared)
+                self.assertIs(worker._prompt_task, owner)
+                self.assertFalse(any(message.get("id") in [1, 2, 3, 5] for message in messages))
+                if cancel:
+                    await worker.dispatch("session/cancel", {})
+                compact_release.set()
+                if not failure and not cancel:
+                    await observe_fixture(final_ready.wait(), owner)
+                    self.assertFalse(any(message.get("id") == 1 for message in messages))
+                    self.assertEqual([message["result"] for message in messages if message.get("id") in [2, 3, 5]],
+                                     [{"stopReason": "end_turn"}] * 3)
+                    self.assertEqual(worker._pending_images, [staged])
+                    self.assertEqual(self.pipeline.finish_turn.await_count, 0)
+                    final_release.set()
+                await owner
+            finally:
+                sampling_release.set()
+                compact_release.set()
+                final_release.set()
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+        replies = [message for message in messages if message.get("id") in [1, 2, 3, 5]]
+        self.assertEqual(sorted(message["id"] for message in replies), [1, 2, 3, 5])
+        self.assertEqual(self.pipeline.finish_turn.await_count, 1)
+        payload = self.pipeline.finish_turn.call_args.args[0]
+        expected_reason = "error" if failure else "cancelled" if cancel else "completed"
+        self.assertEqual(payload["reason"], expected_reason)
+        if failure:
+            self.assertTrue(all("error" in message for message in replies))
+            self.assertEqual(len(self.sent), 2, "failed compaction must stop further sampling")
+        elif cancel:
+            self.assertEqual([message["result"] for message in replies], [{"stopReason": "cancelled"}] * 4)
+            self.assertEqual(len(self.sent), 2)
+        else:
+            self.assertEqual(len(self.sent), 3)
+        updates = [message["params"]["update"] for message in messages if message.get("method") == "session/update"
+                   and message["params"]["update"]["sessionUpdate"] == "compaction_update"]
+        self.assertEqual([update["status"] for update in updates],
+                         ["in_progress", "failed" if failure else "cancelled" if cancel else "completed"])
+        self.assertEqual(updates[0]["compactionId"], updates[1]["compactionId"])
+        self.assertTrue(all("summary" not in update for update in updates))
+        self.assertIsNone(worker.compaction_requests.pending)
+        self.assertNotIn('"text": "/compact"', json.dumps(self.session.transcript_items))
+        worker._pending_images.clear()
+
+    async def _tool_less_request(self, follow_up):
+        self.idle_routing = False
+        self.end_turns = [not follow_up]
+        requests = compactions.Requests()
+        events = []
+
+        def request():
+            if len(self.sent) == 1:
+                requests.request()
+        self.mutate = request
+
+        @contextlib.asynccontextmanager
+        async def inspect(method, url, **kwargs):
+            if json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger":
+                self.assertEqual(self.session.transcript_items[-1]["type"], "model_response")
+                self.before = copy.deepcopy(self.session.transcript_items)
+            async with self.streaming(method, url, **kwargs) as response:
+                yield response
+
+        with mock.patch.object(http_client, "async_http_stream", new=inspect):
+            self.assertEqual(await loki.run_tool_loop_async(
+                self.session.transcript_items, cancel_event=self.event,
+                stream_chat=True, max_loops=2, on_event=events.append,
+                compaction_requests=requests), "ordinary answer")
+        self.assertEqual(len(self.sent), 3 if follow_up else 2)
+        self.assertEqual([event["type"] for event in events if event["type"].startswith("compaction_")],
+                         ["compaction_started", "compaction_completed"])
+        self.assertIsNone(requests.pending)
+        self.assertFalse(any(event["type"] == "max_loops" for event in events))
+
+    async def test_cancellation_before_final_service_is_not_a_completed_turn(self):
+        self.idle_routing = False
+        requests = compactions.Requests()
+        events = []
+        accepted = []
+
+        def on_response(turn, event):
+            accepted.append(requests.request())
+            self.event.set()
+
+        try:
+            self.assertEqual(await loki.run_tool_loop_async(
+                self.session.transcript_items, cancel_event=self.event,
+                stream_chat=True, on_event=events.append, on_response=on_response,
+                compaction_requests=requests), "")
+        finally:
+            requests.finish_pending(cancelled=self.event.is_set())
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(accepted[0].result()["type"], "compaction_cancelled")
+        self.assertEqual([event["type"] for event in events].count("response_cancelled"), 1)
+        self.pipeline.turn_end_hooks = [object()]
+        self.pipeline.finish_turn = mock.AsyncMock()
+        await loki.run_turn_end_hooks_async(events)
+        self.assertEqual(self.pipeline.finish_turn.call_args.args[0]["reason"], "cancelled")
+
+    async def test_tool_less_continuation_services_request_in_the_same_loop(self):
+        await self._tool_less_request(True)
+
+    async def test_final_response_services_request_without_an_invented_model_sample(self):
+        await self._tool_less_request(False)
+
+    async def test_acp_control_during_actual_ask_waits_for_answer_and_whole_batch(self):
+        self.idle_routing = False
+        self.ordinary_outputs = [[{"type": "function_call", "call_id": "question", "name": "Ask",
+                                  "arguments": json.dumps({"question": "Continue?", "options": [{"label": "Yes"}, {"label": "No"}]})},
+                                 self.tool_batch()[1]]]
+        messages = []
+        question_ready = asyncio.Event()
+
+        def write(message):
+            messages.append(message)
+            if message.get("method") == "session/request_input":
+                question_ready.set()
+
+        worker = acp_worker.Worker(self.session, write)
+        worker.can_ask_user = True
+        self.addAsyncCleanup(worker.close)
+        self.event = worker.cancel_event
+
+        @contextlib.asynccontextmanager
+        async def inspect(method, url, **kwargs):
+            if json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger":
+                self.assertEqual(self.session.transcript_items[-1]["call_id"], "step-two")
+                self.before = copy.deepcopy(self.session.transcript_items)
+            async with self.streaming(method, url, **kwargs) as response:
+                yield response
+
+        with mock.patch.object(http_client, "async_http_stream", new=inspect):
+            await worker.handle({"id": 1, "method": "session/prompt", "params": self.params("ask then work")}, concurrent=True)
+            owner = worker._prompt_task
+            try:
+                await observe_fixture(question_ready.wait(), owner)
+                for request_id in [2, 3]:
+                    await worker.handle({"id": request_id, "method": "session/prompt", "params": self.params("/compact")}, concurrent=True)
+                self.assertEqual(len(self.sent), 1)
+                self.assertIs(worker._prompt_task, owner)
+                reverse = next(message for message in messages if message.get("method") == "session/request_input")
+                worker.resolve_reverse(reverse["id"], {"result": {"action": "answered", "answer": "Yes"}})
+                await owner
+            finally:
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(sorted(message["id"] for message in messages if "result" in message), [1, 2, 3])
+        self.assertEqual(len([event for event in self.session.transcript_items if event["type"] == "context_replace"]), 1)
+        self.assertEqual(worker._reverse_requests, {})
+        self.assertEqual(worker._compaction_replies, [])
+
+    async def _finalization_control(self, failure):
+        self.idle_routing = False
+        self.mode = "missing" if failure else "valid"
+        messages = []
+        worker = acp_worker.Worker(self.session, messages.append)
+        self.addAsyncCleanup(worker.close)
+        self.event = worker.cancel_event
+        ready, release = asyncio.Event(), asyncio.Event()
+        self.pipeline.turn_end_hooks = [object()]
+
+        async def hook(payload):
+            self.assertEqual(payload["reason"], "completed")
+            ready.set()
+            await release.wait()
+        self.pipeline.finish_turn = mock.AsyncMock(side_effect=hook)
+
+        @contextlib.asynccontextmanager
+        async def inspect(method, url, **kwargs):
+            if json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger":
+                self.assertIn(1, [message.get("id") for message in messages if "result" in message])
+                self.before = copy.deepcopy(self.session.transcript_items)
+            async with self.streaming(method, url, **kwargs) as response:
+                yield response
+
+        with mock.patch.object(http_client, "async_http_stream", new=inspect):
+            await worker.handle({"id": 1, "method": "session/prompt", "params": self.params("finish normally")}, concurrent=True)
+            owner = worker._prompt_task
+            try:
+                await observe_fixture(ready.wait(), owner)
+                for request_id in [2, 3]:
+                    # Inline receipt must also return, not block this input
+                    # actor while the original finalization is held.
+                    await worker.handle({"id": request_id, "method": "session/prompt", "params": self.params("/compact")})
+                self.assertEqual(len(self.sent), 1)
+                release.set()
+                await owner
+            finally:
+                release.set()
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+        self.assertEqual(self.pipeline.finish_turn.await_count, 1)
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual([message["result"] for message in messages if message.get("id") == 1], [{"stopReason": "end_turn"}])
+        controls = [message for message in messages if message.get("id") in [2, 3]]
+        self.assertEqual(len(controls), 2)
+        self.assertTrue(all(("error" in message) == failure for message in controls))
+        self.assertIsNone(worker.compaction_requests.pending)
+        self.assertEqual(worker._compaction_replies, [])
+
+    async def test_control_during_turn_end_is_a_single_idle_tail_after_original_reply(self):
+        await self._finalization_control(False)
+
+    async def test_failed_idle_tail_does_not_retroactively_fail_the_completed_turn(self):
+        await self._finalization_control(True)
+
+    async def test_v1_worker_channel_correlates_controls_while_original_request_is_pending(self):
+        from loki_agent import acp
+        from test_acps import _LocalWorkerProcess
+        self.idle_routing = False
+        self.ordinary_outputs = [self.tool_batch()]
+        notifications = []
+        process = _LocalWorkerProcess(self.session, "compact-session", lambda message: None)
+        process.worker.can_report_compaction = True
+        self.event = process.worker.cancel_event
+        channel = acp.WorkerChannel("compact-session", process, notifications.append)
+        self.addAsyncCleanup(channel.close)
+        sampling_ready, sampling_release = asyncio.Event(), asyncio.Event()
+        compact_ready, compact_release = asyncio.Event(), asyncio.Event()
+        final_ready, final_release = asyncio.Event(), asyncio.Event()
+
+        @contextlib.asynccontextmanager
+        async def controlled(method, url, **kwargs):
+            compact = json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger"
+            first = not self.sent
+            if compact:
+                self.assertEqual(self.session.transcript_items[-1]["type"], "tool_result")
+                self.before = copy.deepcopy(self.session.transcript_items)
+            async with self.streaming(method, url, **kwargs) as response:
+                ready, release = ([compact_ready, compact_release] if compact else
+                                  [sampling_ready, sampling_release] if first else [final_ready, final_release])
+                ready.set()
+                await release.wait()
+                yield response
+
+        controls = []
+        with mock.patch.object(http_client, "async_http_stream", new=controlled):
+            original = asyncio.create_task(channel.request("session/prompt", self.params("work")))
+            try:
+                await observe_fixture(sampling_ready.wait(), original)
+                for _ in range(2):
+                    forwarded = asyncio.Event()
+                    control = asyncio.create_task(channel.request("session/prompt", self.params("/compact"), forwarded=forwarded))
+                    controls.append(control)
+                    await observe_fixture(forwarded.wait(), original)
+                self.assertTrue(all(not task.done() for task in controls))
+                sampling_release.set()
+                await observe_fixture(compact_ready.wait(), original)
+                self.assertEqual(len(channel._pending), 3)
+                compact_release.set()
+                await observe_fixture(final_ready.wait(), original)
+                self.assertEqual(await asyncio.gather(*controls), [{"stopReason": "end_turn"}] * 2)
+                self.assertFalse(original.done())
+                final_release.set()
+                self.assertEqual(await original, {"stopReason": "end_turn"})
+            finally:
+                sampling_release.set()
+                compact_release.set()
+                final_release.set()
+                for task in [original, *controls]:
+                    task.cancel()
+                await asyncio.gather(original, *controls, return_exceptions=True)
+        self.assertEqual(channel._pending, {})
+        self.assertEqual(process.worker._compaction_replies, [])
+        self.assertEqual(len(self.sent), 3)
+        self.assertTrue(any(packet["params"]["update"]["sessionUpdate"] == "compaction_update"
+                            for packet in notifications if packet.get("method") == "session/update"))
+        await channel.close()
+        self.assertTrue(channel._reader_task.done())
+        self.assertEqual(process.returncode, 0)
+
+    async def test_idle_setting_capture_failure_settles_joined_v1_controls(self):
+        messages = []
+        worker = acp_worker.Worker(self.session, messages.append)
+        self.addAsyncCleanup(worker.close)
+        accepted = worker.compaction_requests.request()
+        worker._compaction_replies.extend([2, 3])
+        with mock.patch.object(loki, "capture_turn_settings", side_effect=protocols.ProtocolError("invalid admitted settings")):
+            await worker._perform_idle_compaction()
+        self.assertEqual(accepted.result()["type"], "compaction_failed")
+        self.assertEqual(sorted(message["id"] for message in messages if "error" in message), [2, 3])
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(worker.compaction_requests.pending)
+        self.assertEqual(worker._compaction_replies, [])
+
+    async def test_acp_v1_controls_join_running_turn_without_early_original_reply(self):
+        await self._acp_control_journey()
+
+    async def test_acp_v1_compaction_failure_fails_original_and_controls_and_notifies_once(self):
+        await self._acp_control_journey(failure=True)
+
+    async def test_acp_v1_cancel_settles_all_controls_without_another_operation(self):
+        await self._acp_control_journey(cancel=True)
 
     async def test_real_precompact_process_uses_sanitized_existing_runner(self):
         program = "import json,os,sys; p=json.load(sys.stdin); assert p['event']=='pre_compact'; assert 'COMPACTION_SECRET_TOKEN' not in os.environ; print('{}')"
@@ -715,6 +1274,122 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline):
             self.assertIn("Context compacted", await loki.compact_context_async(cancel_event=self.event))
         self.assertEqual(len(self.sent), 1)
+
+
+class CompactionRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_receipt_and_running_duplicates_share_outcome_without_observer_cancellation(self):
+        requests = compactions.Requests()
+        future = requests.request()
+        self.assertIs(requests.request(), future)
+        ready, release = asyncio.Event(), asyncio.Event()
+        events = []
+
+        async def operation(started):
+            started()
+            ready.set()
+            await release.wait()
+            return "done"
+
+        async def observe():
+            return await asyncio.shield(future)
+
+        owner = asyncio.create_task(requests.run(operation, events.append))
+        observer = asyncio.create_task(observe())
+        try:
+            await observe_fixture(ready.wait(), owner)
+            self.assertIs(requests.request(), future)
+            observer.cancel()
+            await asyncio.gather(observer, return_exceptions=True)
+            self.assertFalse(future.cancelled())
+            release.set()
+            self.assertEqual((await owner)["type"], "compaction_completed")
+        finally:
+            release.set()
+            owner.cancel()
+            observer.cancel()
+            await asyncio.gather(owner, observer, return_exceptions=True)
+        self.assertIsNone(requests.pending)
+        self.assertEqual([event["type"] for event in events], ["compaction_started", "compaction_completed"])
+        self.assertEqual(events[0]["compaction_id"], events[1]["compaction_id"])
+        self.assertEqual(future.result()["text"], "done")
+        next_request = requests.request()
+        self.assertIsNot(next_request, future)
+        requests.finish_pending(cancelled=True)
+        self.assertEqual(next_request.result()["type"], "compaction_cancelled")
+
+    async def test_failure_and_task_cancellation_settle_outcomes_without_exception_futures(self):
+        requests = compactions.Requests()
+        failed = requests.request()
+
+        async def failure(started):
+            raise compactions.CompactionError("cannot compact")
+
+        outcome = await requests.run(failure)
+        self.assertEqual(outcome["type"], "compaction_failed")
+        self.assertIs(outcome, failed.result())
+        ready = asyncio.Event()
+        cancelled = requests.request()
+
+        async def blocked(started):
+            started()
+            ready.set()
+            await asyncio.Event().wait()
+
+        owner = asyncio.create_task(requests.run(blocked))
+        try:
+            await observe_fixture(ready.wait(), owner)
+            owner.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await owner
+        finally:
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+        self.assertEqual(cancelled.result()["type"], "compaction_cancelled")
+        self.assertIsNone(requests.pending)
+
+    async def test_credential_denial_is_an_operation_failure_not_an_unhandled_frontend_error(self):
+        requests = compactions.Requests()
+        accepted = requests.request()
+        error = authentications.CredentialUnavailable("credential lease unavailable")
+
+        async def denied(started):
+            raise error
+
+        result = await requests.run(denied)
+        self.assertEqual(result["type"], "compaction_failed")
+        self.assertIs(result["error"], error)
+        self.assertIs(accepted.result(), result)
+        self.assertIsNone(requests.pending)
+
+    def test_private_wakeup_has_no_submission_id_count_or_editable_queue_entry(self):
+        queue = terminals.UserMessageQueue()
+        queue.put_nowait("first")
+        queue.put_nowait(terminals.CONTROL_WAKE)
+        queue.put_nowait("second")
+        queue.put_nowait(None)
+        first, second = queue.pending_entries()
+        self.assertEqual(queue.message_count, 2)
+        self.assertEqual([first.id, second.id], [1, 2])
+        queue.edit_text(second.id, "edited second")
+        queue.move_text(first.id)
+        self.assertIs(queue.get_nowait(), terminals.CONTROL_WAKE)
+        self.assertEqual(queue.message_count, 2)
+        self.assertEqual(queue.get_nowait(), "edited second")
+        self.assertEqual(queue.get_nowait(), "first")
+        self.assertIsNone(queue.get_nowait())
+        self.assertEqual(queue.message_count, 0)
+
+    def test_v1_compaction_lifecycle_is_capability_gated_and_summary_free(self):
+        for kind, status in [["compaction_started", "in_progress"], ["compaction_completed", "completed"],
+                             ["compaction_failed", "failed"], ["compaction_cancelled", "cancelled"]]:
+            event = {"type": kind, "compaction_id": "local-id", "text": "readable status"}
+            self.assertEqual(acp_events.map_event("session", event, {})[0]["update"]["sessionUpdate"], "agent_message_chunk")
+            typed = acp_events.map_event("session", event, {}, compaction=True)[0]["update"]
+            self.assertEqual(typed["compactionId"], "local-id")
+            self.assertEqual(typed["status"], status)
+            self.assertNotIn("summary", typed)
+            if kind == "compaction_failed":
+                self.assertEqual(typed["error"], "readable status")
 
 
 class PreCompactSettingsTests(unittest.TestCase):

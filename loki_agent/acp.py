@@ -312,6 +312,7 @@ class Front:
         self._client_requests: dict[str, asyncio.Future] = {}
         self._next_client_request_id = 0
         self._client_supports_form_elicitation = False
+        self._client_supports_compaction = False
 
     @property
     def workers(self) -> dict[str, WorkerChannel]:
@@ -638,6 +639,10 @@ class Front:
         client_capabilities = params.get("clientCapabilities")
         if not isinstance(client_capabilities, dict):
             client_capabilities = {}
+        session_capabilities = client_capabilities.get("session")
+        self._client_supports_compaction = (
+            isinstance(session_capabilities, dict)
+            and isinstance(session_capabilities.get("compaction"), dict))
         elicitation = client_capabilities.get("elicitation")
         self._client_supports_form_elicitation = (
             isinstance(elicitation, dict)
@@ -1079,6 +1084,7 @@ class Front:
                     # the client can actually answer it, so the model is
                     # never given a question tool that always fails.
                     "formElicitation": self._client_supports_form_elicitation,
+                    "compaction": self._client_supports_compaction,
                 },
             )
             raw_descriptor = (prepared or {}).get(

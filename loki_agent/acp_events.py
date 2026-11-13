@@ -110,7 +110,7 @@ def tool_call_update(session_id: str, tool_call_id: str, content,
     return {"sessionId": session_id, "update": update}
 
 
-def map_event(session_id: str, event: dict, state: dict) -> list:
+def map_event(session_id: str, event: dict, state: dict, *, compaction=False) -> list:
     """Translate one Loki on_event into zero or more update params.
 
     ``state`` carries turn-local bookkeeping. Provider call ids are preserved
@@ -118,6 +118,20 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
     attach updates to the wrong tool.
     """
     kind = event.get("type")
+    if kind in ["compaction_started", "compaction_completed", "compaction_failed", "compaction_cancelled"]:
+        # Only the settled execution owner emits these events, never busy
+        # receipt. Untyped v1 text therefore cannot splice into live deltas.
+        # Lifecycle is live presentation: saved replacements retain their
+        # existing ordinary replay notice, not an invented ID/final outcome.
+        if compaction and event.get("compaction_id") is not None:
+            update = {"sessionUpdate": "compaction_update",
+                      "compactionId": event["compaction_id"],
+                      "status": {"compaction_started": "in_progress", "compaction_completed": "completed",
+                                 "compaction_failed": "failed", "compaction_cancelled": "cancelled"}[kind]}
+            if kind == "compaction_failed":
+                update["error"] = event["text"]
+            return [{"sessionId": session_id, "update": update}]
+        return [agent_message_chunk(session_id, event.get("text", "Compacting context."))]
     if kind == "reasoning_start":
         if state.get("last_content_kind") == "thought":
             return [{"sessionId": session_id, "update": {

@@ -2227,6 +2227,11 @@ class InputModal:
             self.reading = False
 
 
+# Wakes the existing idle input owner for deferred control work. It is neither
+# user text nor EOF and must never acquire an editable submission ID or image.
+CONTROL_WAKE = object()
+
+
 @dataclass(frozen=True)
 class QueuedText:
     id: int
@@ -2274,21 +2279,21 @@ class UserMessageQueue(asyncio.Queue):
                 pass
 
     def put_nowait(self, item):
-        entry = None if item is None else QueuedText(self._next_id, item)
+        entry = item if item is None or item is CONTROL_WAKE else QueuedText(self._next_id, item)
         super().put_nowait(entry)
-        if entry is not None:
+        if isinstance(entry, QueuedText):
             self._next_id += 1
             self._message_count += 1
             self._notify_size_change()
 
     def get_nowait(self):
         entry = super().get_nowait()
-        if entry is not None:
+        if isinstance(entry, QueuedText):
             assert self._message_count > 0
             self._message_count -= 1
             self._notify_size_change()
             return entry.text
-        return None
+        return entry
 
     def discard_pending_messages(self):
         old_count = self._message_count
@@ -2302,12 +2307,12 @@ class UserMessageQueue(asyncio.Queue):
             self._notify_size_change()
 
     def pending_entries(self) -> list:
-        """Identified queued submissions in send order, excluding EOF."""
-        return [entry for entry in self._queue if entry is not None]
+        """Identified submissions in send order, excluding EOF/control wakeups."""
+        return [entry for entry in self._queue if isinstance(entry, QueuedText)]
 
     def _entry_index(self, entry_id):
         for index, entry in enumerate(self._queue):
-            if entry is not None and entry.id == entry_id:
+            if isinstance(entry, QueuedText) and entry.id == entry_id:
                 return index
         raise KeyError(entry_id)
 
@@ -2323,8 +2328,8 @@ class UserMessageQueue(asyncio.Queue):
     def move_text(self, entry_id, before_id=None):
         index = self._entry_index(entry_id)
         # Validate both operands before changing anything.
-        target = (self._entry_index(before_id) if before_id is not None
-                  else len(self.pending_entries()))
+        target = (self._entry_index(before_id) if before_id is not None else
+                  next((i for i, item in enumerate(self._queue) if item is None), len(self._queue)))
         if entry_id == before_id:
             return
         entry = self._queue[index]

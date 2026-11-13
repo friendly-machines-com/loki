@@ -728,6 +728,15 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
         if event.get("cwd") is not None:
             _print_repr_line("  Shell CWD: ", event["cwd"])
         terminal.reset_colors_and_flags()
+    elif kind in ["compaction_started", "compaction_completed", "compaction_failed", "compaction_cancelled"]:
+        if kind == "compaction_started":
+            text = "Compacting context."
+        elif kind == "compaction_failed":
+            text = "Context compaction failed: " + compactions.format_error(event["error"])
+        else:
+            text = event["text"]
+        _emit_immediate_output("/compact", text)
+        _redraw_status()
     elif kind == "tool_result":
         # The canonical result event.  ``tool_error`` carries only the failure
         # content and no name, and ACP drops it for the same reason: printing
@@ -762,7 +771,7 @@ def _terminal_allowed_tools():
 async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
                                   cancel_event: asyncio.Event | None = None,
                                   turn_events=None, ui_settings=None,
-                                  ask_user=None) -> str:
+                                  ask_user=None, compaction_requests=None) -> str:
     # The reader's event is the state; callback-based requests see a view of
     # that same event, with or without recovery. Capture policy once, then lend
     # one scoped recovery object to both request replay and history continuation.
@@ -787,20 +796,20 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     # The user/mode input has already been appended: the old report is stale
     # during this request, even before the first response or tool result.
     _redraw_status()
-    return await run_tool_loop_async(
-        transcript_items,
-        allowed=allowed,
-        on_event=on_event,
-        cancel_check=cancel_check,
-        stream_chat=True,
-        report_timing=True,
-        cancel_event=cancel_event,
-        recovery=recovery,
-        reasoning_effort=reasoning_effort,
-        thinking=thinking,
-        ask_user=ask_user,
-        on_response=on_response,
-    )
+    try:
+        return await run_tool_loop_async(
+            transcript_items, allowed=allowed, on_event=on_event,
+            cancel_check=cancel_check, stream_chat=True, report_timing=True,
+            cancel_event=cancel_event, recovery=recovery,
+            reasoning_effort=reasoning_effort, thinking=thinking,
+            ask_user=ask_user, on_response=on_response,
+            compaction_requests=compaction_requests)
+    finally:
+        # Seal this loop's intent before the outer turn_end hook can await.
+        # Later receipt is then the input owner's idle tail, not a dead loop.
+        if compaction_requests is not None:
+            compaction_requests.finish_pending(
+                cancelled=not current_session().active or bool(cancel_check and cancel_check()))
 
 
 def _status_fields(activity):
@@ -1542,11 +1551,51 @@ async def async_main(args, configuration: settings.Settings) -> int:
         # The staged-images list is shared with the immediate /queue command
         # (see _QueuedInputs); the loop keeps using this local name.
         pending_images = _queued_inputs.reset(session)
+        compact_requests = compactions.Requests()
+        status_cleanup.callback(compact_requests.finish_pending, cancelled=True)
+
+        def submit(text):
+            argument = command_deliveries.compact_argument(text)
+            if argument is None:
+                return _submit_immediate(text)
+            if argument:
+                _emit_immediate_output(text, "Usage: /compact", file=sys.stderr)
+                return True
+            first = compact_requests.pending is None
+            compact_requests.request()
+            # The sole consumer may be blocked on get(). One non-text wakeup
+            # per attempt also survives finalization; stale wakeups are harmless.
+            if first:
+                session.user_messages.put_nowait(terminals.CONTROL_WAKE)
+            _echo_immediate(text)
+            _emit_immediate_output(text, "Compaction requested." if first else "Compaction already requested.")
+            return True
+
+        async def idle_compaction():
+            _terminal_activity.set_turn_running(True)
+            session.reader.cancel_event.clear()
+            try:
+                await compact_requests.run(
+                    lambda started: _core.compact_context_async(
+                        cancel_event=session.reader.cancel_event,
+                        thinking=_core.capture_turn_settings(), allowed=_terminal_allowed_tools(),
+                        allow_ask=terminal_ask_user(session) is not None, on_start=started),
+                    lambda event: _terminal_agent_event(event, ui_settings=ui_settings))
+            finally:
+                _terminal_activity.set_turn_running(False)
+
+        # Normal and modal readers call the same synchronous intake before
+        # queue/answer admission. It records intent only, never awaits the tool
+        # batch which may itself be waiting for that modal answer.
+        session.on_submit = submit
         dummy_model_hint_shown = False
         # The first normal frame needs the selected provider and loaded history.
         # Startup modals retain the reader without enabling the normal producer.
         await session.start()
         while current_session().active:
+            if compact_requests.pending is not None:
+                await idle_compaction()
+                continue
             # Show completed dispatch effects before admitting the next queued input.
             # Busy turns and modals redraw through the out-of-band callbacks.
             _redraw_status()
@@ -1555,6 +1604,8 @@ async def async_main(args, configuration: settings.Settings) -> int:
 
             if user_in is None or not current_session().active:
                 break
+            if user_in is terminals.CONTROL_WAKE:
+                continue
 
             # An empty prompt submits staged images without inventing text.
             if not user_in and not pending_images:
@@ -1580,33 +1631,10 @@ async def async_main(args, configuration: settings.Settings) -> int:
             match command_text:
                 case '/quit':
                     break
-                case _ if (command_text == '/compact' or (command_text.startswith('/compact')
-                           and len(command_text) > 8 and command_text[8].isspace())):
-                    # This mutates inference context and performs network I/O:
-                    # use FIFO delivery, NOT immediate monitoring. The existing
-                    # input/activity owners retain cancellation and busy state;
-                    # never insert command text or consume staged images as a
-                    # model prompt. The shared operation owns gate/save/commit.
-                    if command_text != '/compact':
-                        print("Usage: /compact", file=sys.stderr)
-                        continue
-                    _terminal_activity.set_turn_running(True)
-                    session.reader.cancel_event.clear()
-                    try:
-                        text = await _core.compact_context_async(
-                            cancel_event=session.reader.cancel_event,
-                            thinking=_core.capture_turn_settings(), allowed=_terminal_allowed_tools(),
-                            allow_ask=terminal_ask_user(session) is not None)
-                    except recoveries.Cancelled:
-                        text = "Context compaction cancelled."
-                    except KeyboardInterrupt:
-                        text = "Context compaction cancelled."
-                    except Exception as error:
-                        text = "Context compaction failed: " + compactions.format_error(error)
-                    finally:
-                        _terminal_activity.set_turn_running(False)
-                    terminal.write_text(text, multiline=True, file=sys.stderr)
-                    print(file=sys.stderr)
+                case _ if command_deliveries.compact_argument(command_text) is not None:
+                    # Scripted/queue-fed input shares the same receipt/coalescing
+                    # path. Real keyboard controls were claimed before the FIFO.
+                    submit(command_text)
                     continue
                 case _ if (command_text == '/account'
                            or command_text.startswith('/account ')):
@@ -1847,7 +1875,7 @@ async def async_main(args, configuration: settings.Settings) -> int:
                     cancel_check=session.reader.cancel_event.is_set,
                     cancel_event=session.reader.cancel_event,
                     turn_events=turn_events, ui_settings=ui_settings,
-                    ask_user=terminal_ask_user(session))
+                    ask_user=terminal_ask_user(session), compaction_requests=compact_requests)
             except KeyboardInterrupt:
                 if turn_events is not None:
                     turn_events.append({"type": "response_cancelled"})

@@ -161,7 +161,16 @@ def _write_destination(file_path: str) -> str:
     return existing_target(file_path, observed)
 
 
-def atomic_write_text(file_path: str, content: str):
+def atomic_write_text(file_path: str, content: str, *, on_published=None):
+    """Publish through the existing editor writer, then notify its synchronous owner.
+
+    Chat compaction must install exactly the selection visible on disk even when
+    retained-directory cleanup subsequently fails. A successful return is too late
+    to identify that boundary. The optional callback reports successful replacement
+    before cleanup, without another writer, pathname reopen or rollback policy.
+    Callers prepare their state beforehand; the callback cannot await. Ordinary
+    editor saves keep their existing permissions, link and cleanup contracts.
+    """
     file_path = _follow_final_link(file_path)
     # A final symlink is followed so its target is replaced and the link stays,
     # the same rule as the write tools apply; callers that already selected a
@@ -219,8 +228,16 @@ def atomic_write_text(file_path: str, content: str):
                 # Buffered bytes must reach the file before chmod, because a
                 # subsequent write could clear the captured POSIX set-ID bits.
                 _apply_destination_permissions(file_path, stream.fileno(), target_mode)
-        private_files.replace_at(directory_fd, temporary, name)
-        temporary = None
+
+        def published():
+            nonlocal temporary
+            # The source name is no longer ours after native rename, including
+            # when the Windows primitive's own source-handle close then fails.
+            temporary = None
+            if on_published is not None:
+                on_published()
+
+        private_files.replace_at(directory_fd, temporary, name, on_published=published)
     finally:
         try:
             if temporary is not None:

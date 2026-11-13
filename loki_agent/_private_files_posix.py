@@ -111,9 +111,14 @@ def open_lock_file_at(directory_fd: int, name: str, mode: int, *, user_owned=Fal
     return os.open(name, _no_follow(flags), mode, dir_fd=directory_fd)
 
 
-def replace_at(directory_fd: int, temporary: str, name: str) -> None:
+def replace_at(directory_fd: int, temporary: str, name: str, *, on_published=None) -> None:
+    # The editor/chat publisher relinquishes its temporary name and commits
+    # prepared state here, not after potentially failing owner cleanup. Match
+    # Windows' native-rename boundary without sharing its handle mechanics.
     os.replace(temporary, name,
                src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    if on_published is not None:
+        on_published()
 
 
 def unlink_at(directory_fd: int, name: str) -> None:

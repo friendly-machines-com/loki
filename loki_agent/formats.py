@@ -2572,19 +2572,13 @@ def _responses_tool_output(blocks):
     return rendered
 
 
-def items_to_openai_responses_parts(events, target=None, *, system_role="system"):
-    """Project saved local instructions using the selected wire contract's role.
+def items_to_openai_responses_parts(events, target=None):
+    """Extract the instruction prefix without inventing later role translations.
 
-    Provider supplies system_role for LATE top-level system events; the existing
-    extracted prefix cannot cover a first mode announcement after a checkpoint,
-    or later cwd/mode updates. Reordering those instructions into the prefix would
-    change their position/meaning and cached history. Render a new wire item in
-    place instead, leaving canonical authority, text and persisted snapshots alone.
-    This parameter never relabels provider response items: saved/native data cannot
-    gain local developer authority through the instruction-framing path.
+    The selected Provider packs that prefix for its qualified wire profile.
+    Later instruction events retain their original role and position; a compaction
+    checkpoint is not permission to rewrite their authority or hoist them.
     """
-    if system_role not in ["system", "developer"]:
-        raise ProjectionError("invalid Responses local instruction role")
     events = active_events(events)
     instructions = []
     input_items = []
@@ -2600,12 +2594,7 @@ def items_to_openai_responses_parts(events, target=None, *, system_role="system"
                     if text:
                         instructions.append(text)
                 else:
-                    # Preserve the selected position; the Provider owns which
-                    # role its contract admits for locally authored instructions.
-                    message = _responses_wire_message(event, False)
-                    if role == "system":
-                        message["role"] = system_role
-                    input_items.append(message)
+                    input_items.append(_responses_wire_message(event, False))
             elif role in ["user", "assistant"]:
                 instruction_prefix_open = False
                 input_items.append(_responses_wire_message(

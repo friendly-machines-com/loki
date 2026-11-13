@@ -87,13 +87,18 @@ class ScriptedInputSession:
         # whose is_set result invents cancellation during ordinary inference.
         self.reader = types.SimpleNamespace(cancel_event=asyncio.Event())
 
+    def put_nowait(self, item):
+        # These are future scripted keyboard lines, not already-admitted queue
+        # entries. Deliver the owner's control wake before reading another line.
+        self.messages.insert(0, item)
+
     async def get(self):
         while True:
             text = self.messages.pop(0)
             # Model the input owner's immediate-command interception, not a
             # consumer-side slash-command handler. Native PTY tests cover
             # actual queue timing.
-            if text is None or not self.on_submit(text):
+            if text is None or text is terminals.CONTROL_WAKE or not self.on_submit(text):
                 return text
 
     async def __aenter__(self):

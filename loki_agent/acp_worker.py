@@ -47,7 +47,7 @@ class PendingSessionOpen:
 
 
 class TurnFailure(Exception):
-    """A provider/tool-loop failure that must be an ACP request error."""
+    """A turn or explicit-operation failure requiring an ACP v1 request error."""
 
 
 class Worker:
@@ -70,6 +70,12 @@ class Worker:
         # elicitation capability. It decides whether the model is offered
         # the Ask tool at all.
         self.can_ask_user = False
+        self.can_report_compaction = False
+        # Controls retain their own wire IDs, not another prompt task. Receipt
+        # must return immediately so this same input loop can receive cancellation
+        # and reverse-question answers while the existing owner does the work.
+        self._compaction_replies: list = []
+        self.compaction_requests = compactions.Requests(self._settle_compaction_replies)
         self._model_options: list[dict] = []
         self._option_leaves: dict[str, object] = {}
         self._current_option_value: str | None = None
@@ -81,25 +87,100 @@ class Worker:
         # Images staged by /image, attached to the next real-turn prompt.
         self._pending_images: list = []
 
+    def _is_compact_control(self, params):
+        if not self.session.active:
+            raise acps.TransportError("This conversation has closed", code=acps.INVALID_PARAMS)
+        if self._pending_open is not None:
+            raise acps.TransportError("session open is awaiting approval", code=acps.INVALID_PARAMS)
+        command = acp_commands.parse(self._prompt_text(params))
+        return command is not None and command[0] == "compact" and not command[1]
+
+    @staticmethod
+    def _compaction_result(outcome):
+        if outcome["type"] == "compaction_failed":
+            raise TurnFailure("Context compaction failed: " + compactions.format_error(outcome["error"]))
+        return {"stopReason": "cancelled" if outcome["type"] == "compaction_cancelled" else "end_turn"}
+
+    def _settle_compaction_replies(self, outcome):
+        # _answer owns one ordinary reply; coalesced controls retain independent
+        # wire identities. Take the whole batch before writes, attempt every ID
+        # even on failure, then expose errors to the existing channel/close owner.
+        replies = self._compaction_replies
+        self._compaction_replies = []
+        errors = []
+        for request_id in replies:
+            try:
+                try:
+                    result = self._compaction_result(outcome)
+                except TurnFailure as error:
+                    self.write(acps.error_response(request_id, {"code": acps.INTERNAL_ERROR, "message": str(error)}))
+                else:
+                    self.write(acps.response(request_id, result=result))
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise ExceptionGroup("Could not deliver compaction replies", errors)
+
+    def _event_updates(self, event, state):
+        if event.get("type") == "compaction_failed":
+            event = {**event, "text": "Context compaction failed: " + compactions.format_error(event["error"])}
+        return acp_events.map_event(self.session_id, event, state, compaction=self.can_report_compaction)
+
+    async def _perform_idle_compaction(self, thinking=None):
+        # The admitting owner captures settings and resets cancellation once. A joining control
+        # or a scheduled-before-start cancellation must not reset that event.
+        def on_event(event):
+            for update in self._event_updates(event, {}):
+                self.write(acps.notification("session/update", update))
+
+        async def operation(started):
+            # Reuse the registered idle-command adapter inside the actual owner,
+            # never from busy receipt or as a second independent execution path.
+            admitted = thinking if thinking is not None else loki.capture_turn_settings()
+            result = await acp_commands.run(
+                "/compact", self.session, cancel_event=self.cancel_event,
+                thinking=admitted, allow_ask=self.can_ask_user, on_start=started)
+            return result.text
+
+        return await self.compaction_requests.run(operation, on_event)
+
+    async def _compaction_tail(self):
+        # _prompt_task also spans final hooks/reply writing. Requests received
+        # after loop exit belong to this idle tail, not an already-finalized turn.
+        while self.compaction_requests.pending is not None and self.session.active:
+            self.cancel_event.clear()
+            await self._perform_idle_compaction()
+        if not self.session.active:
+            self.compaction_requests.finish_pending(cancelled=True)
+
     async def handle(self, message: dict, concurrent: bool = False):
         method = message.get("method")
         request_id = message.get("id")
         if method is None or request_id is None:
             return
-        if concurrent and method == "session/prompt":
+        if method == "session/prompt":
             try:
-                thinking = self._prepare_prompt(message.get("params") or {})
+                params = message.get("params") or {}
+                if (self._prompt_task is not None and not self._prompt_task.done()
+                        and self._is_compact_control(params)):
+                    self.compaction_requests.request()
+                    self._compaction_replies.append(request_id)
+                    return
+                thinking = self._prepare_prompt(params)
             except acps.TransportError as error:
                 self.write(acps.error_response(
                     request_id, {"code": error.code, "message": str(error)}))
                 return
-            self._prompt_task = asyncio.create_task(
-                self._answer(
-                    message,
-                    thinking=thinking,
-                ),
-                name=f"acp-worker-prompt-{request_id}",
-            )
+            if concurrent:
+                self._prompt_task = asyncio.create_task(
+                    self._answer(message, thinking=thinking),
+                    name=f"acp-worker-prompt-{request_id}")
+            else:
+                self._prompt_task = asyncio.current_task()
+                try:
+                    await self._answer(message, thinking=thinking)
+                finally:
+                    self._prompt_task = None
             return
         await self._answer(message)
 
@@ -126,7 +207,12 @@ class Worker:
                     except asyncio.CancelledError:
                         pass
 
-                await finish_cleanup(join_prompt(), preserve_failure=sys.exc_info()[0] is not None)
+                try:
+                    await finish_cleanup(join_prompt(), preserve_failure=sys.exc_info()[0] is not None)
+                finally:
+                    self.compaction_requests.finish_pending(cancelled=True)
+            else:
+                self.compaction_requests.finish_pending(cancelled=True)
 
     async def _answer(
             self, message: dict,
@@ -141,18 +227,18 @@ class Worker:
         except acps.TransportError as error:
             self.write(acps.error_response(
                 request_id, {"code": error.code, "message": str(error)}))
-            return
         except Exception as error:
             self.write(acps.error_response(
                 request_id, {"code": acps.INTERNAL_ERROR, "message": str(error)}))
-            return
-        try:
-            self.write(acps.response(request_id, result=result))
-        except acps.TransportError as error:
-            # Encoding failed before any frame byte. The caller receives an
-            # explicit error, not a partial result or a stranded request.
-            self.write(acps.error_response(
-                request_id, {"code": error.code, "message": str(error)}))
+        else:
+            try:
+                self.write(acps.response(request_id, result=result))
+            except acps.TransportError as error:
+                # Encoding failed before any frame byte; retain the v1 error path.
+                self.write(acps.error_response(
+                    request_id, {"code": error.code, "message": str(error)}))
+        if asyncio.current_task() is self._prompt_task:
+            await self._compaction_tail()
 
     async def dispatch(
             self, method: str, params: dict,
@@ -448,6 +534,7 @@ class Worker:
         # The front relays whether its client can render questions. Saved
         # conversation data cannot supply this live capability.
         self.can_ask_user = params.get('formElicitation') is True
+        self.can_report_compaction = params.get('compaction') is True
         saved_descriptor = None
         connection_update = _UNCHANGED
         if open_method != "session/new":
@@ -820,12 +907,10 @@ class Worker:
         return user_text
 
     def _prepare_prompt(self, params, thinking=None):
-        # ACP local commands still use ordinary prompt admission: overlap
-        # is rejected, not queued. Terminal immediacy in command_deliveries
-        # does not bypass this gate (decision D2): agent_message_chunk has
-        # no message boundary, so monitor output could splice into the
-        # streaming agent message. An ACP bypass needs its own out-of-band
-        # output channel first.
+        # Ordinary prompts and local commands retain overlap rejection. Exact
+        # compaction controls are claimed separately by handle/prompt: they only
+        # record intent and keep their own v1 replies, without monitor text in
+        # the live assistant stream or a second ordinary turn.
         if not self.session.active:
             raise acps.TransportError(
                 "This conversation has closed", code=acps.INVALID_PARAMS)
@@ -854,6 +939,10 @@ class Worker:
             thinking: model_requests.TurnThinkingSettings | None = None) -> dict:
         task = asyncio.current_task()
         scheduled = self._prompt_task is task
+        if (not scheduled and self._prompt_task is not None and not self._prompt_task.done()
+                and self._is_compact_control(params)):
+            future = self.compaction_requests.request()
+            return self._compaction_result(await asyncio.shield(future))
         if not scheduled:
             thinking = self._prepare_prompt(params, thinking)
             self._prompt_task = task
@@ -863,7 +952,10 @@ class Worker:
             # Inline callers own the task only for this prompt. Scheduled
             # callers remain owned through _answer's final response write.
             if not scheduled:
-                self._prompt_task = None
+                try:
+                    await self._compaction_tail()
+                finally:
+                    self._prompt_task = None
 
     async def _prompt(self, params, thinking):
         user_text = self._prompt_text(params)
@@ -876,29 +968,17 @@ class Worker:
         outcome = None
         command = acp_commands.parse(user_text)
         if command is not None and command[0] == "compact":
-            # The usual local-command return skips cancellation handling and
-            # ordinary-turn persistence. Compaction is instead a busy-gated
-            # network operation: the shared owner saves before installation,
-            # and no user message, image consumption or turn-end hook is made.
-            # Check cancellation BEFORE entry (including scheduled-before-start),
-            # never after success: a post-publication cancel cannot undo commit.
-            stop_reason = "end_turn"
-            try:
-                if self.cancel_event.is_set():
-                    raise recoveries.Cancelled()
-                outcome = await acp_commands.run(
-                    user_text, self.session, cancel_event=self.cancel_event,
-                    thinking=thinking, allow_ask=self.can_ask_user)
-                text = outcome.text
-            except recoveries.Cancelled:
-                text, stop_reason = "Context compaction cancelled.", "cancelled"
-            except asyncio.CancelledError:
-                text, stop_reason = "Context compaction cancelled.", "cancelled"
-            except Exception as error:
-                text = "Context compaction failed: " + compactions.format_error(error)
-            if text:
-                self.write(acps.notification("session/update", acp_events.agent_message_chunk(self.session_id, text)))
-            return {"stopReason": stop_reason}
+            if command[1]:
+                self.write(acps.notification("session/update", acp_events.agent_message_chunk(self.session_id, "Usage: /compact")))
+                return {"stopReason": "end_turn"}
+            future = self.compaction_requests.request()
+            # Admission already captured thinking and reset cancellation once.
+            # A pre-start cancel must not be cleared by the idle execution path.
+            if self.cancel_event.is_set():
+                self.compaction_requests.finish_pending(cancelled=True)
+            else:
+                await self._perform_idle_compaction(thinking)
+            return self._compaction_result(future.result())
         cancelled_bang = (command is not None and command[0] == "!"
                           and self.cancel_event.is_set())
         if not cancelled_bang and user_text.lstrip().startswith(("/", "!")):
@@ -938,8 +1018,7 @@ class Worker:
 
         def on_event(event):
             events.append(event)
-            for update in acp_events.map_event(
-                    self.session_id, event, mapper_state):
+            for update in self._event_updates(event, mapper_state):
                 self.write(acps.notification("session/update", update))
 
         turn_text = ""
@@ -948,7 +1027,7 @@ class Worker:
             try:
                 turn_text = await self._run_turn(on_event, thinking) or ""
             except BaseException as error:
-                if not self.cancel_event.is_set():
+                if not self.cancel_event.is_set() or any(event.get("type") == "compaction_failed" for event in events):
                     turn_error = error
                     raise
                 if not any(
@@ -995,21 +1074,25 @@ class Worker:
         # The existing prompt task owns replay/continuation, backoff and hook
         # cleanup through this await. _prompt then saves/notifies once and
         # _answer writes the sole reply; recovery adds no separate lifecycle.
-        return await loki.run_tool_loop_async(
-            self.session.transcript_items,
-            on_event=on_event,
-            cancel_event=self.cancel_event,
-            recovery=recovery,
-            stream_chat=True,
-            on_response=on_response,
-            thinking=thinking,
-            ask_user=self._ask_user if self.can_ask_user else None,
-        )
+        try:
+            return await loki.run_tool_loop_async(
+                self.session.transcript_items, on_event=on_event,
+                cancel_event=self.cancel_event, recovery=recovery,
+                stream_chat=True, on_response=on_response, thinking=thinking,
+                ask_user=self._ask_user if self.can_ask_user else None,
+                compaction_requests=self.compaction_requests)
+        finally:
+            # No await before sealing this loop. Later controls are serviced
+            # after the original save/hook/reply by _answer's idle tail.
+            self.compaction_requests.finish_pending(
+                cancelled=self.cancel_event.is_set() or not self.session.active)
 
     @staticmethod
     def _turn_failure(events: list) -> str | None:
         for event in events:
             kind = event.get("type")
+            if kind == "compaction_failed":
+                return "Context compaction failed: " + compactions.format_error(event["error"])
             if kind == "api_error":
                 error = event.get("error")
                 return (
