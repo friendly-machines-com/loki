@@ -53,7 +53,6 @@ logger = logging.getLogger(__name__)
 # cwd selects a different root without changing this process's startup context.
 CHAT_LOG_DIR = paths.chat_log_dir_for(os.getcwd())
 
-PROTOCOL_VERSION = 1
 AGENT_INFO = {
     "name": "loki",
     "title": "Loki",
@@ -313,6 +312,10 @@ class Front:
         self._next_client_request_id = 0
         self._client_supports_form_elicitation = False
         self._client_supports_compaction = False
+        # This live connection selects its dialect before any session work.
+        # Failed repeated initialization cannot replace the last success.
+        self.protocol_version = None
+        self._initialization_locked = False
 
     @property
     def workers(self) -> dict[str, WorkerChannel]:
@@ -373,10 +376,10 @@ class Front:
             print(f"ACP notification {message.get('method')!r} failed: "
                   f"{error!r}", file=sys.stderr)
         else:
-            self.write(acps.error_response(message["id"], {
-                "code": getattr(error, "code", acps.INTERNAL_ERROR),
-                "message": str(error),
-            }))
+            detail = {"code": getattr(error, "code", acps.INTERNAL_ERROR), "message": str(error)}
+            if getattr(error, "data", None) is not None:
+                detail["data"] = error.data
+            self.write(acps.error_response(message["id"], detail))
 
     def _reserve_session(self, session_id: object):
         # Wire values are untrusted; the shared bool predicate is not a type guard.
@@ -427,6 +430,14 @@ class Front:
             if not isinstance(params, dict):
                 raise acps.TransportError(
                     "request params must be an object", code=acps.INVALID_PARAMS)
+            if method == "initialize":
+                # No await/resource acquisition is needed. Publish negotiation
+                # synchronously before subsequent buffered requests are admitted.
+                result = self.initialize(params)
+                self.write(acps.response(request_id, result=result))
+                return
+            if self.protocol_version is not None and request_id is not None:
+                self._initialization_locked = True
             if method == "session/new" or method in RESTORE_METHODS:
                 self._validate_session_setup(params)
                 self._working_directory(params)
@@ -636,20 +647,26 @@ class Front:
             f"method not found: {method}", code=acps.METHOD_NOT_FOUND)
 
     def initialize(self, params: dict) -> dict:
+        selected = acps.negotiate_protocol_version(params)
+        if self._initialization_locked:
+            raise acps.TransportError("initialize cannot be repeated after another request", code=acps.INVALID_REQUEST)
         client_capabilities = params.get("clientCapabilities")
         if not isinstance(client_capabilities, dict):
             client_capabilities = {}
         session_capabilities = client_capabilities.get("session")
-        self._client_supports_compaction = (
+        compaction = (
             isinstance(session_capabilities, dict)
             and isinstance(session_capabilities.get("compaction"), dict))
         elicitation = client_capabilities.get("elicitation")
-        self._client_supports_form_elicitation = (
+        form_elicitation = (
             isinstance(elicitation, dict)
             and isinstance(elicitation.get("form"), dict)
         )
+        self.protocol_version = selected
+        self._client_supports_compaction = compaction
+        self._client_supports_form_elicitation = form_elicitation
         return {
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": selected,
             "agentInfo": AGENT_INFO,
             "authMethods": [],
             "agentCapabilities": {

@@ -167,7 +167,7 @@ class FrontInputFailureTests(unittest.IsolatedAsyncioTestCase):
         source = _FrontInput(front)
         try:
             with self.assertRaises(OSError) as caught:
-                await source.send({'id': 1, 'method': 'initialize'})
+                await source.send({'id': 1, 'method': 'initialize', 'params': {'protocolVersion': 1}})
             self.assertIs(caught.exception, failure)
         finally:
             await source.close()
@@ -622,6 +622,55 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FrontSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_version_selection_uses_uint16_and_highest_supported_not_above_request(self):
+        with mock.patch.object(acps, "SUPPORTED_PROTOCOL_VERSIONS", [1, 2]):
+            for requested, expected in [[1, 1], [2, 2], [3, 2], [65535, 2]]:
+                self.assertEqual(acps.negotiate_protocol_version({"protocolVersion": requested}), expected)
+            with self.assertRaises(acps.TransportError) as unsupported:
+                acps.negotiate_protocol_version({"protocolVersion": 0})
+            self.assertEqual(unsupported.exception.code, -32022)
+            self.assertEqual(unsupported.exception.data, {"requested": 0, "supported": [1, 2]})
+        for value in [None, True, False, -1, 65536, "2", 2.0, [], {}]:
+            with self.subTest(value=value), self.assertRaises(acps.TransportError) as invalid:
+                acps.negotiate_protocol_version({"protocolVersion": value})
+            self.assertEqual(invalid.exception.code, acps.INVALID_PARAMS)
+        with self.assertRaises(acps.TransportError):
+            acps.negotiate_protocol_version({})
+
+    async def test_downgrade_uses_v1_shape_and_failed_repeat_preserves_capabilities(self):
+        front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
+        self.addAsyncCleanup(front.shutdown)
+        with mock.patch.object(acps, "SUPPORTED_PROTOCOL_VERSIONS", [1]):
+            front.initialize({"protocolVersion": 1, "clientCapabilities": {"session": {"compaction": {}}}})
+            with self.assertRaises(acps.TransportError):
+                front.initialize({"protocolVersion": 0, "clientCapabilities": {}})
+            self.assertEqual(front.protocol_version, 1)
+            self.assertTrue(front._client_supports_compaction)
+            result = front.initialize({"protocolVersion": 2, "capabilities": {"elicitation": {"form": {}}},
+                                       "info": {"name": "new-client", "version": "test"}})
+            self.assertEqual(result["protocolVersion"], 1)
+            self.assertIn("agentCapabilities", result)
+            self.assertNotIn("capabilities", result)
+            self.assertFalse(front._client_supports_form_elicitation)
+            front.initialize({"protocolVersion": 1, "clientCapabilities": {"elicitation": {"form": {}}}})
+            self.assertTrue(front._client_supports_form_elicitation)
+
+    async def test_wire_initialize_is_synchronous_and_cannot_change_after_another_request(self):
+        messages = []
+        front = acp.Front(lambda: None, messages.append, CredentialStore({}))
+        self.addAsyncCleanup(front.shutdown)
+        front.handle(acps.request(1, "initialize", {"protocolVersion": 1}))
+        self.assertEqual(messages[0]["result"]["protocolVersion"], 1)
+        front.handle(acps.request(2, "unknown/method", {}))
+        front.handle(acps.request(3, "initialize", {"protocolVersion": 1}))
+        self.assertEqual(next(message for message in messages if message.get("id") == 3)["error"]["code"], acps.INVALID_REQUEST)
+        await asyncio.gather(*list(front._tasks))
+        front.handle(acps.request(4, "initialize", {"protocolVersion": 0}))
+        error = next(message for message in messages if message.get("id") == 4)["error"]
+        self.assertEqual(error["code"], -32022)
+        self.assertEqual(error["data"]["requested"], 0)
+        self.assertEqual(front.protocol_version, 1)
+
     async def test_compaction_reporting_uses_v1_client_capability_object_not_elicitation(self):
         front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
         self.addAsyncCleanup(front.shutdown)
@@ -939,6 +988,7 @@ class SavedConnectionAuthorizationTests(
             lambda: None, write, CredentialStore({}))
         if advertise:
             front.initialize({
+                "protocolVersion": 1,
                 "clientCapabilities": {
                     "elicitation": {"form": {}},
                 },
@@ -1769,7 +1819,7 @@ class FrontWorkerTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                 env = self._front_env(root)
                 workspace = _configured_workspace(root)
                 front, diagnostics = await self._front(env, workspace, cleanup=cleanup.push_async_callback)
-                await self._request(front, 1, 'initialize', {})
+                await self._request(front, 1, 'initialize', {'protocolVersion': 1})
                 opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
                 session_id = opened['sessionId']
                 result, _ = await self._request(front, 3, 'session/prompt', {
@@ -1777,7 +1827,7 @@ class FrontWorkerTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result['stopReason'], 'end_turn')
                 await self._finish(front, diagnostics, session_id)
                 restored, diagnostics = await self._front(env, workspace, cleanup=cleanup.push_async_callback)
-                await self._request(restored, 1, 'initialize', {})
+                await self._request(restored, 1, 'initialize', {'protocolVersion': 1})
                 _reply, updates = await self._request(restored, 2, 'session/load', {
                     'cwd': workspace, 'sessionId': session_id})
                 chunks = [message['params']['update']['content']['text'] for message in updates
@@ -4573,6 +4623,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                         source = _FrontInput(front)
                         sources.append(source)
                         await source.send(acps.request(0, 'initialize', {
+                            'protocolVersion': 1,
                             'clientCapabilities': {'elicitation': {'form': {}}}}))
                         opened = await request(1, "session/new", {"cwd": workspace})
                         session_id = opened["sessionId"]
@@ -4596,6 +4647,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                         source = _FrontInput(front)
                         sources.append(source)
                         await source.send(acps.request(0, 'initialize', {
+                            'protocolVersion': 1,
                             'clientCapabilities': {'elicitation': {'form': {}}}}))
                         messages.clear()
                         await source.send(acps.request(73, method, {
@@ -5933,6 +5985,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 f.source = _FrontInput(f.front)
                 try:
                     await f.source.send(acps.request(0, 'initialize', {
+                        'protocolVersion': 1,
                         'clientCapabilities': {'elicitation': {'form': {}}}}))
                     opened = await request(1, 'session/new', {'cwd': workspace})
                     f.session_id = opened['sessionId']
@@ -6497,6 +6550,7 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
             front = acp.Front(lambda: None, client_write, CredentialStore({}))
             if advertise:
                 front.initialize({
+                    "protocolVersion": 1,
                     "clientCapabilities": {"elicitation": {"form": {}}}})
             owner = self._owner(front)
             channel = acp.WorkerChannel(
@@ -6795,6 +6849,7 @@ class FrontAskValidationTests(unittest.IsolatedAsyncioTestCase):
         front = acp.Front(lambda: None, messages.append, CredentialStore({}))
         if advertise:
             front.initialize({
+                "protocolVersion": 1,
                 "clientCapabilities": {"elicitation": {"form": {}}}})
         self.owner = front._reserve_session("s")
         self.owner.state = "active"
@@ -6855,6 +6910,7 @@ class FrontAskValidationTests(unittest.IsolatedAsyncioTestCase):
 
         front = acp.Front(lambda: None, write, CredentialStore({}))
         front.initialize({
+            "protocolVersion": 1,
             "clientCapabilities": {"elicitation": {"form": {}}}})
         self.owner = front._reserve_session("s")
         self.owner.state = "active"

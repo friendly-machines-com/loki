@@ -19,9 +19,32 @@ from .streams import BufferedReader
 
 
 class TransportError(Exception):
-    def __init__(self, message: str, *, code: int = -32603):
+    def __init__(self, message: str, *, code: int = -32603, data=None):
         super().__init__(message)
         self.code = code
+        self.data = data
+
+
+# Enable a major only together with its wire/lifecycle implementation. Selection
+# understands newer requests without pretending a version-constant change is v2.
+SUPPORTED_PROTOCOL_VERSIONS = [1]
+
+
+def negotiate_protocol_version(params):
+    """Select before parsing version-specific fields; never upgrade the peer.
+
+    Initialization is the connection's contract, not catalog/model metadata.
+    ACP's uint16 major and highest-supported <= request rule make downgrade
+    explicit; malformed majors and an empty intersection are different errors.
+    """
+    requested = params.get("protocolVersion") if isinstance(params, dict) else None
+    if isinstance(requested, bool) or not isinstance(requested, int) or not 0 <= requested <= 65535:
+        raise TransportError("protocolVersion must be an integer from 0 to 65535", code=-32602)
+    available = [version for version in SUPPORTED_PROTOCOL_VERSIONS if version <= requested]
+    if not available:
+        raise TransportError("Unsupported protocol version", code=-32022,
+                             data={"requested": requested, "supported": list(SUPPORTED_PROTOCOL_VERSIONS)})
+    return max(available)
 
 
 # ACP carries prompts/catalogs, unlike small credential RPC. The public budget
