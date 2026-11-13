@@ -174,6 +174,15 @@ class FrontInputFailureTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FramingTests(unittest.IsolatedAsyncioTestCase):
+    def test_valid_json_nonobjects_are_invalid_requests_not_json_parse_errors(self):
+        for raw in [b'[]\n', b'1\n', b'null\n', b'"text"\n']:
+            with self.subTest(raw=raw), self.assertRaises(acps.TransportError) as rejected:
+                acps.decode_message(raw)
+            self.assertEqual(rejected.exception.code, acps.INVALID_REQUEST)
+        with self.assertRaises(acps.TransportError) as malformed:
+            acps.decode_message(b'{\n')
+        self.assertEqual(malformed.exception.code, acps.PARSE_ERROR)
+
     def checked_writer(self, output):
         with mock.patch.object(acps.os, 'dup', return_value=123), \
                 mock.patch.object(acps.os, 'fdopen', return_value=output):

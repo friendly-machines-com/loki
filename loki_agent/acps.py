@@ -106,7 +106,7 @@ def decode_message(raw: bytes) -> dict:
     except (ValueError, RecursionError) as error:
         raise TransportError(str(error), code=PARSE_ERROR) from error
     if not isinstance(message, dict):
-        raise TransportError('not a JSON object', code=PARSE_ERROR)
+        raise TransportError('not a JSON-RPC object', code=INVALID_REQUEST)
     request_id = message.get('id')
     if message.get('method') is not None and request_id is not None:
         probe = error_response(request_id, {
