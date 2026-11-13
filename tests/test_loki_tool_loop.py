@@ -2478,7 +2478,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(config.auth_spec.credential, authentications.CredentialRef.environment("OPENROUTER_API_KEY"))
             self.assertIsNone(config.auth_spec.header_name)
             loki.apply_runtime_config(config)
-            self.assertIn("Model: z-ai/glm-5.2 (deprecated), Context: unknown; /model", terminal_frontend.status_text())
+            self.assertIn("Model: z-ai/glm-5.2 (deprecated), Context: unknown; /compact, /model", terminal_frontend.status_text())
             self.assertEqual(loki.current_config().stream, variant == "custom")
             self.assertNotIn("Authorization", loki.current_config().chat_provider.headers)
             prepare("https://effective.example/v1/responses", "z-ai/glm-5.2", protocols.OPENAI_RESPONSES,
@@ -2544,7 +2544,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     async def get(inner_self):
                         message = await super().get()
                         if message == "/model" and loki.current_model() == "gpt-test":
-                            self.assertIn("Model: gpt-test (deprecated), Context: unknown; /model", terminal_frontend.status_text())
+                            self.assertIn("Model: gpt-test (deprecated), Context: unknown; /compact, /model", terminal_frontend.status_text())
                             self.assertEqual(json.loads(pathlib.Path(path).read_text())["session_state"]["connection"]["model_status"],
                                              "deprecated")
                         if message == "normalized selection":
