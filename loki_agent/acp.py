@@ -27,6 +27,7 @@ from . import (
     savefiles,
     paths,
     streams,
+    texts,
 )
 from .connections import (
     ConnectionDescriptor,
@@ -729,7 +730,7 @@ class Front:
             return await self.restore_session(
                 method, params, request_id=request_id, owner=owner)
         if method == "session/list":
-            return self.list_sessions(params)
+            return await self.list_sessions(params)
         if method == "session/close":
             return await self.close_session(params, owner=owner)
         if method in SESSION_METHODS:
@@ -1295,7 +1296,7 @@ class Front:
             result["lokiUpdates"] = updates
         return result
 
-    def list_sessions(self, params: dict) -> dict:
+    async def list_sessions(self, params: dict) -> dict:
         requested = params.get("cwd")
         if requested is not None:
             if (not isinstance(requested, str)
@@ -1308,32 +1309,22 @@ class Front:
         # conversation metadata.
         root = (chat_log_dir_for(requested) if requested is not None
                 else CHAT_LOG_DIR)
-        entries = []
-        for entry in savefiles.chat_log_entries(root):
-            session_id = entry.name[len('chat-'):-len('.json')]
-            if not session_id:
-                continue
-            try:
-                with savefiles.open_chat_log(entry.path) as (file_obj, facts):
-                    blob = json.load(file_obj)
-            except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
-                continue
-            state = blob.get('session_state') if isinstance(blob, dict) else None
-            if not isinstance(state, dict):
-                continue
-            cwd = state.get('cwd') or state.get('shell_cwd')
-            if not isinstance(cwd, str) or not cwd:
-                continue
-            # A fixed record keeps the opened file's ordering observation out
-            # of the protocol payload; no later pathname lookup changes it.
-            entries.append((facts.st_mtime, {
-                "sessionId": session_id,
-                "cwd": cwd,
+        # The same backend owns admission, reading and ordering for both fronts.
+        # This adapter only projects protocol fields; it creates no worker/state.
+        sessions = []
+        for info in await savefiles.list_saved_sessions(root):
+            session = {
+                "sessionId": info['id'],
+                "cwd": info['cwd'],
                 "updatedAt": datetime.datetime.fromtimestamp(
-                    facts.st_mtime, datetime.timezone.utc).isoformat(),
-            }))
-        entries.sort(key=lambda item: item[0])
-        return {"sessions": [session for _modified, session in entries]}
+                    info['mtime'], datetime.timezone.utc).isoformat(),
+            }
+            if info['preview']:
+                # A display label, unlike cwd, may neutralize controls and lone
+                # surrogates so untrusted history cannot break UTF-8 publication.
+                session['title'] = texts.escape_terminal_text(info['preview'], multiline=False)
+            sessions.append(session)
+        return {"sessions": sessions}
 
     async def close_session(self, params: dict, owner=None) -> dict:
         session_id = params.get("sessionId")

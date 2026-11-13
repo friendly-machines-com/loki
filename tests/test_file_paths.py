@@ -785,21 +785,22 @@ class FilePathTests(unittest.TestCase):
         self.assertTrue(os.path.islink(alias))
         entries = {entry.name: entry.path for entry in savefiles.chat_log_entries(str(self.project))}
         self.assertEqual(entries, {'chat-target.json': target, 'chat-alias.json': alias})
-        self.assertEqual(savefiles.text_for(alias), document)
+        summaries = asyncio.run(savefiles.list_saved_sessions(str(self.project), query='shell_cwd'))
+        self.assertEqual([item['path'] for item in summaries], [alias, target])
         os.unlink(target)
         os.mkfifo(target)
         for path in [target, alias]:
             with self.subTest(path=path):
                 with self.assertRaisesRegex(OSError, 'not a regular file'):
                     loki.load_chat_log(path)
-                self.assertEqual(savefiles.text_for(path), '')
+                self.assertEqual(asyncio.run(savefiles.list_saved_sessions(str(self.project))), [])
                 self.assertEqual(self.session.chat_log_path, alias)
-        self.assertEqual(savefiles.filtered_chat_log_entries('not present', str(self.project)), [])
+        self.assertEqual(asyncio.run(savefiles.list_saved_sessions(str(self.project), query='not present')), [])
         os.unlink(target)
         os.mkdir(target)
         with self.assertRaisesRegex(OSError, 'not a regular file'):
             loki.load_chat_log(alias)
-        self.assertEqual(savefiles.text_for(alias), '')
+        self.assertEqual(asyncio.run(savefiles.list_saved_sessions(str(self.project))), [])
 
     def test_preparsed_saved_log_keeps_the_admitted_snapshot(self):
         filename = os.path.join(str(self.project), 'prepared.json')

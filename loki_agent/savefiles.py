@@ -6,6 +6,8 @@ as typed text segments for a front-end to render.
 """
 
 from contextlib import aclosing, contextmanager
+import asyncio
+import codecs
 import json
 import os
 import re
@@ -109,15 +111,6 @@ def open_chat_log(path: str, *, errors='strict'):
     finally:
         if descriptor is not None:
             os.close(descriptor)
-
-
-def text_for(path: str) -> str:
-    # Re-read each call rather than retaining a second copy of a saved log.
-    try:
-        with open_chat_log(path, errors='replace') as (stream, _facts):
-            return stream.read()
-    except OSError:
-        return ""
 
 
 _PREVIEW_CHARS = 80
@@ -246,19 +239,51 @@ async def _preview_event(reader, event):
             return
 
 
+async def _cwd_value(reader):
+    # Only a string can become a displayed cwd. For other JSON values retain
+    # truthiness alone, preserving `cwd or shell_cwd` without building containers.
+    kind = await reader.kind()
+    if kind == '{':
+        await reader.expect('{')
+        first = True
+        while await reader.key(first=first, max_chars=0) is not None:
+            first = False
+            await reader.skip()
+        return not first
+    if kind == '[':
+        await reader.expect('[')
+        first = True
+        while await reader.item(first=first):
+            first = False
+            await reader.skip()
+        return not first
+    return await reader.scalar()
+
+
+async def _saved_cwd(reader):
+    if await reader.kind() != '{':
+        raise json_streams.Error('Saved session metadata must be an object')
+    await reader.expect('{')
+    first = True
+    fields = {}
+    while (key := await reader.key(first=first)) is not None:
+        first = False
+        if key in ['cwd', 'shell_cwd']:
+            fields[key] = await _cwd_value(reader)
+        else:
+            await reader.skip()
+    cwd = fields.get('cwd') or fields.get('shell_cwd')
+    return cwd if isinstance(cwd, str) and cwd else None
+
+
 async def preview(stream, *, chunk_size=json_streams.CHUNK_SIZE) -> str:
-    """Read a historical first-user excerpt, not the active compaction window.
+    """Borrow a stream for a best-effort historical first-user excerpt.
 
-    Picker rows previously used regex on text_for(), reading the entire log before
-    examining its prefix. A selective cursor instead skips unknown metadata and
-    non-user events without materializing them, and stops once the first user's
-    first text block is determined. Captures remain bounded even with late role
-    fields, huge strings, or future metadata. No schema/format change or cache.
-
-    This is best-effort display of an untrusted prefix, not log validation: an
-    unread tail may be incomplete/invalid (or contain duplicate keys). Resume
-    still uses read_chat_log for authoritative decoding/validation. The caller
-    owns the borrowed stream; cancellation propagates through its existing scope.
+    Both listing adapters use this prefix, not the active compaction window.
+    Stop even inside the first user text once the excerpt is determined. Field
+    order/escaped keys are handled without retaining an event or history DOM.
+    An unread suffix may be invalid or contain duplicate fields; authoritative
+    conversation decoding remains read_chat_log's job, not listing's.
     """
     reader = json_streams.Reader(stream, chunk_size=chunk_size)
     event = None
@@ -280,50 +305,102 @@ async def preview(stream, *, chunk_size=json_streams.CHUNK_SIZE) -> str:
                     return event.text.render() if event.text is not None else ''
             return ''
     except json_streams.Error:
-        # A writer may have stopped partway through a recognizable user string.
-        # Return only the decoded prefix, never raw JSON fragments or other roles.
         if event is not None and event.is_user and event.text is not None:
             return event.text.render()
     return ''
 
 
-async def format_picker_row(idx: int, entry: os.DirEntry[str]) -> str:
-    # The picker owns this one checked open through early success, parse errors
-    # and cancellation. Keep the enumerated pathname verbatim; the lexer has no
-    # filesystem authority and the existing terminal writer escapes its output.
-    chat_id = _saved_chat_id(entry.name)
-    if chat_id is None:
-        raise ValueError('saved conversation name is invalid')
+async def _listing_cwd(stream):
+    # The writer appends session_state after events; a forward traversal defeats
+    # early-stop listing. Inspect that final object, then validate only its range.
+    # A metadata-first document is also readable without crossing events. Never
+    # turn a missing suffix into a reverse/forward scan of the events array.
     try:
-        mtime = os.path.getmtime(entry.path)
-    except OSError:
-        mtime = 0
-    when = time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))
-    snippet = ''
-    try:
-        with open_chat_log(entry.path, errors='replace') as (stream, _facts):
-            snippet = await preview(stream)
-    except OSError:
-        pass
-    return f"  {idx}. {when}  {chat_id[:8]}  {snippet}"
+        region = await json_streams.ObjectSuffix(stream).field('session_state')
+    except json_streams.Error:
+        region = None
+    if region is not None:
+        reader = json_streams.Reader(codecs.getreader('utf-8')(json_streams.ByteRange(stream, region)))
+        cwd = await _saved_cwd(reader)
+        if await reader.kind():
+            raise json_streams.Error('Extra data in saved session metadata')
+        return cwd
+    stream.seek(0)
+    reader = json_streams.Reader(codecs.getreader('utf-8')(stream))
+    await reader.expect('{')
+    first = True
+    cwd = None
+    while (key := await reader.key(first=first)) is not None:
+        first = False
+        if key == 'events':
+            return cwd
+        if key == 'session_state':
+            cwd = await _saved_cwd(reader)
+        else:
+            await reader.skip()
+    if await reader.kind():
+        raise json_streams.Error('Extra data after saved JSON object')
+    return cwd
 
 
-def filtered_chat_log_entries(query: str, chat_log_dir: str) -> list[os.DirEntry[str]]:
-    # Full-text filtering still searches the entire serialized log, unlike
-    # bounded previews. Preserve substring semantics and partial-log tolerance;
-    # mtime ordering puts the most recently touched conversation at the bottom.
+async def list_saved_sessions(chat_log_dir: str, *, query: str = '') -> list[dict]:
+    """One listing backend for terminal rows and ACP serialization.
+
+    The old terminal collector read prefixes while ACP built/validated entire
+    documents. Both now receive the same admitted, ordered summaries: a valid
+    saved cwd is required, an empty preview is not an error, and unread history
+    is NOT certified resumable. Missing/unreadable/invalid summaries are omitted
+    for both callers; actual resume still validates the complete conversation.
+
+    Open each admitted name once, preserving the enumerated path and its fstat
+    observation even across atomic replacement. The existing checked text wrapper
+    owns the handle; all listing reads borrow its binary buffer (never mix reads
+    through the owning TextIOWrapper). Fresh non-owning codecs readers isolate
+    decoding after seeks. No handles, decoders or cursors escape this scope,
+    including on cancellation. Only extracted strings become descriptive data,
+    never executable/pathname authority or already-safe terminal output.
+
+    Ordinary listing consumes the needed prefix and metadata suffix, not their
+    intervening history. Only an explicit full-text query reads the entire file;
+    its whole-string lower/substring semantics intentionally remain unchanged.
+    """
     words = query.lower().split()
-    entries = chat_log_entries(chat_log_dir)
-    if not words:
-        matches = entries
-    else:
-        matches = []
-        for entry in entries:
-            blob = text_for(entry.path).lower()
-            if all(w in blob for w in words):
-                matches.append(entry)
-    matches.sort(key=lambda entry: os.path.getmtime(entry.path))
-    return matches
+    summaries = []
+    for entry in chat_log_entries(chat_log_dir):
+        try:
+            with open_chat_log(entry.path) as opened:
+                file_obj, facts = opened
+                stream = file_obj.buffer
+                cwd = await _listing_cwd(stream)
+                if cwd is None:
+                    continue
+                if words:
+                    stream.seek(0)
+                    search = codecs.getreader('utf-8')(stream, errors='replace')
+                    parts = []
+                    while part := search.read(json_streams.CHUNK_SIZE):
+                        parts.append(part)
+                        await asyncio.sleep(0)
+                    content = ''.join(parts).lower()
+                    matches = all(word in content for word in words)
+                    del parts, content
+                    if not matches:
+                        continue
+                stream.seek(0)
+                snippet = await preview(codecs.getreader('utf-8')(stream, errors='replace'))
+                summaries.append({'id': _saved_chat_id(entry.name), 'path': entry.path,
+                                  'mtime': facts.st_mtime, 'preview': snippet, 'cwd': cwd})
+        except (OSError, UnicodeError, json_streams.Error, RecursionError):
+            continue
+    summaries.sort(key=lambda item: item['id'])
+    summaries.sort(key=lambda item: item['mtime'])
+    return summaries
+
+
+def format_picker_row(idx: int, info: dict) -> str:
+    # Presentation only: neither adapter performs filesystem acquisition.
+    when = time.strftime('%Y-%m-%d %H:%M', time.localtime(info['mtime']))
+    return f"  {idx}. {when}  {info['id'][:8]}  {info['preview']}"
 
 
 async def run_session_picker_async(
@@ -333,14 +410,14 @@ async def run_session_picker_async(
     # a fresh chat).
     query = ""
     while True:
-        matches = filtered_chat_log_entries(query, chat_log_dir)
+        matches = await list_saved_sessions(chat_log_dir, query=query)
         print()
         print("Saved sessions:")
         print("Resume a chat. \"filter <words>\" searches the logs (words in any order);")
         print("bare \"filter\" clears it; a number selects that row; empty cancels.")
         if matches:
             for i, entry in enumerate(matches, 1):
-                text_writer(await format_picker_row(i, entry))
+                text_writer(format_picker_row(i, entry))
                 print()
         else:
             print("  (no chats match -- broaden your filter, or type \"filter\" to clear)")
@@ -359,7 +436,7 @@ async def run_session_picker_async(
             n = None
         if n is not None:
             if 1 <= n <= len(matches):
-                return matches[n - 1].path
+                return matches[n - 1]['path']
             continue  # out of range, re-render, keep current filter
 
         # Branch 3: empty -- cancel the picker.

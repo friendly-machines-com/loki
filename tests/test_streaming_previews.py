@@ -1,12 +1,7 @@
 """Historical-user previews must not read/materialize the rest of a chat."""
 
-import asyncio
-from contextlib import contextmanager
 import io
 import json
-import os
-import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -130,90 +125,9 @@ class StreamingPreviewTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=repr(value)):
                 self.assertEqual(await savefiles.preview(io.StringIO(wire), chunk_size=2), 'real')
 
-    async def test_picker_row_closes_early_and_preserves_the_supplied_key(self):
-        key = 'opaque/../supplied-key'
-        entry = SimpleNamespace(name='chat-saved.json', path=key)
-        source = Fragments(['{"events":[' + json.dumps(user('line\nwith\twhitespace'))], guarded=True)
-
-        @contextmanager
-        def opening(path, **options):
-            self.assertEqual(path, key)
-            self.assertEqual(options, {'errors': 'replace'})
-            try:
-                yield source, None
-            finally:
-                source.close()
-
-        with mock.patch.object(savefiles, 'open_chat_log', side_effect=opening) as opened:
-            row = await savefiles.format_picker_row(1, entry)
-        self.assertTrue(row.endswith('  line with whitespace'), row)
-        opened.assert_called_once_with(key, errors='replace')
-        self.assertTrue(source.closed)
-
-    async def test_cancellation_between_refills_closes_the_checked_open(self):
-        ready = asyncio.get_running_loop().create_future()
-
-        def pieces():
-            yield '{"metadata":"'
-            while True:
-                yield 'x' * 4096
-        source = Fragments(pieces())
-        read = source.read
-
-        def reading(size):
-            part = read(size)
-            if not ready.done():
-                ready.set_result(None)
-            return part
-        source.read = reading
-
-        @contextmanager
-        def opening(*args, **options):
-            try:
-                yield source, None
-            finally:
-                source.close()
-
-        with mock.patch.object(savefiles, 'open_chat_log', side_effect=opening):
-            operation = asyncio.create_task(savefiles.format_picker_row(1, SimpleNamespace(
-                name='chat-saved.json', path='opaque-nonexistent-key')))
-            try:
-                await asyncio.wait([ready, operation], return_when=asyncio.FIRST_COMPLETED)
-                if operation.done():
-                    await operation
-                    self.fail('preview finished before the refill cancellation')
-                self.assertTrue(ready.done())
-                reads_at_cancel = len(source.reads)
-                operation.cancel()
-                with self.assertRaises(asyncio.CancelledError):
-                    await operation
-            finally:
-                operation.cancel()
-                await asyncio.gather(operation, return_exceptions=True)
-        self.assertTrue(source.closed)
-        self.assertEqual(len(source.reads), reads_at_cancel)
-
-    @unittest.skipUnless(os.name == 'posix', 'native regular-file aliases and FIFOs')
-    async def test_native_alias_and_fifo_use_the_existing_checked_open(self):
-        with tempfile.TemporaryDirectory() as root:
-            with tempfile.NamedTemporaryFile(dir=root, prefix='chat-', suffix='.json', delete=False,
-                                             mode='w', encoding='utf-8') as resource:
-                name = resource.name
-                json.dump({'events': [user('native alias preview')]}, resource)
-            with tempfile.NamedTemporaryFile(dir=root, prefix='chat-', suffix='.json', delete=False) as alias:
-                alias_name = alias.name
-            os.unlink(alias_name)
-            os.symlink(name, alias_name)
-            entries = savefiles.chat_log_entries(root)
-            alias_entry = next(entry for entry in entries if entry.path == alias_name)
-            self.assertIn('native alias preview', await savefiles.format_picker_row(1, alias_entry))
-            os.unlink(name)
-            os.mkfifo(name)
-            row = await savefiles.format_picker_row(1, alias_entry)
-            self.assertNotIn('native alias preview', row)
-            self.assertTrue(row.endswith('  '), row)
-
-    async def test_unreadable_row_has_an_empty_preview(self):
-        with mock.patch.object(savefiles, 'open_chat_log', side_effect=OSError('unreadable')):
-            row = await savefiles.format_picker_row(1, SimpleNamespace(name='chat-saved.json', path='unreadable-key'))
-        self.assertTrue(row.endswith('  saved  '), row)
+    def test_picker_row_only_formats_an_already_read_summary(self):
+        summary = {'id': 'saved', 'path': object(), 'mtime': 0,
+                   'preview': 'historical request', 'cwd': 'raw/../cwd/./'}
+        with mock.patch.object(savefiles, 'open_chat_log', side_effect=AssertionError('formatter opened a file')):
+            row = savefiles.format_picker_row(1, summary)
+        self.assertTrue(row.endswith('  saved  historical request'), row)

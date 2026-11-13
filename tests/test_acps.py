@@ -1674,9 +1674,11 @@ class WorkerSessionNameTests(unittest.TestCase):
             asyncio.run(scenario(root))
 
 
-class SessionListingTests(unittest.TestCase):
+class SessionListingTests(unittest.IsolatedAsyncioTestCase):
     def front(self):
-        return acp.Front(lambda: None, lambda message: None, CredentialStore({}))
+        front = acp.Front(lambda: None, lambda message: None, CredentialStore({}))
+        self.addAsyncCleanup(front.shutdown)
+        return front
 
     def write_log(self, workspace, session_id, state, modified=1000):
         root = app_paths.chat_log_dir_for(workspace)
@@ -1689,7 +1691,7 @@ class SessionListingTests(unittest.TestCase):
         os.utime(path, (modified, modified))
         return path
 
-    def test_workspace_owns_listing_after_cd_and_after_saved_cwd_disappears(self):
+    async def test_workspace_owns_listing_after_cd_and_after_saved_cwd_disappears(self):
         with tempfile.TemporaryDirectory() as workspace, \
                 tempfile.TemporaryDirectory() as changed, \
                 tempfile.TemporaryDirectory() as gone, \
@@ -1705,25 +1707,25 @@ class SessionListingTests(unittest.TestCase):
                     before[path] = stream.read()
             with mock.patch.object(acp, 'CHAT_LOG_DIR', app_paths.chat_log_dir_for(startup)):
                 front = self.front()
-                result = front.list_sessions({'cwd': workspace})
+                result = await front.list_sessions({'cwd': workspace})
                 self.assertEqual(result, {'sessions': [
                     {'sessionId': 'gone', 'cwd': gone, 'updatedAt': '1970-01-01T00:16:40+00:00'},
                     {'sessionId': 'changed', 'cwd': raw, 'updatedAt': '1970-01-01T00:33:20+00:00'},
                 ]})
-                self.assertEqual([entry['sessionId'] for entry in front.list_sessions({})['sessions']],
+                self.assertEqual([entry['sessionId'] for entry in (await front.list_sessions({}))['sessions']],
                                  ['other'])
             self.assertFalse(os.path.exists(gone))
             for path in [changed_log, gone_log]:
                 with open(path, 'rb') as stream:
                     self.assertEqual(stream.read(), before[path])
 
-    def test_missing_log_directory_is_not_created_by_either_listing(self):
+    async def test_missing_log_directory_is_not_created_by_either_listing(self):
         from loki_agent import savefiles
 
         with tempfile.TemporaryDirectory() as workspace:
             root = app_paths.chat_log_dir_for(workspace)
             self.assertFalse(os.path.exists(root))
-            self.assertEqual(self.front().list_sessions({'cwd': workspace}), {'sessions': []})
+            self.assertEqual(await self.front().list_sessions({'cwd': workspace}), {'sessions': []})
             self.assertEqual(savefiles.chat_log_entries(root), [])
             self.assertEqual(
                 savefiles.resolve_chat_log_path('saved', workspace, root, mock.Mock()),
@@ -1731,7 +1733,7 @@ class SessionListingTests(unittest.TestCase):
             self.assertFalse(os.path.exists(root))
             self.assertEqual(os.listdir(workspace), [])
 
-    def test_invalid_saved_metadata_is_not_a_front_failure(self):
+    async def test_invalid_saved_metadata_is_not_a_front_failure(self):
         with tempfile.TemporaryDirectory() as workspace:
             self.write_log(workspace, 'kept', {'shell_cwd': workspace})
             for session_id, state in [['list', ['not', 'a', 'mapping']],
@@ -1742,11 +1744,11 @@ class SessionListingTests(unittest.TestCase):
             invalid = self.write_log(workspace, 'bytes', {'shell_cwd': workspace})
             with open(invalid, 'wb') as stream:
                 stream.write(b'\xff')
-            result = self.front().list_sessions({'cwd': workspace})
+            result = await self.front().list_sessions({'cwd': workspace})
             self.assertEqual([entry['sessionId'] for entry in result['sessions']], ['kept'])
 
     @unittest.skipUnless(os.name == 'posix', 'native POSIX FIFO and symlink types')
-    def test_special_file_and_link_to_special_file_are_not_read(self):
+    async def test_special_file_and_link_to_special_file_are_not_read(self):
         with tempfile.TemporaryDirectory() as workspace:
             self.write_log(workspace, 'kept', {'shell_cwd': workspace})
             fifo = self.write_log(workspace, 'pipe', {'shell_cwd': workspace})
@@ -1758,12 +1760,12 @@ class SessionListingTests(unittest.TestCase):
             directory = self.write_log(workspace, 'directory', {'shell_cwd': workspace})
             os.unlink(directory)
             os.mkdir(directory)
-            result = self.front().list_sessions({'cwd': workspace})
+            result = await self.front().list_sessions({'cwd': workspace})
             self.assertEqual([entry['sessionId'] for entry in result['sessions']], ['kept'])
             self.assertTrue(os.path.islink(link))
 
     @unittest.skipUnless(os.name == 'posix', 'native POSIX file symlinks')
-    def test_regular_file_link_preserves_the_selected_filename(self):
+    async def test_regular_file_link_preserves_the_selected_filename(self):
         with tempfile.TemporaryDirectory() as workspace, \
                 tempfile.TemporaryDirectory() as other:
             raw = other + '/./'
@@ -1774,13 +1776,13 @@ class SessionListingTests(unittest.TestCase):
             from loki_agent import savefiles
             with savefiles.open_chat_log(link) as (stream, _facts):
                 self.assertTrue(os.get_blocking(stream.fileno()))
-            result = self.front().list_sessions({'cwd': workspace})
+            result = await self.front().list_sessions({'cwd': workspace})
             self.assertEqual(result, {'sessions': [{
                 'sessionId': 'linked', 'cwd': raw, 'updatedAt': '1970-01-01T00:16:40+00:00'}]})
             self.assertTrue(os.path.islink(link))
             self.assertEqual(os.readlink(link), target)
 
-    def test_timestamp_and_metadata_describe_the_same_opened_file(self):
+    async def test_timestamp_and_metadata_describe_the_same_opened_file(self):
         with tempfile.TemporaryDirectory() as workspace:
             original = self.write_log(workspace, 'original', {'shell_cwd': 'original cwd'}, 1000)
             replacement = self.write_log(workspace, 'replacement', {'shell_cwd': 'replacement cwd'}, 2000)
@@ -1810,7 +1812,7 @@ class SessionListingTests(unittest.TestCase):
                 return descriptor
 
             with mock.patch.object(acp.os, 'open', side_effect=select):
-                result = self.front().list_sessions({'cwd': workspace})
+                result = await self.front().list_sessions({'cwd': workspace})
             self.assertTrue(attempted)
             self.assertTrue(replaced or blocked is not None)
             if blocked is not None:
@@ -1820,8 +1822,187 @@ class SessionListingTests(unittest.TestCase):
                 'sessionId': 'original', 'cwd': 'original cwd',
                 'updatedAt': '1970-01-01T00:16:40+00:00'}])
 
+    async def test_terminal_and_acp_are_adapters_of_the_same_backend(self):
+        from loki_agent import savefiles
+        root = object()
+        selected_key = object()
+        summary = {'id': 'saved', 'path': selected_key, 'mtime': 1000,
+                   'preview': 'historical request', 'cwd': 'raw/../cwd/./'}
+        rendered = []
+        with mock.patch.object(acp, 'CHAT_LOG_DIR', root), \
+                mock.patch.object(savefiles, 'list_saved_sessions', new_callable=mock.AsyncMock,
+                                  return_value=[summary]) as listing, \
+                mock.patch.object(savefiles, 'open_chat_log', side_effect=AssertionError('adapter opened a file')):
+            selected = await savefiles.run_session_picker_async(
+                input_fn=mock.AsyncMock(return_value='1'), chat_log_dir=root, text_writer=rendered.append)
+            result = await self.front().list_sessions({})
+        self.assertIs(selected, selected_key)
+        self.assertTrue(rendered[0].endswith('  saved  historical request'))
+        self.assertEqual(result, {'sessions': [{
+            'sessionId': 'saved', 'cwd': summary['cwd'], 'title': summary['preview'],
+            'updatedAt': '1970-01-01T00:16:40+00:00'}]})
+        self.assertEqual(listing.await_args_list, [mock.call(root, query=''), mock.call(root)])
+
+    @contextmanager
+    def listing_source(self, source):
+        from types import SimpleNamespace
+        from loki_agent import savefiles
+        entry = SimpleNamespace(name='chat-streamed.json', path=mock.sentinel.saved_log_key)
+
+        @contextmanager
+        def opening(path, **options):
+            self.assertIs(path, entry.path)
+            self.assertEqual(options, {})
+            try:
+                yield [SimpleNamespace(buffer=source), SimpleNamespace(st_mtime=1000)]
+            finally:
+                source.close()
+
+        with mock.patch.object(savefiles, 'chat_log_entries', return_value=[entry]), \
+                mock.patch.object(savefiles, 'open_chat_log', side_effect=opening):
+            yield
+
+    async def test_listing_skips_history_and_returns_the_historical_title_and_raw_cwd(self):
+        from test_session_listings import MeasuredBytes
+        from loki_agent import formats
+        cwd = 'gone/../raw/./directory//'
+
+        def pieces():
+            yield '{"events":[' + json.dumps(formats.message_item('user', 'historical request'))
+            yield ',{"type":"model_response","items":[{"type":"native_output","value":"'
+            for _ in range(2048):
+                yield 'x' * 4096
+            yield '"}]}],"session_state":' + json.dumps({'shell_cwd': cwd}) + '}'
+
+        source = MeasuredBytes(''.join(pieces()).encode('utf-8'), guard=True)
+        with self.listing_source(source), mock.patch.object(acp.json, 'load', side_effect=AssertionError('history DOM loaded')):
+            result = await self.front().list_sessions({})
+        self.assertEqual(result, {'sessions': [{
+            'sessionId': 'streamed', 'cwd': cwd, 'updatedAt': '1970-01-01T00:16:40+00:00',
+            'title': 'historical request'}]})
+        self.assertTrue(source.closed)
+
+    async def test_listing_preserves_cwd_fallback_truthiness_without_materializing_containers(self):
+        cwd = 'kept/../verbatim/./'
+        states = [{'shell_cwd': cwd}, {'cwd': cwd, 'shell_cwd': 'ignored'},
+                  *[{'cwd': value, 'shell_cwd': cwd} for value in [None, '', False, 0, -0.0, [], {}]],
+                  *[{'cwd': value, 'shell_cwd': cwd} for value in [True, 3, [None], {'key': None}]],
+                  {'cwd': 'x' * 8192 + '/..//'}, None, [], {}]
+        for state in states:
+            wire = json.dumps({'session_state': state})
+            selected = (state.get('cwd') or state.get('shell_cwd')) if isinstance(state, dict) else None
+            with self.subTest(state_type=type(state).__name__, selected_type=type(selected).__name__):
+                source = io.BytesIO(wire.encode('utf-8'))
+                with self.listing_source(source):
+                    sessions = (await self.front().list_sessions({}))['sessions']
+                if isinstance(selected, str) and selected:
+                    self.assertEqual(sessions[0]['cwd'], selected)
+                else:
+                    self.assertEqual(sessions, [])
+                self.assertTrue(source.closed)
+
+    async def test_listing_leaves_unread_history_validation_to_resume(self):
+        from loki_agent import savefiles
+        wires = ['{"session_state":{"cwd":"kept"},"events":[1,]}',
+                 '{"events":[invalid],"session_state":{"cwd":"kept"}}']
+        for wire in wires:
+            with self.subTest(wire=wire), self.listing_source(io.BytesIO(wire.encode('utf-8'))):
+                sessions = (await self.front().list_sessions({}))['sessions']
+                self.assertEqual([item['cwd'] for item in sessions], ['kept'])
+                with self.assertRaises(ValueError):
+                    savefiles.read_chat_log(io.StringIO(wire))
+
+    async def test_listing_observes_duplicate_metadata_fields(self):
+        wires = ['{"session_state":{"cwd":"old"},"session_state":{"cwd":"last/./"}}',
+                 '{"session_state":{"cwd":"old","cwd":null,"shell_cwd":"fallback/../"}}',
+                 '{"session_state":{"cwd":"old"},"session_state":[]}']
+        for wire in wires:
+            blob = json.loads(wire)
+            state = blob['session_state']
+            cwd = (state.get('cwd') or state.get('shell_cwd')) if isinstance(state, dict) else None
+            with self.subTest(wire=wire), self.listing_source(io.BytesIO(wire.encode('utf-8'))):
+                sessions = (await self.front().list_sessions({}))['sessions']
+                if cwd is None:
+                    self.assertEqual(sessions, [])
+                else:
+                    self.assertEqual(sessions[0]['cwd'], cwd)
+
+    async def test_wire_listing_uses_shared_titles_on_negotiated_v1_and_v2(self):
+        from loki_agent import formats
+        wire = json.dumps({'events': [formats.message_item('user', 'request \ud800 \x1b]0;bad\x07')],
+                           'session_state': {'shell_cwd': 'raw/../cwd/./'}})
+        for version in [1, 2]:
+            with self.subTest(version=version):
+                messages = []
+                front = acp.Front(None, messages.append, CredentialStore({}))
+                self.addAsyncCleanup(front.shutdown)
+                front.handle(acps.request(0, 'initialize', {
+                    'protocolVersion': version, 'info': {'name': 'listing-test', 'version': '1'}}))
+                source = io.BytesIO(wire.encode('utf-8'))
+                with self.listing_source(source):
+                    front.handle(acps.request(1, 'session/list', {}))
+                    await asyncio.gather(*list(front._tasks))
+                response = next(message for message in messages if message.get('id') == 1)
+                self.assertNotIn('error', response)
+                self.assertEqual(response['result']['sessions'][0]['title'], 'request \\ud800 ^[]0;bad^G')
+                self.assertEqual(response['result']['sessions'][0]['cwd'], 'raw/../cwd/./')
+                self.assertTrue(source.closed)
+
+    async def test_listing_cancellation_closes_its_checked_stream(self):
+        ready = asyncio.get_running_loop().create_future()
+        source = io.BytesIO(b'{"session_state":{"cwd":"kept"}}')
+        read = source.read
+
+        def reading(size):
+            part = read(size)
+            if not ready.done():
+                ready.set_result(None)
+            return part
+
+        source.read = reading
+        with self.listing_source(source):
+            operation = asyncio.create_task(self.front().list_sessions({}))
+            try:
+                await asyncio.wait([ready, operation], return_when=asyncio.FIRST_COMPLETED)
+                if operation.done():
+                    await operation
+                    self.fail('listing finished before cancellation')
+                operation.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await operation
+            finally:
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+        self.assertTrue(source.closed)
+
 
 class FrontWorkerTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_real_front_lists_saved_summaries_in_both_dialects(self):
+        from loki_agent import formats, savefiles
+        for version in [1, 2]:
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as root:
+                async with AsyncExitStack() as cleanup:
+                    env = self._front_env(root)
+                    workspace = _configured_workspace(root)
+                    path = SessionListingTests.write_log(self, workspace, 'shared', {'shell_cwd': workspace})
+                    with open(path, 'w', encoding='utf-8') as stream:
+                        stream.write(savefiles.serialize_chat_log([
+                            formats.message_item('user', 'historical request'),
+                            formats.message_item('assistant', 'x' * (2 * 1024 * 1024)),
+                        ], [], {'shell_cwd': workspace}))
+                    front, _diagnostics = await self._front(env, workspace, cleanup=cleanup.push_async_callback)
+                    initialized, _ = await self._request(front, 1, 'initialize', {
+                        'protocolVersion': version, 'info': {'name': 'listing-test', 'version': '1'}})
+                    self.assertEqual(initialized['protocolVersion'], version)
+                    for request_id in [2, 3]:
+                        result, _ = await self._request(front, request_id, 'session/list', {'cwd': workspace})
+                        self.assertEqual(len(result['sessions']), 1)
+                        summary = result['sessions'][0]
+                        self.assertEqual(summary['sessionId'], 'shared')
+                        self.assertEqual(summary['cwd'], workspace)
+                        self.assertEqual(summary['title'], 'historical request')
+                        self.assertNotIn('path', summary)
+
     async def test_large_prompt_and_replay_cross_the_real_worker_channel(self):
         text = 'large ACP text ' * 6000 + 'END'
         self.assertGreater(len(text.encode('utf-8')), 65536)

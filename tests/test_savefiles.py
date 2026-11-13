@@ -48,16 +48,17 @@ class SavedConversationNameTests(unittest.TestCase):
                                  'bad\nname', 'chat-safe.json']]
         with mock.patch.object(savefiles.os, 'scandir') as scan, \
                 mock.patch.object(savefiles, 'open_chat_log') as read, \
-                mock.patch.object(savefiles.os.path, 'getmtime') as metadata:
+                mock.patch.object(savefiles.os, 'stat') as metadata:
             scan.return_value.__enter__.return_value = [allowed, *invalid]
             self.assertEqual(savefiles.chat_log_entries('unused'), [allowed])
             self.assertIs(savefiles.saved_chat_log_path('unused', 'safe_123-ID'), allowed.path)
             for entry in invalid:
                 with self.subTest(name=entry.name):
                     self.assertIsNone(savefiles.saved_chat_log_path('unused', entry.name[5:-5]))
-                    with self.assertRaisesRegex(ValueError, 'conversation name'):
-                        asyncio.run(savefiles.format_picker_row(1, entry))
             read.assert_not_called()
+            read.side_effect = OSError('unreadable fixture')
+            self.assertEqual(asyncio.run(savefiles.list_saved_sessions('unused')), [])
+            read.assert_called_once_with(allowed.path)
             metadata.assert_not_called()
 
     def test_bare_cli_saved_names_cannot_bypass_the_allowlist(self):

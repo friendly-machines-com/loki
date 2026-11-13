@@ -3058,7 +3058,7 @@ class FrontendOutputOwnershipTests(unittest.IsolatedAsyncioTestCase):
         output, errors = io.StringIO(), io.StringIO()
         with mock.patch.object(terminal_frontend.terminals, 'open_terminal_stdin'), \
                 mock.patch.object(terminal_frontend, 'input_session', return_value=inputs), \
-                mock.patch.object(terminal_frontend.savefiles, 'filtered_chat_log_entries', return_value=[]), \
+                mock.patch.object(terminal_frontend.savefiles, 'list_saved_sessions', new_callable=mock.AsyncMock, return_value=[]), \
                 mock.patch.object(terminal_frontend, 'new_chat_log') as new_chat, \
                 mock.patch.object(terminal_frontend, 'load_chat_log') as load_chat, \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
@@ -5155,7 +5155,7 @@ class SessionPickerTests(unittest.TestCase):
     def _write_chat(self, dirpath, chat_id, text, mtime=None):
         path = os.path.join(dirpath, f"chat-{chat_id}.json")
         with open(path, "w") as f:
-            f.write(text)
+            f.write(json.dumps({**json.loads(text), 'session_state': {'shell_cwd': dirpath}}))
         if mtime is not None:
             os.utime(path, (mtime, mtime))
         return path
@@ -5237,7 +5237,8 @@ class SessionPickerTests(unittest.TestCase):
                 name = resource.name
                 json.dump({"events": [{"type": "message", "role": "user", "content": [
                     {"type": "text", "text": "origin preview"}]}],
-                    "future_metadata": "search-word-after-the-preview"}, resource)
+                    "future_metadata": "search-word-after-the-preview",
+                    "session_state": {"shell_cwd": tmpdir}}, resource)
             with self._make_picker(tmpdir, ["filter search-word-after-the-preview", "1"]) as session, \
                     contextlib.redirect_stdout(io.StringIO()) as output:
                 result = asyncio.run(terminal_frontend.run_session_picker_async(session))
@@ -5277,7 +5278,8 @@ class SessionPickerTests(unittest.TestCase):
             with tempfile.NamedTemporaryFile(dir=tmpdir, prefix="chat-", suffix=".json", delete=False,
                                              mode="w", encoding="utf-8") as resource:
                 name = resource.name
-                resource.write('{"events":[{"type":"message","role":"user",'
+                resource.write('{"session_state":' + json.dumps({'shell_cwd': tmpdir})
+                               + ',"events":[{"type":"message","role":"user",'
                                '"content":[{"type":"text","text":"hi there this is truncated')
             with self._make_picker(tmpdir, ["1"]) as session, contextlib.redirect_stdout(io.StringIO()) as output:
                 result = asyncio.run(terminal_frontend.run_session_picker_async(session))
@@ -5289,7 +5291,8 @@ class SessionPickerTests(unittest.TestCase):
             with tempfile.NamedTemporaryFile(dir=tmpdir, prefix="chat-", suffix=".json", delete=False,
                                              mode="w", encoding="utf-8") as resource:
                 json.dump({"events": [{"type": "message", "role": "user", "content": [
-                    {"type": "text", "text": "hello \x1b]0;owned\x07 \x9b31m \ud800"}]}]}, resource)
+                    {"type": "text", "text": "hello \x1b]0;owned\x07 \x9b31m \ud800"}]}],
+                    "session_state": {"shell_cwd": tmpdir}}, resource)
             with self._make_picker(tmpdir, [""]) as session, contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertIsNone(asyncio.run(terminal_frontend.run_session_picker_async(session)))
             rendered = output.getvalue()
@@ -5320,7 +5323,7 @@ class SessionPickerTests(unittest.TestCase):
                     with self.assertRaises(type(error)):
                         await terminal_frontend.run_session_picker_async(types.SimpleNamespace(modal=modal))
 
-                with mock.patch.object(terminal_frontend.savefiles, 'filtered_chat_log_entries', return_value=[]), \
+                with mock.patch.object(terminal_frontend.savefiles, 'list_saved_sessions', new_callable=mock.AsyncMock, return_value=[]), \
                         mock.patch.object(terminal_frontend.terminal, 'goto_position', side_effect=restore('position')), \
                         mock.patch.object(terminal_frontend.terminal, 'clear_to_end_of_screen', side_effect=restore('clear')), \
                         mock.patch.object(terminal_frontend.terminal, 'flush', side_effect=restore('flush')), \
