@@ -153,10 +153,13 @@ class TerminalBangFailureTests(unittest.IsolatedAsyncioTestCase):
             stdout, stderr = io.StringIO(), io.StringIO()
             attempts = []
             original_connect = asyncio.open_connection
+            # Inference uses canned HTTP/SSE, not a TLS handshake or host CAs.
+            tls_context = object()
 
             async def connect(*args, **kwargs):
                 if 'sock' in kwargs:
                     return await original_connect(*args, **kwargs)
+                self.assertIs(kwargs.get('ssl'), tls_context)
                 attempts.append(args)
                 self.assertEqual(args[0], 'provider.example.test')
                 # Both execution and display must precede even the attempt to
@@ -176,6 +179,8 @@ class TerminalBangFailureTests(unittest.IsolatedAsyncioTestCase):
                 'LOKI_MODEL': 'bang-model', 'LOKI_STREAM': '1'})))
             resources.enter_context(mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', tool_runtime.ToolHookPipeline()))
             resources.enter_context(mock.patch.object(asyncio, 'open_connection', side_effect=connect))
+            resources.enter_context(mock.patch.object(
+                http_client.ssl, 'create_default_context', return_value=tls_context))
             resources.enter_context(mock.patch.object(terminal_frontend, 'input_session',
                                                       return_value=ScriptedInputSession(['!' + command, None])))
             resources.enter_context(mock.patch.object(terminal_frontend, 'new_chat_log_path', return_value=log_path))
@@ -1856,7 +1861,12 @@ class ModelLoadingTests(unittest.TestCase):
                 response({"data": [{"id": "first-model"}, {"id": "selected-model"}]}),
                 response(answer("fallback durable answer")), response(answer("fallback resumed answer"))])
             catalog_attempts = []
+            tls_context = object()
             async with contextlib.AsyncExitStack() as job_scope:
+                # Catalog/inference replies are synthetic; both initial and
+                # resumed turns must avoid real TLS trust-store initialization.
+                job_scope.enter_context(mock.patch.object(
+                    http_client.ssl, 'create_default_context', return_value=tls_context))
                 directory = job_scope.enter_context(tempfile.TemporaryDirectory())
                 # Later manager callbacks must retire before either Session's Store.
                 stores = job_scope.enter_context(contextlib.ExitStack())
@@ -1876,7 +1886,7 @@ class ModelLoadingTests(unittest.TestCase):
 
                 async def connect(host, port, **kwargs):
                     self.assertEqual(port, 443)
-                    self.assertIsNotNone(kwargs.get("ssl"))
+                    self.assertIs(kwargs.get("ssl"), tls_context)
                     if host == "models.dev":
                         catalog_attempts.append(host)
                         raise OSError("catalog offline")
@@ -2335,11 +2345,13 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(close_service)
         port = server.sockets[0].getsockname()[1]
         real_connect = asyncio.open_connection
+        # This service speaks plain HTTP on loopback; TLS is deliberately fake.
+        tls_context = object()
 
         async def connect(host, port_in, **kwargs):
             from urllib.parse import urlsplit
             self.assertEqual(port_in, 443)
-            self.assertIsNotNone(kwargs.get("ssl"))
+            self.assertIs(kwargs.get("ssl"), tls_context)
             self.assertIn(host, ("models.dev", urlsplit(phase["url"]).hostname))
             return await real_connect("127.0.0.1", port)
 
@@ -2426,6 +2438,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
                 mock.patch.object(loki, "CREDENTIALS", owner.inventory), \
                 mock.patch.object(asyncio, "open_connection", side_effect=connect), \
+                mock.patch.object(http_client.ssl, "create_default_context", return_value=tls_context), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             # An explicit endpoint leases only LOKI_API_KEY, never a generic SDK key.
             env = {**values, "LOKI_API_BASE": "https://api.deepseek.com/anthropic",

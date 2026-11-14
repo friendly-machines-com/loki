@@ -168,6 +168,9 @@ class CatalogFetchTests(unittest.TestCase):
             server = await asyncio.start_server(accepted, "127.0.0.1", 0)
             port = server.sockets[0].getsockname()[1]
             real_connect = asyncio.open_connection
+            # The catalog fixture redirects HTTPS to plain loopback HTTP; its
+            # parsing/cache contract does not include system trust-store loading.
+            tls_context = object()
             real_request = http_client.async_http_request
             real_fetch = models.fetch_models_dev
             fetched_catalogs = []
@@ -179,7 +182,7 @@ class CatalogFetchTests(unittest.TestCase):
 
             async def connect(host, port_in, **kwargs):
                 self.assertEqual((host, port_in), ("models.dev", 443))
-                self.assertIsNotNone(kwargs.get("ssl"))
+                self.assertIs(kwargs.get("ssl"), tls_context)
                 return await real_connect("127.0.0.1", port)
 
             with tempfile.TemporaryDirectory() as directory:
@@ -189,6 +192,7 @@ class CatalogFetchTests(unittest.TestCase):
                 models._index_cache = None
                 try:
                     with mock.patch.object(asyncio, "open_connection", side_effect=connect), \
+                         mock.patch.object(http_client.ssl, "create_default_context", return_value=tls_context), \
                          mock.patch.object(http_client, "async_http_request", wraps=real_request) as transport, \
                          mock.patch.object(models, "fetch_models_dev", side_effect=fetch), \
                          mock.patch.object(asyncio, "to_thread", side_effect=AssertionError("executor used")):

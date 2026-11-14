@@ -4566,6 +4566,9 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 worker = channel.process.worker
                 emitted = mock.Mock(wraps=worker.write)
                 original_connect = asyncio.open_connection
+                # This journey decodes fake HTTP/SSE bytes, not TLS handshakes;
+                # keep system trust-store loading outside that fake boundary.
+                tls_context = object()
 
                 def text(updates):
                     return ''.join(update['content']['text'] for update in _tool_updates(updates, 'prompt-owner')
@@ -4574,6 +4577,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 async def connect(*args, **kwargs):
                     if 'sock' in kwargs:
                         return await original_connect(*args, **kwargs)
+                    self.assertIs(kwargs.get('ssl'), tls_context)
                     attempts.append(args)
                     self.assertEqual(args[0], 'provider.example.test')
                     with open(witness_path, 'rb') as result:
@@ -4589,6 +4593,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
                 with mock.patch.object(worker, 'write', new=emitted), \
                         mock.patch.object(http_client.asyncio, 'open_connection', side_effect=connect), \
+                        mock.patch.object(http_client.ssl, 'create_default_context', return_value=tls_context), \
                         mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', tool_runtime.ToolHookPipeline()):
                     with self.assertRaises(acps.TransportError) as failed:
                         await channel.request('session/prompt', self._params('!' + command))
@@ -4710,14 +4715,20 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                                          + str(len(body)).encode() + b"\r\n\r\n" + body)
                     connector = FakeConnector(responses)
                     open_connection = asyncio.open_connection
+                    # Persistence/restore uses canned HTTP, so TLS setup must
+                    # not depend on host certificates. IPC still uses real sockets.
+                    tls_context = object()
 
                     async def connect(*args, **kwargs):
                         if "sock" in kwargs:
                             return await open_connection(*args, **kwargs)
+                        self.assertIs(kwargs.get("ssl"), tls_context)
                         return await connector.open_connection(*args, **kwargs)
 
                     stack.enter_context(mock.patch.object(
                         http_client.asyncio, "open_connection", new=connect))
+                    stack.enter_context(mock.patch.object(
+                        http_client.ssl, "create_default_context", return_value=tls_context))
                     base_session = Session(shell_cwd=workspace)
                     resources.push_async_callback(base_session.close_state)
                     session_stores.append(base_session.response_headers)
@@ -6099,14 +6110,20 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 stack.push_async_callback(base_session.close_state)
                 stack.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', base_session))
                 real_connect = asyncio.open_connection
+                # Approval and credential routing are real; external HTTP/TLS
+                # are fake. Do not load system trust stores for canned replies.
+                tls_context = object()
 
                 async def connect(*args, **kwargs):
                     if 'sock' in kwargs:
                         return await real_connect(*args, **kwargs)
+                    self.assertIs(kwargs.get('ssl'), tls_context)
                     f.trace.append('http')
                     return await f.connector.open_connection(*args, **kwargs)
 
                 stack.enter_context(mock.patch.object(http_client.asyncio, 'open_connection', new=connect))
+                stack.enter_context(mock.patch.object(
+                    http_client.ssl, 'create_default_context', return_value=tls_context))
                 real_lease = f.front.credential_broker.lease
                 f.leases = []
 
