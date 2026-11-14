@@ -42,11 +42,12 @@ sys.stdout.flush()
 # finish on its own: the cancellation under test stops it, or the fixture
 # releases it.  Takes both paths from the caller.
 _BLOCKS_UNTIL_RELEASED = """
-import pathlib, sys, time
+import os, sys, time
 sys.stdout.flush()
 ready, release = %r, %r
-pathlib.Path(ready).write_text('ready')
-while not pathlib.Path(release).exists():
+with open(ready, 'w') as stream:
+    stream.write('ready')
+while not os.path.exists(release):
     time.sleep(0.01)
 sys.stdout.write('released\\n')
 sys.stdout.flush()
@@ -173,10 +174,11 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                 await manager._monitor_background_job(job)
             self.assertEqual(job.status, "exited")
             self.assertEqual(job.exit_code, 0)
-            self.assertEqual(
-                Path(job.stdout_path).read_text(encoding="utf-8").strip(),
-                "stdin-bytes: 0",
-                "background job stdin must be end of file carrying nothing")
+            with open(job.stdout_path, encoding='utf-8') as stream:
+                self.assertEqual(
+                    stream.read().strip(),
+                    "stdin-bytes: 0",
+                    "background job stdin must be end of file carrying nothing")
             self.assertIsNone(
                 getattr(job.process, "stdin", None),
                 "a completed background job still owns its stdin end")

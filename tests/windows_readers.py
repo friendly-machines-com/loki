@@ -203,8 +203,13 @@ def probe(native, limits_type, sid, workspace, output, actor_script):
         return result
     finally:
         with ExitStack() as cleanup:
-            # Preserve output as data, never replay its terminal controls.
-            cleanup.callback(Path(output).write_text, captured.decode(errors='replace'))
+            # Preserve output as data, never replay its terminal controls. Open
+            # the supplied filename only when this cleanup callback runs.
+            def write_output(text):
+                with open(output, 'w') as stream:
+                    stream.write(text)
+
+            cleanup.callback(write_output, captured.decode(errors='replace'))
             if console is not None:
                 cleanup.callback(api.pseudoconsole_close, console)
             # These callbacks run before ClosePseudoConsole: teardown cannot

@@ -292,7 +292,8 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
                         f'/queue{{txt:{queued_texts},img:0}}')
             before_stream_release = bytes(collected[turn_start:])
             release_start = len(collected)
-            pathlib.Path(gate).touch()
+            with open(gate, 'a'):
+                pass
             # With no queued inputs, wait for the turn to end before causing
             # a prompt redraw: split model controls must remain observable as
             # contiguous escaped text. Queued-input tests deliberately permit
@@ -660,7 +661,8 @@ class PtyUiTests(unittest.TestCase):
                 self.assertNotIn("blocked prefix completed", "".join(before.text))
                 # Every key, including /quit, precedes the state change.
                 # Draining to exit makes a missing frame fail, not hang.
-                pathlib.Path(gate).touch()
+                with open(gate, 'a'):
+                    pass
                 code, captured = _read_to_exit(handle, output)
                 self.assertEqual(code, 0, captured)
             finally:

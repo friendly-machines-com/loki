@@ -913,8 +913,19 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
                 ))
         return result, execution, dispatched, events
 
-    def test_tool_paths_are_not_autocorrected(self):
+    def test_tool_path_strings_are_passed_verbatim(self):
         paths = [
+            "",
+            ".",
+            "./README.md",
+            "README.md/",
+            "README.md/../loki.py",
+            "./directory//file/./",
+            " leading and trailing spaces ",
+            "//directory/file",
+            r"C:relative\file",
+            r"\\?\C:\project\file. ",
+            "filename-\udcff",
             "/tmp/project/[notes.md](http://notes.md)",
             "/tmp/project/[notes.md](https://notes.md)",
             r"C:\project\[notes.md](http://notes.md)",

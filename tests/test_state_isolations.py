@@ -47,10 +47,11 @@ def access_result(operation, action):
 
 def privilege_state():
     selected = {}
-    for line in Path('/proc/self/status').read_text().splitlines():
-        key, separator, value = line.partition(':')
-        if separator and key in ['CapEff', 'CapPrm', 'CapInh', 'CapBnd', 'NoNewPrivs']:
-            selected[key] = value.strip()
+    with open('/proc/self/status') as stream:
+        for line in stream.read().splitlines():
+            key, separator, value = line.partition(':')
+            if separator and key in ['CapEff', 'CapPrm', 'CapInh', 'CapBnd', 'NoNewPrivs']:
+                selected[key] = value.strip()
     return selected
 
 
@@ -75,13 +76,14 @@ def unmount_call(libc, path):
 
 
 def mountpoint_present(path):
-    for line in Path('/proc/self/mountinfo').read_text().splitlines():
-        name = line.split()[4]
-        for encoded, decoded in [['\\040', ' '], ['\\011', '\t'],
-                                 ['\\012', '\n'], ['\\134', '\\']]:
-            name = name.replace(encoded, decoded)
-        if name == str(path):
-            return True
+    with open('/proc/self/mountinfo') as stream:
+        for line in stream.read().splitlines():
+            name = line.split()[4]
+            for encoded, decoded in [['\\040', ' '], ['\\011', '\t'],
+                                     ['\\012', '\n'], ['\\134', '\\']]:
+                name = name.replace(encoded, decoded)
+            if name == str(path):
+                return True
     return False
 
 
@@ -118,8 +120,9 @@ def credential_cover_probe(manifest_path):
     """
     import socket
 
-    manifest = json.loads(Path(manifest_path).read_text())
-    home = Path(manifest['home'])
+    with open(manifest_path) as stream:
+        manifest = json.load(stream)
+    home = manifest['home']
     configuration = Path(manifest['configuration'])
     # Named for the mounted cover, not the credential tree: the Windows
     # boundary guard scans launching modules' mkdir/open calls for that
@@ -190,8 +193,9 @@ def deployment_launcher(manifest_path):
     """Prepare a disposable Guix-shaped mount view, then exec the real Loki."""
     from loki_agent import credential_storages
 
-    manifest = json.loads(Path(manifest_path).read_text())
-    home = Path(manifest['home'])
+    with open(manifest_path) as stream:
+        manifest = json.load(stream)
+    home = manifest['home']
     state = Path(manifest['state'])
     libc = ctypes.CDLL(None, use_errno=True)
     uid, gid = os.getuid(), os.getgid()
@@ -283,8 +287,11 @@ def state_actions(manifest):
     results = [access_result(name, action) for name, action in operations]
     directory = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        results.append(access_result('post-cover-dirfd-write', lambda: Path(
-            f'/proc/self/fd/{directory}/via-fd').write_bytes(b'bad')))
+        def write_via_fd():
+            with open(f'/proc/self/fd/{directory}/via-fd', 'wb') as stream:
+                stream.write(b'bad')
+
+        results.append(access_result('post-cover-dirfd-write', write_via_fd))
     finally:
         os.close(directory)
     return results
@@ -298,7 +305,8 @@ def append(path):
 def tool_probe(manifest_path):
     import socket
 
-    manifest = json.loads(Path(manifest_path).read_text())
+    with open(manifest_path) as stream:
+        manifest = json.load(stream)
     with socket.socket(socket.AF_UNIX) as control:
         control.connect(manifest['control'])
         output = control.makefile('w', buffering=1)
@@ -574,7 +582,8 @@ if __name__ == '__main__':
     elif sys.argv[1:2] == ['--tool']:
         tool_probe(sys.argv[2])
     elif sys.argv[1:2] == ['--descendant']:
-        description = json.loads(Path(sys.argv[2]).read_text())
+        with open(sys.argv[2]) as stream:
+            description = json.load(stream)
         print(json.dumps(access_result('exec-descendant-state-write', lambda: (
             Path(description['state']) / 'descendant-write').write_bytes(b'bad'))))
     else:

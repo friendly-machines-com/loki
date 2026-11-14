@@ -297,15 +297,13 @@ class DriverProcessTests(unittest.TestCase):
         self.assertIn("explicit debug timeout exceeded (2s)", stdout.getvalue())
 
     def test_partial_progress_is_visible_before_worker_finishes(self):
-        ready = self.root / "ready"
         release = self.root / "release"
         self.write("test_live.py", f"""
-            import pathlib, time, unittest
+            import os, time, unittest
             class Live(unittest.TestCase):
                 def test_live(self):
                     print('VISIBLE-BEFORE-END', flush=True)
-                    pathlib.Path({str(ready)!r}).touch()
-                    while not pathlib.Path({str(release)!r}).exists():
+                    while not os.path.exists({str(release)!r}):
                         time.sleep(0.01)
         """)
         # Output and the release handshake observe this worker's real lifetime;

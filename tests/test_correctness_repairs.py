@@ -3,7 +3,6 @@ import contextlib
 import errno
 import json
 import os
-import pathlib
 import shlex
 import signal
 import sys
@@ -110,20 +109,24 @@ class FileObservationContractTests(unittest.TestCase):
     def test_binary_change_after_read_blocks_overwrite(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "payload.bin")
-            pathlib.Path(path).write_bytes(b"\x00old")
+            with open(path, 'wb') as stream:
+                stream.write(b"\x00old")
             self.assertIn("binary", loki.run_read(path))
 
-            pathlib.Path(path).write_bytes(b"\x00new")
+            with open(path, 'wb') as stream:
+                stream.write(b"\x00new")
             result = asyncio.run(loki.dispatch_tool_async('Write', {'file_path': path, 'content': 'replacement'}))
 
             self.assertFalse(result['ok'], result)
             self.assertIn('changed on disk', result['content'])
-            self.assertEqual(pathlib.Path(path).read_bytes(), b"\x00new")
+            with open(path, 'rb') as stream:
+                self.assertEqual(stream.read(), b"\x00new")
 
     def test_deletion_after_read_blocks_recreation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "notes.txt")
-            pathlib.Path(path).write_text("old", encoding="utf-8")
+            with open(path, 'w', encoding='utf-8') as stream:
+                stream.write("old")
             loki.run_read(path)
             os.unlink(path)
 
@@ -138,7 +141,8 @@ class FileObservationContractTests(unittest.TestCase):
             path = os.path.join(tmpdir, "empty.txt")
             result = loki.run_write(path, "")
             self.assertIn("Successfully wrote", result)
-            self.assertEqual(pathlib.Path(path).read_text(encoding="utf-8"), "")
+            with open(path, encoding='utf-8') as stream:
+                self.assertEqual(stream.read(), "")
 
 
 class JobOwnershipContractTests(unittest.IsolatedAsyncioTestCase):

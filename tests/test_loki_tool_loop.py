@@ -1637,8 +1637,9 @@ class ModelLoadingTests(unittest.TestCase):
                 "shell_cwd": loki.current_shell_cwd(),
                 "connection": descriptor.to_dict(),
             }
-            pathlib.Path(path).write_text(
-                json.dumps(blob), encoding="utf-8")
+            serialized_blob = json.dumps(blob)
+            with open(path, 'w', encoding='utf-8') as stream:
+                stream.write(serialized_blob)
             confirm = mock.AsyncMock(return_value=True)
             stdout = io.StringIO()
             with mock.patch(
@@ -1905,11 +1906,13 @@ class ModelLoadingTests(unittest.TestCase):
                         loki.save_chat_log()
                         self.assertEqual(loki.current_config().chat_provider.models_url, models_url)
                         await session.job_manager.close_session_owned()
-                saved = json.loads(pathlib.Path(path).read_text())
+                with open(path) as stream:
+                    saved = json.load(stream)
                 self.assertEqual(saved["session_state"]["connection"]["models_url"], models_url)
                 self.assertEqual(saved["session_state"]["connection"]["model"], "selected-model")
                 self.assertEqual(formats.item_text(saved["events"][-1]), "fallback durable answer")
-                self.assertNotIn("fallback-secret", pathlib.Path(path).read_text())
+                with open(path) as stream:
+                    self.assertNotIn("fallback-secret", stream.read())
                 self.assertEqual(catalog_attempts, ["models.dev"])
                 fresh = credential_supervisors.CredentialSupervisor(CredentialStore({"LOKI_API_KEY": "fallback-secret"}))
                 resumed = loki.Session(shell_cwd=directory, job_manager=job_manager(
@@ -1934,11 +1937,13 @@ class ModelLoadingTests(unittest.TestCase):
                     self.assertEqual(loki.current_config().chat_provider.models_url, models_url)
                     loki.save_chat_log()
                     await resumed.job_manager.close_session_owned()
-                final = json.loads(pathlib.Path(path).read_text())
+                with open(path) as stream:
+                    final = json.load(stream)
                 self.assertEqual(final["events"][:len(saved["events"])], saved["events"])
                 self.assertEqual(formats.item_text(final["events"][-1]), "fallback resumed answer")
                 self.assertEqual(final["session_state"]["connection"], saved["session_state"]["connection"])
-                self.assertNotIn("fallback-secret", pathlib.Path(path).read_text())
+                with open(path) as stream:
+                    self.assertNotIn("fallback-secret", stream.read())
                 self.assertEqual(connector.responses, [])
                 requests, payloads = [], []
                 for connection, writer in zip(connector.calls, connector.writers):
@@ -2504,7 +2509,8 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await pick(["filter openrouter", "1", "1"], "openrouter", "https://effective.example/v1", "env:OPENROUTER_API_KEY")
             self.assertEqual(len(prompts) - before_retry, 3)
             self.assertEqual(len(approvals), 1)
-            persisted_router = json.loads(pathlib.Path(path).read_text())
+            with open(path) as stream:
+                persisted_router = json.load(stream)
             self.assertEqual(persisted_router["session_state"]["connection"]["model_status"], "deprecated")
 
             original_provider = loki.current_config().chat_provider
@@ -2558,8 +2564,9 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         message = await super().get()
                         if message == "/model" and loki.current_model() == "gpt-test":
                             self.assertIn("Model: gpt-test (deprecated), Context: unknown; /compact, /model", terminal_frontend.status_text())
-                            self.assertEqual(json.loads(pathlib.Path(path).read_text())["session_state"]["connection"]["model_status"],
-                                             "deprecated")
+                            with open(path) as stream:
+                                persisted = json.load(stream)
+                            self.assertEqual(persisted["session_state"]["connection"]["model_status"], "deprecated")
                         if message == "normalized selection":
                             self.assertEqual(loki.current_config().chat_provider.provider_name,
                                              "OpenAI Platform API [endpoint supplied by Loki]")
@@ -2627,7 +2634,8 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             elif variant == "numeric":
                 expected_prompts.append("override a normalized provider endpoint")
                 expected_answers.append("override durable answer")
-            before = json.loads(pathlib.Path(path).read_text())
+            with open(path) as stream:
+                before = json.load(stream)
             self.assertEqual(before["session_state"]["connection"], loki.active_connection_descriptor().to_dict())
             self.assertEqual([(item["call_id"], formats.item_text(item)) for item in before["events"]
                               if item.get("type") == "tool_result"], [("selection-read", "1\tselection witness")])
@@ -2684,7 +2692,8 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 await resumed.job_manager.close_session_owned()
             self.assertEqual(len(requests), count + 1)
             self.assertEqual(phase["queue"], [])
-            final = json.loads(pathlib.Path(path).read_text())
+            with open(path) as stream:
+                final = json.load(stream)
             self.assertEqual(final["events"][:len(before["events"])], before["events"])
             self.assertEqual(formats.item_text(final["events"][-1]),
                              {"credentialless": "credentialless durable answer", "numeric": "override durable answer",
@@ -2708,9 +2717,10 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                               and (item["type"] != "message" or item.get("role") == "user")], expected_types)
             self.assertNotIn("calls", final)
             self.assertEqual(final["session_state"]["connection"]["chat_url"], descriptor["chat_url"])
+            with open(path) as stream, open(storage.file_path) as credentials:
+                durable_text = stream.read() + credentials.read() + output.getvalue() + errors.getvalue()
             for secret in (value for name, value in values.items() if name.endswith("API_KEY")):
-                self.assertNotIn(secret, pathlib.Path(path).read_text() + pathlib.Path(storage.file_path).read_text()
-                                 + output.getvalue() + errors.getvalue())
+                self.assertNotIn(secret, durable_text)
             self.assertTrue(any(prompt.startswith("Model choice") for prompt in prompts))
             self.assertTrue(any(prompt.startswith("Provider choice") for prompt in prompts))
             self.assertTrue(all("filter WORDS" in prompt and "empty cancels" in prompt
@@ -2880,7 +2890,8 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                               formats.item_text(results[0]))
                 loki.mark_chat_log_dirty()
                 loki.save_chat_log()
-                before = pathlib.Path(path).read_bytes()
+                with open(path, 'rb') as stream:
+                    before = stream.read()
                 first_blob = json.loads(before)
                 self.assertNotIn("conversation_id", first_blob["session_state"])
                 saved_results = [item for item in first_blob["events"]
@@ -2915,7 +2926,8 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     status = await terminal_frontend.async_main([f"--resume={path}"], settings.Settings())
                     self.assertEqual(status, 0)
                     if not approve:
-                        self.assertEqual(pathlib.Path(path).read_bytes(), before)
+                        with open(path, 'rb') as stream:
+                            self.assertEqual(stream.read(), before)
                         self.assertEqual(len(requests), 3)
                         return
                     self.assertEqual(resumed.conversation_id, chat_id)
@@ -2924,7 +2936,8 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(loki.current_config().reasoning_effort_profile.values, ["high"])
                     loki.save_chat_log()
                     await resumed.job_manager.close_session_owned()
-                saved = json.loads(pathlib.Path(path).read_bytes())
+                with open(path, 'rb') as stream:
+                    saved = json.load(stream)
                 connection = saved["session_state"]["connection"]
                 self.assertTrue(connection["openai_request_profile"]["supports_parallel_tool_calls"])
                 self.assertEqual(connection["reasoning_effort_profile"]["options"][0]["value"], "high")
@@ -2936,7 +2949,8 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("first durable answer", json.dumps(payload))
                     self.assertIn("todo-call", json.dumps(payload))
                     self.assertEqual(payload["reasoning"]["effort"], "high")
-                durable = pathlib.Path(path).read_text()
+                with open(path) as stream:
+                    durable = stream.read()
                 for text in ["first durable answer", "resumed durable answer", "next durable answer",
                              "todo-call", "inspect durable workflow"]:
                     self.assertIn(text, durable)
@@ -3841,7 +3855,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             path = str(root / 'chat-switch.json')
             hook_log = root / 'hook-events.jsonl'
             script = (
-                'import json,pathlib,sys\n'
+                'import json,sys\n'
                 'p=json.load(sys.stdin); i=p["invocation"]; a=i["effective_arguments"]\n'
                 'if i["call_id"] in ["chat-search", "c-search"]:\n'
                 ' assert i["adjustments"][1] == {"hook":"loki.input-repair",\n'
@@ -3864,7 +3878,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 ' json.dump({"arguments":a},sys.stdout)\n'
                 'else:\n'
                 ' assert p["outcome"]["executed"] and p["outcome"]["ok"]\n'
-                ' pathlib.Path(sys.argv[2]).write_text("marker post\\n")\n'
+                ' with open(sys.argv[2], "w") as f: f.write("marker post\\n")\n'
                 ' json.dump({"changed_paths":[sys.argv[2]],"note":"post observed"},sys.stdout)\n'
             )
             with tempfile.NamedTemporaryFile(
@@ -3917,10 +3931,11 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(args[4], '--')
                     self.assertIn(args[5], ['marker', 'notes'])
                     args = [sys.executable, '-c',
-                            'import pathlib,sys\n'
+                            'import sys\n'
                             'path=sys.argv[2]\n'
-                            'for number,line in enumerate(pathlib.Path(path).read_text().splitlines(),1):\n'
-                            ' if sys.argv[1] in line: print(f"{path}:{number}:{line}")\n',
+                            'with open(path) as stream:\n'
+                            ' for number,line in enumerate(stream.read().splitlines(),1):\n'
+                            '  if sys.argv[1] in line: print(f"{path}:{number}:{line}")\n',
                             *args[5:]]
                 child = await real_spawn(*args, **kwargs)
                 children.append(child)
@@ -4157,7 +4172,8 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('marker original', outcomes['b-grep'])
                 self.assertIn('opaque-A', json.dumps(captured[2][1]))
                 self.assertIn('opaque-B', json.dumps(captured[-1][1]))
-                saved = json.loads(pathlib.Path(path).read_text())
+                with open(path) as stream:
+                    saved = json.load(stream)
                 self.assertNotIn('calls', saved)
                 self.assertNotIn('"start":', json.dumps(saved))
                 self.assertEqual(saved['toolsets'], [[
@@ -4208,7 +4224,8 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(hook_records(), hooks_before)
                     self.assertEqual(len(children), child_count)
                     self.assertEqual(search_queries, ['loki'] + ['loki external custom'] * 3 + ['loki'])
-                    final_blob = json.loads(pathlib.Path(path).read_text())
+                    with open(path) as stream:
+                        final_blob = json.load(stream)
                     persisted = final_blob['events']
                     for cid, original in originals.items():
                         call = next(call for event in persisted if event.get('type') == 'model_response'
@@ -4306,7 +4323,8 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn(f'model-{name}: {prompt} done', terminal_text)
                     self.assertNotIn('private anthropic thought', terminal_text)
                     self.assertNotIn('opaque-A', terminal_text)
-                    durable = pathlib.Path(path).read_text()
+                    with open(path) as stream:
+                        durable = stream.read()
                     for name in ['A', 'B', 'CHAT', 'ANTHROPIC', 'C']:
                         self.assertNotIn(f'leased-{name}-secret', durable + diagnostics.getvalue())
                     self.assertEqual(len(children), 8)
@@ -4958,7 +4976,8 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     return session
 
                 def read_blob(path):
-                    return json.loads(pathlib.Path(path).read_text(encoding='utf-8'))
+                    with open(path, encoding='utf-8') as stream:
+                        return json.load(stream)
 
                 rendered = []
                 real_present = terminal_frontend._ResumeTranscriptPresenter.write
@@ -4973,7 +4992,8 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(input_session.active)
                     self.assertFalse(input_session.modal_active)
                     self.assertEqual(events, saved[selected_label]['events'])
-                    self.assertEqual(pathlib.Path(paths[selected_label]).read_bytes(), before[selected_label])
+                    with open(paths[selected_label], 'rb') as stream:
+                        self.assertEqual(stream.read(), before[selected_label])
                     start = output.tell()
                     real_present(presenter, events)
                     rendered.append(output.getvalue()[start:])
@@ -5004,7 +5024,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                                 self.assertFalse(chat_dir.exists())
                             self.assertEqual(loki.current_chat_log_path(), path)
                             self.assertTrue(session.chat_log_dirty)
-                            self.assertFalse(pathlib.Path(path).exists())
+                            self.assertFalse(os.path.exists(path))
                             (root / f'{label}.txt').write_text(f'evidence {label}\n', encoding='utf-8')
                             session.transcript_items.append(formats.message_item('user', f'{label} request'))
                             phase.update(label=label, count=0)
@@ -5020,7 +5040,10 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                             os.utime(path, (mtimes[label], mtimes[label]))
                             await session.job_manager.close_session_owned()
                     self.assertEqual(len(set(paths.values())), 3)
-                    before = {label: pathlib.Path(path).read_bytes() for label, path in paths.items()}
+                    before = {}
+                    for saved_label, saved_path in paths.items():
+                        with open(saved_path, 'rb') as stream:
+                            before[saved_label] = stream.read()
                     (root / 'continued.txt').write_text('evidence continued\n', encoding='utf-8')
                     resumed = await fresh_session()
                     self.assertEqual(resumed.transcript_items, [])
@@ -5047,7 +5070,8 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(requests), 8)
                     for label in mtimes:
                         if label != selected_label:
-                            self.assertEqual(pathlib.Path(paths[label]).read_bytes(), before[label])
+                            with open(paths[label], 'rb') as stream:
+                                self.assertEqual(stream.read(), before[label])
                     self.assertTrue(input_session.menu.startswith('\nSaved sessions:\n'))
                     rows = [line for line in input_session.menu.splitlines()
                             if line.startswith(('  1.', '  2.', '  3.'))]
@@ -5434,7 +5458,8 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
             loki.apply_runtime_config(config)
             loki.new_chat_log(path)
             loki.save_chat_log()
-            text = pathlib.Path(path).read_text(encoding="utf-8")
+            with open(path, encoding='utf-8') as stream:
+                text = stream.read()
             blob = json.loads(text)
 
         connection = blob["session_state"]["connection"]
@@ -5475,7 +5500,8 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
             }
             original = json.dumps(
                 blob, separators=(",", ":"), sort_keys=True).encode()
-            pathlib.Path(path).write_bytes(original)
+            with open(path, 'wb') as stream:
+                stream.write(original)
             loki.current_session().runtime_config = None
 
             loki.load_chat_log(path)
@@ -5483,7 +5509,8 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(saved)
             self.assertFalse(loki.current_session().chat_log_dirty)
-            self.assertEqual(pathlib.Path(path).read_bytes(), original)
+            with open(path, 'rb') as stream:
+                self.assertEqual(stream.read(), original)
             self.assertEqual(
                 loki.current_state()["connection"], descriptor.to_dict())
             self.assertEqual(
@@ -5513,16 +5540,17 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
                 "connection": legacy_connection,
                 "future_field": "retained",
             }
-            pathlib.Path(path).write_text(
-                json.dumps(blob), encoding="utf-8")
+            serialized_blob = json.dumps(blob)
+            with open(path, 'w', encoding='utf-8') as stream:
+                stream.write(serialized_blob)
             loki.current_session().runtime_config = None
 
             loki.load_chat_log(path)
             loki.mark_chat_log_dirty()
             self.assertTrue(loki.save_chat_log())
 
-            after = json.loads(
-                pathlib.Path(path).read_text(encoding="utf-8"))
+            with open(path, encoding='utf-8') as stream:
+                after = json.load(stream)
             self.assertEqual(
                 after["session_state"]["connection"],
                 descriptor.to_dict(),
@@ -5551,8 +5579,9 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
                 "shell_cwd": tmpdir,
                 "connection": saved_descriptor.to_dict(),
             }
-            pathlib.Path(path).write_text(
-                json.dumps(blob), encoding="utf-8")
+            serialized_blob = json.dumps(blob)
+            with open(path, 'w', encoding='utf-8') as stream:
+                stream.write(serialized_blob)
             loki.apply_runtime_config(connections.make_runtime_config(
                 "https://override.example/v1",
                 protocols.OPENAI_CHAT,
@@ -5566,8 +5595,8 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
             loki.mark_chat_log_dirty()
             loki.save_chat_log()
 
-            after = json.loads(
-                pathlib.Path(path).read_text(encoding="utf-8"))
+            with open(path, encoding='utf-8') as stream:
+                after = json.load(stream)
             self.assertEqual(
                 after["session_state"]["connection"],
                 saved_descriptor.to_dict(),
@@ -5599,7 +5628,8 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
             path = os.path.join(tmpdir, "chat-test.json")
             loki.new_chat_log(path)
             loki.save_chat_log()
-            original = pathlib.Path(path).read_bytes()
+            with open(path, 'rb') as stream:
+                original = stream.read()
 
             loki.current_transcript().append(
                 formats.message_item("user", "must not publish"))
@@ -5613,7 +5643,8 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(OSError, "publish failed"):
                     loki.save_chat_log()
 
-            self.assertEqual(pathlib.Path(path).read_bytes(), original)
+            with open(path, 'rb') as stream:
+                self.assertEqual(stream.read(), original)
             self.assertTrue(loki.current_session().chat_log_dirty)
             self.assertEqual(
                 [name for name in os.listdir(tmpdir)

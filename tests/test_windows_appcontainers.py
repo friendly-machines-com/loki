@@ -587,7 +587,7 @@ def startup_commands(workspace, mode, executable, system_root):
 def read_startup_artifact(path):
     """Bound diagnostic output and preserve read errors as unknown evidence."""
     try:
-        with Path(path).open('rb') as stream:
+        with open(path, 'rb') as stream:
             data = stream.read(4097)
     except FileNotFoundError:
         return {'missing': True, 'prefix': '', 'truncated': False}
@@ -784,7 +784,8 @@ class StateTokenProbe:
     def startup_controls(self, primary, role_sid, manifest_path):
         """Start all paired witnesses, then observe each without waiting on another."""
         native = self.n
-        manifest = json.loads(Path(manifest_path).read_text())
+        with open(manifest_path) as stream:
+            manifest = json.load(stream)
         workspace = Path(manifest['workspace'])
         state = Path(manifest['state'])
         role = native.sid(role_sid)
@@ -916,7 +917,8 @@ class StateTokenProbe:
             print(json.dumps({'state_child_created': role, 'pid': child.pid,
                               'token': snapshot, 'in_job': info['in_job']}), flush=True)
             state_progress('launch-manifest-read-before', role=role, child_pid=child.pid)
-            manifest = json.loads(Path(manifest_path).read_text())
+            with open(manifest_path) as stream:
+                manifest = json.load(stream)
             state_progress('launch-manifest-read-after', role=role, child_pid=child.pid)
             if (snapshot['app'] != 1 or snapshot['package'] != manifest['package']
                     or snapshot['user'] != manifest['owner']):
@@ -972,6 +974,15 @@ def state_access_report(probe, manifest, role):
         with path.open('ab') as stream:
             stream.write(b'append')
 
+    # These callbacks receive complete probe operands, not fixture-name roots.
+    def read_file(path):
+        with open(path, 'rb') as stream:
+            return stream.read()
+
+    def overwrite_file(path):
+        with open(path, 'wb') as stream:
+            return stream.write(b'bad')
+
     def rename_directory(path):
         moved = path.with_name(path.name + '-moved')
         path.rename(moved)
@@ -980,8 +991,8 @@ def state_access_report(probe, manifest, role):
     writing = 'allowed' if role == 'control' else 'access-denied'
     reading = 'characterized' if role == 'refiltered' else 'allowed'
     observe('state-read', lambda: (state / 'read').read_bytes(), reading)
-    observe('configuration-read', lambda: Path(manifest['configuration']).read_bytes(), reading)
-    observe('configuration-write', lambda: Path(manifest['configuration']).write_bytes(b'bad'), 'access-denied')
+    observe('configuration-read', lambda: read_file(manifest['configuration']), reading)
+    observe('configuration-write', lambda: overwrite_file(manifest['configuration']), 'access-denied')
     observe('workspace-write', lambda: (workspace / (role + '-workspace')).write_bytes(b'ok'), 'allowed')
     for name, action in [
             ['state-create', lambda: (state / 'created').write_bytes(b'bad')],
@@ -1008,8 +1019,8 @@ def state_access_report(probe, manifest, role):
     ]:
         observe(name, action, 'characterized' if role == 'control' else 'access-denied')
     for name, path in [['setup', manifest['setup']], ['credentials', manifest['credentials']]]:
-        observe(name + '-read', lambda path=path: Path(path).read_bytes(), 'access-denied')
-        observe(name + '-write', lambda path=path: Path(path).write_bytes(b'bad'), 'access-denied')
+        observe(name + '-read', lambda path=path: read_file(path), 'access-denied')
+        observe(name + '-write', lambda path=path: overwrite_file(path), 'access-denied')
     if role != 'control':
         observe('state-junction-write', lambda: (
             workspace / 'state-junction' / role / 'via-junction').write_bytes(b'bad'), 'access-denied')
@@ -1089,7 +1100,8 @@ def recover_state_parent_token(probe, manifest):
 def state_access_child(manifest_path, role):
     state_progress('child-enter', role=role)
     state_progress('child-manifest-read-before', role=role)
-    manifest = json.loads(Path(manifest_path).read_text())
+    with open(manifest_path) as stream:
+        manifest = json.load(stream)
     state_progress('child-manifest-read-after', role=role)
     state_progress('child-native-init-before', role=role)
     native = AppContainers()
@@ -1171,7 +1183,8 @@ def state_writer_child(manifest_path):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from loki_agent.process_protections import protect_credential_process
     protect_credential_process()
-    manifest = json.loads(Path(manifest_path).read_text())
+    with open(manifest_path) as stream:
+        manifest = json.load(stream)
     native = AppContainers()
     probe = StateTokenProbe(native)
     role_sid = HANDLE()
@@ -1190,7 +1203,9 @@ def state_writer_child(manifest_path):
         cleanup.callback(probe.api.close, handle)
         manifest.update({'writer_pid': os.getpid(), 'writer_handle': handle,
                          'writer_memory': C.addressof(memory), 'writer_memory_size': C.sizeof(memory)})
-        Path(manifest_path).write_text(json.dumps(manifest))
+        manifest_text = json.dumps(manifest)
+        with open(manifest_path, 'w') as stream:
+            stream.write(manifest_text)
         # Both the direct memory and file operations have successful controls
         # before hostile children try to recover these authorities.
         memory_control = C.create_string_buffer(C.sizeof(memory))
@@ -1501,7 +1516,9 @@ def scratch_child(directory, report_path):
             report['file'] = stream.name
     except OSError as error:
         report['error'] = '%s: %s' % (type(error).__name__, error)
-    Path(report_path).write_text(json.dumps(report))
+    report_text = json.dumps(report)
+    with open(report_path, 'w') as stream:
+        stream.write(report_text)
     return 0
 
 
@@ -1657,7 +1674,9 @@ def eof_stdin_child(report_path):
         report['bytes'] = len(data)
     except OSError as error:
         report['error'] = '%s: %s' % (type(error).__name__, error)
-    Path(report_path).write_text(json.dumps(report))
+    report_text = json.dumps(report)
+    with open(report_path, 'w') as stream:
+        stream.write(report_text)
     return 0
 
 
@@ -1755,7 +1774,9 @@ def private_pipe_child(report_path):
         if descriptor.value:
             native.local_free(descriptor)
         windows_api.close_handle(token)
-        Path(report_path).write_text(json.dumps(report))
+        report_text = json.dumps(report)
+        with open(report_path, 'w') as stream:
+            stream.write(report_text)
     return 0 if report['status'] == 'passed' else 1
 
 
@@ -1787,7 +1808,9 @@ def nul_open_child(report_path):
     else:
         report['opened'] = True
         os.close(handle)
-    Path(report_path).write_text(json.dumps(report))
+    report_text = json.dumps(report)
+    with open(report_path, 'w') as stream:
+        stream.write(report_text)
     return 0
 
 
@@ -1854,14 +1877,14 @@ def scratch_probe(native, sid, workspace, report_path):
     directory = os.path.join(str(workspace), '.loki', 'tmp')
     if os.path.isdir(directory):
         shutil.rmtree(directory)
-    child_report = Path(report_path)
     code = native.launch(
         [sys.executable, '-I', '-u', __file__, '--scratch-child',
-         directory, str(child_report)],
+         directory, str(report_path)],
         sid, workspace, workspace / 'scratch-child.log')
     if code != 0:
         raise RuntimeError('AppContainer scratch child exited %d' % code)
-    report = json.loads(child_report.read_text())
+    with open(report_path) as stream:
+        report = json.load(stream)
     if report.get('error') or not report.get('created'):
         raise RuntimeError('AppContainer scratch child reported %r' % (report,))
     if not str(report.get('file') or '').startswith(directory):
@@ -1898,9 +1921,11 @@ def task_witness(request_path):
     standard-user broker is denied on this Server image; native run
     1670996), so the broker selects the witness target via this file.
     """
-    request = json.loads(request_path.read_text())
-    return [json.loads(Path(request['manifest']).read_text()),
-            Path(request['report']), request['lease']]
+    with open(request_path) as stream:
+        request = json.load(stream)
+    with open(request['manifest']) as stream:
+        manifest = json.load(stream)
+    return [manifest, Path(request['report']), request['lease']]
 
 
 def verify_task_route(report_path, owner, native=None, api=None, *, cleanup):
@@ -2351,7 +2376,8 @@ def runtime_gate(manifest_path):
     from the shipped path rule rather than a patched function, so the fixture
     supplies ``XDG_CONFIG_HOME`` and the real resolution is exercised.
     """
-    manifest = json.loads(Path(manifest_path).read_text())
+    with open(manifest_path) as stream:
+        manifest = json.load(stream)
     # Under isolated (-I) Python the script's directory is not on sys.path, so
     # the staged package must be named explicitly, as the sibling helpers are.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -2371,7 +2397,8 @@ def runtime_gate(manifest_path):
 
 def contained(manifest_path, descendant=False):
     native = AppContainers()
-    manifest = json.loads(Path(manifest_path).read_text())
+    with open(manifest_path) as stream:
+        manifest = json.load(stream)
     details = native.token_details(include_groups=True)
     primitives['require_standard_user'](details, manifest['owner'])
     identity = native.app_identity()
@@ -2596,15 +2623,14 @@ class EscapeResultTests(unittest.TestCase):
         api.close.assert_called_once_with(7)
 
     def test_task_request_requires_an_explicit_controller_lease(self):
-        with tempfile.TemporaryDirectory() as directory:
-            manifest = os.path.join(directory, 'manifest.json')
-            with open(manifest, 'w', encoding='utf-8') as stream:
-                json.dump({'workspace': directory}, stream)
-            request = mock.Mock()
-            request.read_text.return_value = json.dumps(
-                {'manifest': manifest, 'report': os.path.join(directory, 'report.json')})
+        request = {'manifest': 'manifest.json', 'report': 'report.json'}
+        readers = [mock.mock_open(read_data=json.dumps(request)).return_value,
+                   mock.mock_open(read_data='{"workspace":"workspace"}').return_value]
+        with mock.patch('builtins.open', side_effect=readers) as opened:
             with self.assertRaisesRegex(KeyError, 'lease'):
-                task_witness(request)
+                task_witness('./request.json')
+        self.assertEqual(opened.call_args_list,
+                         [mock.call('./request.json'), mock.call('manifest.json')])
 
     def fake_witness_api(self):
         # Argument/launch-result units replace the kernel lease but retain its
@@ -3093,7 +3119,8 @@ class EscapeResultTests(unittest.TestCase):
             target = os.path.join(directory, '.loki', 'tmp')
             report_path = os.path.join(directory, 'report.json')
             self.assertEqual(scratch_child(target, report_path), 0)
-            report = json.loads(Path(report_path).read_text())
+            with open(report_path) as stream:
+                report = json.load(stream)
             self.assertIsNone(report['error'])
             self.assertTrue(report['created'])
             self.assertTrue(report['file'].startswith(target))
@@ -4065,6 +4092,14 @@ class StateTokenProbeTests(unittest.TestCase):
                             failed = subprocess.run(broken, cwd=directory, capture_output=True)
                             self.assertEqual(failed.returncode, spec['expected_exit'] + 1)
 
+    @unittest.skipUnless(os.name == 'posix', 'POSIX literal pathname constraints')
+    def test_startup_artifacts_preserve_literal_lookup_keys(self):
+        self.assertEqual(read_startup_artifact(''),
+                         {'missing': True, 'prefix': '', 'truncated': False})
+        artifact = read_startup_artifact('README.md/')
+        self.assertIn('read_error', artifact)
+        self.assertNotIn('prefix', artifact)
+
     def test_startup_artifacts_distinguish_missing_truncated_and_unreadable(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'output'
@@ -4081,7 +4116,7 @@ class StateTokenProbeTests(unittest.TestCase):
             self.assertEqual(artifact['prefix'], 'x' * 4096)
             error = PermissionError('cannot inspect artifact')
             error.winerror = 5
-            with mock.patch.object(Path, 'open', side_effect=error):
+            with mock.patch('builtins.open', side_effect=error):
                 artifact = read_startup_artifact(path)
             self.assertEqual(artifact, {'read_error': str(error), 'winerror': 5})
             self.assertNotIn('missing', artifact)
@@ -5407,7 +5442,7 @@ class AppContainerTests(unittest.TestCase):
             print(json.dumps({'scheduled_task_setup': 'blocked; route untested'}),
                   flush=True)
         else:
-            request_path = Path(fixture['request'])
+            request_path = fixture['request']
             schtasks = str(Path(os.environ['SystemRoot']) / 'System32/schtasks.exe')
 
             def run_schtasks(*arguments):
@@ -5419,8 +5454,10 @@ class AppContainerTests(unittest.TestCase):
 
             with ExitStack() as retirement, escape_helpers['witness_lease'](
                     native, primitives['Overlapped'], workspace) as lease:
-                request_path.write_text(json.dumps({'manifest': str(manifest),
-                                                    'report': str(control_report), 'lease': lease}))
+                request_text = json.dumps({'manifest': str(manifest),
+                                           'report': str(control_report), 'lease': lease})
+                with open(request_path, 'w') as stream:
+                    stream.write(request_text)
                 run_schtasks('/Run', '/TN', task_name)
                 deadline = time.monotonic() + 20
                 while not control_report.exists():
@@ -5435,8 +5472,10 @@ class AppContainerTests(unittest.TestCase):
             api.wait_task_idle(task_name)
             task_lease = self.enterContext(escape_helpers['witness_lease'](
                 native, primitives['Overlapped'], workspace))
-            request_path.write_text(json.dumps({'manifest': str(manifest),
-                                                'report': str(task_report), 'lease': task_lease}))
+            request_text = json.dumps({'manifest': str(manifest),
+                                       'report': str(task_report), 'lease': task_lease})
+            with open(request_path, 'w') as stream:
+                stream.write(request_text)
         # Per-user local COM server (arm 1, no admin): register, prove the
         # route is live and dangerous via an unrestricted control activation,
         # then retarget the registration at the worker-attempt report. If the
@@ -5498,14 +5537,16 @@ class AppContainerTests(unittest.TestCase):
                                           'scope': scope}), flush=True)
                         continue
                     machine_cls = machine[clsid_field]
-                    com_request = Path(machine[request_field])
+                    com_request = machine[request_field]
                     control_report_path = root / (
                         'com-' + scope + '-control-' + uuid.uuid4().hex + '.json')
                     with ExitStack() as retirement, escape_helpers['witness_lease'](
                             native, primitives['Overlapped'], workspace) as lease:
-                        com_request.write_text(json.dumps(
+                        request_text = json.dumps(
                             {'manifest': str(manifest),
-                             'report': str(control_report_path), 'lease': lease}))
+                             'report': str(control_report_path), 'lease': lease})
+                        with open(com_request, 'w') as stream:
+                            stream.write(request_text)
                         payload, detail = activate_and_observe(
                             [sys.executable, '-I', '-u', str(escapes), '--com-activate',
                              machine_cls], control_report_path, owner, native, api,
@@ -5525,9 +5566,11 @@ class AppContainerTests(unittest.TestCase):
                             'com-machine-report-' + uuid.uuid4().hex + '.json')
                         machine_lease = self.enterContext(escape_helpers['witness_lease'](
                             native, primitives['Overlapped'], workspace))
-                        com_request.write_text(json.dumps(
+                        request_text = json.dumps(
                             {'manifest': str(manifest),
-                             'report': str(machine_report), 'lease': machine_lease}))
+                             'report': str(machine_report), 'lease': machine_lease})
+                        with open(com_request, 'w') as stream:
+                            stream.write(request_text)
                         com_targets.append({'name': scope, 'clsid': machine_cls,
                                             'report': str(machine_report)})
         manifest.write_text(json.dumps({'secret': str(secret),
@@ -5862,20 +5905,22 @@ if __name__ == '__main__':
         native = AppContainers()
         api = escape_helpers['Escapes'](
             native, primitives, ExtendedStartups, ProcessInfos)
-        escape_helpers['witness'](api, json.loads(Path(sys.argv[2]).read_text()),
-                                  Path(sys.argv[3]), access_outcome, sys.argv[4])
+        with open(sys.argv[2]) as stream:
+            manifest = json.load(stream)
+        escape_helpers['witness'](api, manifest, Path(sys.argv[3]), access_outcome, sys.argv[4])
         sys.exit(0)
     if len(sys.argv) == 3 and sys.argv[1] == '--token-impersonation':
         native = AppContainers()
         api = escape_helpers['Escapes'](
             native, primitives, ExtendedStartups, ProcessInfos)
-        report = escape_helpers['impersonation'](
-            api, json.loads(Path(sys.argv[2]).read_text()), access_outcome)
+        with open(sys.argv[2]) as stream:
+            manifest = json.load(stream)
+        report = escape_helpers['impersonation'](api, manifest, access_outcome)
         print(json.dumps(report), flush=True)
         sys.exit(0 if report['outcome'] in ['impersonated-contained',
                                             'access-denied'] else 1)
     if len(sys.argv) == 3 and sys.argv[1] in ['--task-witness', '--com-witness']:
-        manifest, report, lease = task_witness(Path(sys.argv[2]))
+        manifest, report, lease = task_witness(sys.argv[2])
         native = AppContainers()
         api = escape_helpers['Escapes'](
             native, primitives, ExtendedStartups, ProcessInfos)

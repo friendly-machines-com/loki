@@ -141,8 +141,8 @@ class GlobTests(unittest.TestCase):
                     self.assertIn(job.process.returncode, (0, 1))
                     self.assertEqual(job.exit_code, job.process.returncode)
                     self.assertEqual(job.status, 'exited')
-                    metadata = json.loads(
-                        Path(job.metadata_path).read_text(encoding='utf-8'))
+                    with open(job.metadata_path, encoding='utf-8') as stream:
+                        metadata = json.load(stream)
                     self.assertEqual(metadata['exit_code'], job.exit_code)
                     self.assertEqual(metadata['cwd'], str(workspace))
                     self.assertEqual(metadata['status'], 'exited')
@@ -196,11 +196,10 @@ class GlobTests(unittest.TestCase):
                         async def ready():
                             while True:
                                 for job in manager.jobs.values():
-                                    if (job.process is not None
-                                            and Path(job.stdout_path).exists()
-                                            and 'search-ready' in Path(
-                                                job.stdout_path).read_text()):
-                                        return job
+                                    if job.process is not None and os.path.exists(job.stdout_path):
+                                        with open(job.stdout_path) as stream:
+                                            if 'search-ready' in stream.read():
+                                                return job
                                 self.assertFalse(search.done(), 'search ended before readiness')
                                 await asyncio.sleep(0.01)
 
@@ -213,7 +212,8 @@ class GlobTests(unittest.TestCase):
                         self.assertIn('glob search was cancelled by the user', result['content'])
                         self.assertIsNotNone(job.process.returncode)
                         self.assertEqual(job.status, 'cancelled')
-                        metadata = json.loads(Path(job.metadata_path).read_text())
+                        with open(job.metadata_path) as stream:
+                            metadata = json.load(stream)
                         self.assertEqual(metadata['status'], 'cancelled')
                     finally:
                         cancel.set()

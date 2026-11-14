@@ -41,9 +41,10 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
                 status, headers or {"x-remaining": "10"})
 
     async def test_runtime_cleanup_uses_fixture_storage_not_preexisting_user_state(self):
-        protected = Path(self.path)
-        protected.write_bytes(b"user-owned status must not be read or changed")
-        original = protected.read_bytes()
+        with open(self.path, 'wb') as stream:
+            stream.write(b"user-owned status must not be read or changed")
+        with open(self.path, 'rb') as stream:
+            original = stream.read()
         existing_store = self.enterContext(contextlib.closing(response_headers.Store(self.path)))
         existing_session = Session(response_headers=existing_store)
         with mock.patch.object(response_headers, '_snapshot_location',
@@ -63,9 +64,11 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
                         saved = inspected.snapshot()['endpoints']
                     self.assertEqual({entry["endpoint"] for entry in saved}, {
                         "https://test.example/0", "https://test.example/1"})
-                    self.assertEqual(protected.read_bytes(), original)
-        self.assertFalse(Path(isolated_path).exists())
-        self.assertEqual(protected.read_bytes(), original)
+                    with open(self.path, 'rb') as stream:
+                        self.assertEqual(stream.read(), original)
+        self.assertFalse(os.path.exists(isolated_path))
+        with open(self.path, 'rb') as stream:
+            self.assertEqual(stream.read(), original)
 
     async def test_updates_keys_retains_absent_and_does_not_write(self):
         with mock.patch.object(response_headers.time, "time_ns", return_value=1):
@@ -327,10 +330,13 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(values["set-cookie"]["value"], "[redacted]")
         self.assertEqual(values["x-ratelimit-remaining-tokens"]["value"], "42")
         await self.store.save()
-        self.assertNotIn("do-not-store", Path(self.path).read_text())
+        with open(self.path) as stream:
+            self.assertNotIn("do-not-store", stream.read())
         # Saved data is untrusted too: inspection must apply the same filter.
         values["set-cookie"]["value"] = "secret-from-file"
-        Path(self.path).write_text(json.dumps(document))
+        document_text = json.dumps(document)
+        with open(self.path, 'w') as stream:
+            stream.write(document_text)
         with contextlib.closing(response_headers.Store(self.path)) as reopened:
             loaded = reopened.snapshot()
         self.assertNotIn("secret-from-file", json.dumps(loaded))
@@ -412,16 +418,19 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
             headers = saved.snapshot()["endpoints"][0]["headers"]
             self.assertEqual(headers["x-remaining"]["value"], "9")
             self.assertEqual(headers["x-reset"]["value"], "soon")
-        before = Path(self.path).read_bytes()
+        with open(self.path, 'rb') as stream:
+            before = stream.read()
         with mock.patch.object(response_headers.private_files, "open_lock_file_at") as lock:
             self.assertTrue(self.store.try_save())
             lock.assert_not_called()
-        self.assertEqual(Path(self.path).read_bytes(), before)
+        with open(self.path, 'rb') as stream:
+            self.assertEqual(stream.read(), before)
 
     def test_try_save_busy_does_not_read_or_change_the_snapshot(self):
         self.observe()
         self.assertTrue(self.store.try_save())
-        original = Path(self.path).read_bytes()
+        with open(self.path, 'rb') as stream:
+            original = stream.read()
         self.observe(headers={"x-remaining": "5"})
         # A separately opened handle represents an independent runtime. The
         # reader/merge must not run until this writer's real lock is released.
@@ -433,7 +442,8 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
                                    side_effect=AssertionError("read without lock")):
                 self.assertFalse(self.store.try_save())
             self.assertTrue(self.store.dirty)
-            self.assertEqual(Path(self.path).read_bytes(), original)
+            with open(self.path, 'rb') as stream:
+                self.assertEqual(stream.read(), original)
         finally:
             response_headers.private_files.close(lock_fd)
         self.assertTrue(self.store.try_save())

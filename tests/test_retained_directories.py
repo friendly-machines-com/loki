@@ -220,7 +220,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         release = self.root / 'release'
         job = await manager.run_background_exec([
             sys.executable, '-c',
-            "import pathlib,sys,time\nwhile not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)",
+            "import os,sys,time\nwhile not os.path.exists(sys.argv[1]): time.sleep(.01)",
             str(release)])
         try:
             await manager.aclose()
@@ -354,9 +354,8 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
             await manager.run_exec([sys.executable, '-c', "print('must not run')"])
         self.assertEqual(list(target.iterdir()), [])
         job, _, _, _ = await manager.run_exec([sys.executable, '-c', "print('ok')"])
-        spool = Path(job.stdout_path)
-        spool.unlink()
-        os.mkfifo(spool)
+        os.unlink(job.stdout_path)
+        os.mkfifo(job.stdout_path)
         with self.assertRaisesRegex(OSError, 'regular file'):
             manager.job_status(job.id)
 
