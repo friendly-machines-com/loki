@@ -47,6 +47,7 @@
                                    "\"")))))
              (replace 'check
                (lambda _
+                 (setenv "HOME" "/tmp")
                  ;; The Guix builder inherits SIGINT ignored, and an ignored
                  ;; disposition survives exec. That isn't the correct
                  ;; environment that loki would run in in production.
