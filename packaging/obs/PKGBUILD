@@ -23,8 +23,7 @@ sha256sums+=('SKIP')
 
 build() {
   cd "$pkgname-$pkgver"
-  # Use the distribution backend even when it is newer than flit_core <4.
-  python -m build --wheel --skip-dependency-check --no-isolation
+  python -m build --wheel --no-isolation
 }
 
 package() {

@@ -8,10 +8,12 @@
          package recipes. Change this when packaging a new upstream version. -->
     <param name="versionformat">0.1.0</param>
   </service>
-  <service name="tar" mode="buildtime"/>
-  <service name="recompress" mode="buildtime">
+  <!-- Generate portable sources on the OBS server: service RPMs are not
+       available in every target distribution's build repositories. -->
+  <service name="tar" mode="serveronly"/>
+  <service name="recompress" mode="serveronly">
     <param name="file">*.tar</param>
     <param name="compression">gz</param>
   </service>
-  <service name="set_version" mode="buildtime"/>
+  <service name="set_version" mode="serveronly"/>
 </services>

@@ -6,7 +6,7 @@ Build-Depends: debhelper-compat (= 13),
                dh-python,
                pybuild-plugin-pyproject,
                python3-all (>= 3.11.10),
-               python3-flit-core (>= 3.8),
+               flit (>= 3.8),
                pypy3 (>= 7.3.19) <!cpython>
 Standards-Version: 4.7.0
 Homepage: https://friendly-machines.com/git/loki.git
