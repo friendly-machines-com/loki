@@ -1,0 +1,8 @@
+-------------------------------------------------------------------
+Sat Nov 14 03:52:36 UTC 2026 - Danny Milosavljevic <dannym@friendly-machines.com>
+
+- Complete RPM packaging for Loki:
+  - Deduplicate identical bytecode caches on openSUSE.
+  - Remove script shebangs from imported library modules during prep.
+  - Check imports from the built wheel with the selected interpreter.
+  - Supply RPM changelog metadata.
