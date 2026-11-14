@@ -4,7 +4,7 @@ Binary: loki
 Architecture: all
 Version: 0.1.0-1
 Maintainer: Danny Milosavljevic <dannym@friendly-machines.com>
-Homepage: https://github.com/friendly-machines-com/loki
+Homepage: https://friendly-machines.com/git/loki.git
 DEBTRANSFORM-TAR: loki-@VERSION@.tar.gz
 DEBTRANSFORM-FILES-TAR:
 DEBTRANSFORM-RELEASE: 1

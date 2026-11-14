@@ -14,7 +14,7 @@ Version:        0.1.0
 Release:        0
 Summary:        Really really minimal-dependency coding agent
 License:        MIT
-URL:            https://github.com/friendly-machines-com/loki
+URL:            https://friendly-machines.com/git/loki.git
 Source0:        %{name}-%{version}.tar.gz
 BuildArch:      noarch
 

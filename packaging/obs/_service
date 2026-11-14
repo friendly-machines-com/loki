@@ -1,6 +1,6 @@
 <services>
   <service name="obs_scm">
-    <param name="url">https://github.com/friendly-machines-com/loki.git</param>
+    <param name="url">https://friendly-machines.com/git/loki.git</param>
     <param name="scm">git</param>
     <param name="revision">master</param>
     <param name="filename">loki</param>

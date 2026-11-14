@@ -3,7 +3,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="Really really minimal-dependency coding agent"
 arch=('any')
-url="https://github.com/friendly-machines-com/loki"
+url="https://friendly-machines.com/git/loki.git"
 license=('MIT')
 depends=('python>=3.11.10')
 makedepends=('python-build' 'python-flit-core' 'python-installer' 'python-wheel')

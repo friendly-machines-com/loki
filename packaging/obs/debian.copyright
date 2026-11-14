@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: loki-agent
-Source: https://github.com/friendly-machines-com/loki
+Source: https://friendly-machines.com/git/loki.git
 
 Files: *
 Copyright: 2026 Danny Milosavljevic
