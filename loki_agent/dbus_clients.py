@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Zero-dependency, pure Python standard library asyncio standby inhibitor.
 Prefers XDG Desktop Portal (Session Bus, sandbox-friendly) with automatic
