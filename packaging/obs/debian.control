@@ -1,0 +1,20 @@
+Source: loki
+Section: devel
+Priority: optional
+Maintainer: Danny Milosavljevic <dannym@friendly-machines.com>
+Build-Depends: debhelper-compat (= 13),
+               dh-python,
+               pybuild-plugin-pyproject,
+               python3-all (>= 3.11.10),
+               python3-flit-core (>= 3.8)
+Standards-Version: 4.7.0
+Homepage: https://github.com/friendly-machines-com/loki
+Rules-Requires-Root: no
+
+Package: loki
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends},
+         python3 (>= 3.11.10),
+         python3 (<< 3.12) | python3 (>= 3.12.4)
+Description: Really really minimal-dependency coding agent
+ No-nonsense coding agent with minimal dependencies.

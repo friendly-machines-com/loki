@@ -1,0 +1,17 @@
+<services>
+  <service name="obs_scm">
+    <param name="url">https://github.com/friendly-machines-com/loki.git</param>
+    <param name="scm">git</param>
+    <param name="revision">master</param>
+    <param name="filename">loki</param>
+    <!-- Keep the archive version aligned with loki_agent/__init__.py and the
+         package recipes. Change this when packaging a new upstream version. -->
+    <param name="versionformat">0.1.0</param>
+  </service>
+  <service name="tar" mode="buildtime"/>
+  <service name="recompress" mode="buildtime">
+    <param name="file">*.tar</param>
+    <param name="compression">gz</param>
+  </service>
+  <service name="set_version" mode="buildtime"/>
+</services>

@@ -1,0 +1,24 @@
+pkgname=loki
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Really really minimal-dependency coding agent"
+arch=('any')
+url="https://github.com/friendly-machines-com/loki"
+license=('MIT')
+depends=('python>=3.11.10')
+makedepends=('python-build' 'python-flit-core' 'python-installer' 'python-wheel')
+source=("$pkgname-$pkgver.tar.gz")
+# OBS produces this archive from the Git revision selected in _service.
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  # Use the distribution backend even when it is newer than flit_core <4.
+  python -m build --wheel --skip-dependency-check --no-isolation
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
