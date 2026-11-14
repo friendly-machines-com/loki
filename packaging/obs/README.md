@@ -11,7 +11,8 @@ The project has no Python runtime dependencies.
    clear its SCM Sync URL before uploading these files directly.
 2. In an `osc checkout` of that package, copy the files from this directory
    (except this README) into the package root. Preserve the executable bit on
-   `debian.rules`. Run `osc addremove` and `osc commit`.
+   `debian.rules`, and include `loki.changes` so OBS can populate RPM changelog
+   metadata. Run `osc addremove` and `osc commit`.
 3. Run the source service using `osc service remoterun` (or **Run services** in
    the web UI), then wait for it to finish. OBS needs the `obs_scm`, `tar`,
    `recompress`, and `set_version` source services on the source server, not in
@@ -146,11 +147,26 @@ Some resolver errors cannot be repaired by Loki's package recipes:
 After uploading recipe changes, rerun the **remote** services before rebuilding.
 A published repository is not proof that this package's dependencies resolve.
 
+## RPM lint and checks
+
+The RPM recipe removes shebangs from the two imported library modules during
+`%prep`, not from the upstream checkout or the installed console entrypoints.
+openSUSE's `%pyproject_install` generates normal and optimized bytecode; `%fdupes`
+then deduplicates identical files without removing either cache variant.
+`loki.changes` and the spec's `%changelog` marker supply OBS changelog metadata.
+
+`%check` imports the public entrypoint modules and the two library modules from
+the built wheel under the selected interpreter. Isolated mode prevents importing
+from the checkout; no frontend is started, so this check needs neither provider
+credentials nor network access. This is a wheel smoke check, not the full upstream
+suite or proof that target-specific rpmlint reports are clear. Rerun the native
+OBS build and inspect its new lint report after uploading both spec and changes.
+
 ## Checks
 
 In an OBS checkout, run `osc service remoterun`, wait for completion, then run
 `osc update -S` and `osc build REPOSITORY ARCH` for each configured target.
 The `serveronly` services deliberately do not run with local `osc service run`.
- RPM macro expansion, debtransform, dependency
+RPM macro expansion, debtransform, dependency
 availability, and makepkg must be tested in their target repositories; a local
 Python wheel build cannot establish that all distro packages build.

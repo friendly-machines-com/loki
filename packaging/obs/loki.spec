@@ -37,6 +37,7 @@ BuildRequires:  %{pythons}-flit-core >= 3.8
 BuildRequires:  %{pythons}-pip
 BuildRequires:  %{pythons}-wheel
 BuildRequires:  python-rpm-macros
+BuildRequires:  fdupes
 %if %{with pypy}
 BuildRequires:  %{pythons}-installer
 BuildRequires:  %{pythons}-packaging
@@ -69,6 +70,9 @@ No-nonsense coding agent with minimal dependencies.
 
 %prep
 %autosetup
+# These are imported libraries, not the installed console-script entrypoints.
+# Preserve their non-executable permissions rather than shipping script shebangs.
+sed -i '1{/^#!/d;}' loki_agent/loki.py loki_agent/dbus_clients.py
 
 %build
 # Distribution macros use the installed backend without build isolation.
@@ -81,6 +85,27 @@ sitelib=$(python3 %{SOURCE1} --python %{loki_pypy_executable} \
 printf '%%s/loki_agent/\n%%s/loki_agent-*.dist-info/\n' "$sitelib" "$sitelib" > loki.files
 %else
 %pyproject_install
+%endif
+%if 0%{?suse_version}
+# CPython's pyproject_install has generated normal and optimized bytecode.
+# Deduplicate the installed tree without removing either cache variant.
+%fdupes %{buildroot}%{_prefix}
+%endif
+
+%check
+check_imports() {
+    "$1" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import loki_agent.__main__, loki_agent.acp_main, loki_agent.windows_setup, loki_agent.loki, loki_agent.dbus_clients' dist/*.whl
+}
+# Import from the built wheel, not the checkout, without starting a frontend,
+# opening credentials, contacting a provider, or requiring a writable HOME.
+%if %{with pypy}
+check_imports %{loki_pypy_executable}
+%else
+%if 0%{?suse_version}
+%python_expand check_imports $python
+%else
+check_imports %{__python3}
+%endif
 %endif
 
 %if %{with pypy}
@@ -97,3 +122,5 @@ printf '%%s/loki_agent/\n%%s/loki_agent-*.dist-info/\n' "$sitelib" "$sitelib" > 
 %{_sitelibdir}/loki_agent/
 %{_sitelibdir}/loki_agent-*.dist-info/
 %endif
+
+%changelog
