@@ -10,6 +10,7 @@
              ((guix licenses) #:prefix license:)
              (gnu packages bash)
              (gnu packages python-build)
+             (gnu packages pypy)
              (gnu packages rust-apps))
 
 (define %source-directory
@@ -64,7 +65,7 @@
                    (copy-file "loki.desktop"
                               (string-append apps "/loki.desktop"))))))))
   (native-inputs (list python-flit-core))
-  (inputs (list ripgrep bash-minimal))
+  (inputs (list pypy ripgrep bash-minimal))
   (home-page #f)
   (synopsis "Really really minimal-dependency coding agent")
   (description
