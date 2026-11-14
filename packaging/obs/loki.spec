@@ -1,3 +1,15 @@
+# Enable only for targets whose distro PyPy meets upstream's language floor.
+# Other targets retain their existing CPython package and installation macros.
+%if 0%{?fedora} >= 44
+%bcond_without pypy
+%{!?loki_pypy_package:%global loki_pypy_package pypy3.11}
+%{!?loki_pypy_executable:%global loki_pypy_executable %{_bindir}/pypy3.11}
+%else
+%bcond_with pypy
+%{!?loki_pypy_package:%global loki_pypy_package pypy3}
+%{!?loki_pypy_executable:%global loki_pypy_executable %{_bindir}/pypy3}
+%endif
+
 %if 0%{?suse_version}
 %if 0%{?suse_version} >= 1600
 %define pythons %{primary_python}
@@ -16,6 +28,7 @@ Summary:        Really really minimal-dependency coding agent
 License:        MIT
 URL:            https://friendly-machines.com/git/loki.git
 Source0:        %{name}-%{version}.tar.gz
+Source1:        install-wheels.py
 BuildArch:      noarch
 
 %if 0%{?suse_version}
@@ -24,16 +37,31 @@ BuildRequires:  %{pythons}-flit-core >= 3.8
 BuildRequires:  %{pythons}-pip
 BuildRequires:  %{pythons}-wheel
 BuildRequires:  python-rpm-macros
+%if %{with pypy}
+BuildRequires:  %{pythons}-installer
+BuildRequires:  %{pythons}-packaging
+%else
 Requires:       %{pythons} >= 3.11.10
 Requires:       (%{pythons} < 3.12 or %{pythons} >= 3.12.4)
+%endif
 %else
 BuildRequires:  pyproject-rpm-macros
 BuildRequires:  python3-devel >= 3.11.10
 BuildRequires:  python3-flit-core >= 3.8
 BuildRequires:  python3-pip
 BuildRequires:  python3-wheel
+%if %{with pypy}
+BuildRequires:  python3-installer
+BuildRequires:  python3-packaging
+%else
 Requires:       python3 >= 3.11.10
 Requires:       (python3 < 3.12 or python3 >= 3.12.4)
+%endif
+%endif
+
+%if %{with pypy}
+BuildRequires:  %{loki_pypy_package}
+Requires:       %{loki_pypy_package}
 %endif
 
 %description
@@ -47,13 +75,25 @@ No-nonsense coding agent with minimal dependencies.
 %pyproject_wheel
 
 %install
+%if %{with pypy}
+sitelib=$(python3 %{SOURCE1} --python %{loki_pypy_executable} \
+    --destdir %{buildroot} dist/*.whl)
+printf '%%s/loki_agent/\n%%s/loki_agent-*.dist-info/\n' "$sitelib" "$sitelib" > loki.files
+%else
 %pyproject_install
+%endif
 
+%if %{with pypy}
+%files -f loki.files
+%else
 %files
+%endif
 %license COPYING
 %doc README.md
 %{_bindir}/loki
 %{_bindir}/loki-acp
 %{_bindir}/loki-setup
+%if !%{with pypy}
 %{_sitelibdir}/loki_agent/
 %{_sitelibdir}/loki_agent-*.dist-info/
+%endif

@@ -34,21 +34,27 @@ snapshot timestamp must not silently disagree with the wheel's version.
 
 ## Distribution requirements
 
-- **openSUSE Tumbleweed / Slowroll:** the spec selects `%{primary_python}`.
+- **openSUSE Tumbleweed / Slowroll:** CPython via `%{primary_python}`; no modern
+  PyPy interpreter was found in the checked official repositories.
 - **Leap 15.x:** the spec selects `python311`. The repository must supply
   Python **3.11.10 or newer** and that interpreter's Flit, pip, and wheel
   packages. A `python311` package name alone does not guarantee the patch level.
-- **Fedora:** uses `python3` and `pyproject-rpm-macros`.
+- **Fedora 44 / Rawhide:** builds with `python3` and `pyproject-rpm-macros`,
+  but installs for the distro's `/usr/bin/pypy3.11` (`pypy3.11` package).
+  Other RPM targets default to CPython unless explicitly enabled.
 - **RHEL-family:** the default Python on RHEL 9 is too old. This spec requires
   repositories whose `python3` is new enough and which provide the listed build
   dependencies; it does not automatically select RHEL's parallel Python stacks.
-- **Debian / Ubuntu:** use a repository with a supported Python, such as Debian
-  13, Debian Unstable, or Ubuntu 26.04. The flat `debian.*` files and `loki.dsc`
+- **Debian 13 / Unstable / Ubuntu 26.04:** use distro `pypy3` for the installed
+  commands. The ordinary CPython/pybuild installation is retained: Debian PyPy's
+  `deb_system` scheme shares `/usr/lib/python3/dist-packages`. `dh_python3`
+  rewrites the shebangs; its normal CPython/debhelper dependencies remain.
+  The flat `debian.*` files and `loki.dsc`
   are OBS debtransform inputs, not an already assembled Debian source package.
   `set_version` substitutes the dsc's `@VERSION@` archive selector before
   debtransform constructs the Debian source package.
-- **Arch:** uses the distribution Python and builds a wheel without isolation
-  or dependency checking, then installs it with `python-installer`.
+- **Arch:** builds with CPython without isolation or dependency checking, then
+  installs for the distro's `/usr/bin/pypy3` using `install-wheels.py`.
 
 Upstream requires `>=3.11.10` and excludes Python `3.12.0` through `3.12.3`.
 Unmodified Debian 12 (3.11.2) and Ubuntu 24.04 (3.12.3) therefore are not targets.
@@ -63,6 +69,59 @@ creating an isolated environment. Arch explicitly passes
 check. This bypass is packaging policy, not proof of backend compatibility:
 check real distribution builds when their backend changes. Ordinary upstream
 builds still honor the original bound in `pyproject.toml`.
+
+## Interpreter policy
+
+Prefer **distro-maintained, Loki-compatible PyPy**, not just any package named
+`pypy3`. PyPy's own version is different from the Python language version. The
+checked packages provide:
+
+| Target | Distro PyPy package | Python language version |
+| --- | --- | --- |
+| Arch Extra | pypy3 8.0.1 | 3.12.15 |
+| Fedora 44 | pypy3.11 8.0.0 | 3.11.16 |
+| Debian 13 | pypy3 7.3.19+dfsg-2 | 3.11.11 |
+| Debian Unstable | pypy3 8.0.1+dfsg-1 | 3.11.17 |
+| Ubuntu 26.04 | pypy3 7.3.20+dfsg-4 | 3.11.13 |
+
+Sources: [Arch](https://archlinux.org/packages/extra/x86_64/pypy3/),
+[Fedora spec](https://src.fedoraproject.org/rpms/pypy3.11/raw/f44/f/pypy3.11.spec)
+and [its upstream language version](https://raw.githubusercontent.com/pypy/pypy/release-pypy3.11-v8.0.0/pypy/module/sys/version.py),
+[Debian 13 source](https://sources.debian.org/src/pypy3/7.3.19%2Bdfsg-2/pypy/module/sys/version.py/),
+[Debian Unstable source](https://sources.debian.org/src/pypy3/8.0.1%2Bdfsg-1/pypy/module/sys/version.py/),
+[Ubuntu source](https://git.launchpad.net/ubuntu/+source/pypy3/plain/pypy/module/sys/version.py?h=ubuntu/resolute).
+These are repository/source checks, not completed native OBS builds.
+
+Interpreter choice is made **when building the distro package**. There is no
+runtime PATH probe or launcher fallback. The selected package dependency and
+absolute shebang agree; `loki`, `loki-acp`, and the Windows-only `loki-setup`
+console script all use that interpreter. Existing internal launches propagate
+that interpreter via `sys.executable`. Upstream checkout shebangs are unchanged.
+
+RPM and Arch still build their universal wheel with CPython. `install-wheels.py`
+uses CPython's `installer`, but queries the selected runtime for its installation
+scheme and generates that runtime's shebangs. It rejects binary wheels and a
+runtime outside the wheel's `Requires-Python` range before installing. It does
+not generate CPython bytecode for PyPy. No PyPy-specific build backend, interpreter
+source download, or locally maintained PyPy package is needed.
+
+For repositories or architectures without a suitable distro PyPy, select CPython
+at package-build configuration time:
+
+- **RPM:** `--without pypy` (or `%_without_pypy 1` in OBS project macros).
+  openSUSE and RHEL-family targets already default to CPython. Enabling PyPy on
+  another verified RPM repository uses `--with pypy`; its package/executable
+  names can be set with `loki_pypy_package` and `loki_pypy_executable` macros.
+- **Debian:** activate the `cpython` build profile, e.g.
+  `DEB_BUILD_PROFILES=cpython` with normal Debian build tools. The profile must
+  apply to dependency resolution as well as `debian.rules`; it removes the PyPy
+  build dependency and restores the CPython shebangs and runtime dependency.
+- **Arch derivatives:** build with `LOKI_PYTHON=python`. Arch Extra itself defaults
+  to PyPy. Only `python` and `pypy3` are accepted values.
+
+If PyPy is explicitly selected but unavailable or incompatible, fix the target's
+build configuration to select CPython rather than downloading an interpreter or
+shipping a broken PyPy shebang.
 
 ## Checks
 

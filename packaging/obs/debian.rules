@@ -2,5 +2,20 @@
 export PYBUILD_NAME=loki-agent
 export PYBUILD_SYSTEM=pyproject
 
+# Debian's PyPy deb_system scheme shares /usr/lib/python3/dist-packages.
+# Keep the normal CPython wheel build/install and let dh_python3 generate the
+# selected runtime's shebangs. Its bytecode/debhelper dependencies still apply.
+ifneq (,$(filter cpython,$(DEB_BUILD_PROFILES)))
+LOKI_SHEBANG = /usr/bin/python3
+LOKI_RUNTIME = python3
+else
+LOKI_SHEBANG = /usr/bin/pypy3
+LOKI_RUNTIME = pypy3 (>= 7.3.19)
+endif
+
 %:
 	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_python3:
+	dh_python3 --shebang=$(LOKI_SHEBANG)
+	printf 'loki:Runtime=%s\n' '$(LOKI_RUNTIME)' >> debian/loki.substvars
