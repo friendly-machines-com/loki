@@ -1049,7 +1049,7 @@ async def run_session_picker_async(session):
         try:
             return await savefiles.run_session_picker_async(
                 input_fn=modal.prompt,
-                chat_log_dir=_core.CHAT_LOG_DIR,
+                chat_log_dir=_core.chat_log_directory(),
                 text_writer=terminal.write_text)
         finally:
             # Also restore after interruption/failure, while this modal still
@@ -1384,6 +1384,8 @@ async def async_main(args, configuration: settings.Settings) -> int:
 
     if shell_cwd is not None:
         try:
+            if not shell_cwd:
+                raise FileNotFoundError(shell_cwd)
             _core.change_shell_cwd(shell_cwd)
         except (FileNotFoundError, NotADirectoryError) as error:
             _print_repr_line(
@@ -1392,6 +1394,12 @@ async def async_main(args, configuration: settings.Settings) -> int:
                 file=sys.stderr,
             )
             return 2
+
+    # Bind history before the picker or saved-state restoration can change the
+    # tool cwd. The CLI workspace is a lookup key relative to the unchanged
+    # process cwd, not a path to canonicalize or a value to load from history.
+    if shell_cwd is not None:
+        current_session().workspace_cwd = shell_cwd
 
     if headless:
         try:

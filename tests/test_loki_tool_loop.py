@@ -4972,7 +4972,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     real_present(presenter, events)
                     rendered.append(output.getvalue()[start:])
 
-                with mock.patch.object(loki, 'CHAT_LOG_DIR', str(chat_dir)), \
+                with mock.patch.object(loki, 'chat_log_directory', return_value=str(chat_dir)), \
                         mock.patch.object(loki, 'CREDENTIALS', store), \
                         mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', loki.tool_runtime.ToolHookPipeline()), \
                         mock.patch.object(terminal_frontend, '_terminal_activity', terminal_frontend.TerminalActivityStatus()), \
@@ -5136,11 +5136,11 @@ class ChatLogPathTests(unittest.TestCase):
     def test_bare_resume_names_resolve_to_local_loki_chat_directory(self):
         self.assertEqual(
             loki.resolve_chat_log_path("abc"),
-            os.path.join(loki.CHAT_LOG_DIR, "chat-abc.json"),
+            os.path.join(loki.chat_log_directory(), "chat-abc.json"),
         )
         self.assertEqual(
             loki.resolve_chat_log_path("chat-abc.json"),
-            os.path.join(loki.CHAT_LOG_DIR, "chat-abc.json"),
+            os.path.join(loki.chat_log_directory(), "chat-abc.json"),
         )
 
     def test_path_like_resume_arguments_stay_explicit(self):
@@ -5161,8 +5161,8 @@ class SessionPickerTests(unittest.TestCase):
     """Tests for the `--resume` (no arg) session picker.
 
     Drives run_session_picker_async by monkeypatching get_input_async to feed a
-    scripted sequence of inputs, with CHAT_LOG_DIR pointed at a tempdir of
-    synthetic chat logs.
+    scripted sequence of inputs, with the history-directory fixture selecting
+    synthetic chat logs independently of the host process cwd.
     """
 
     def _write_chat(self, dirpath, chat_id, text, mtime=None):
@@ -5230,7 +5230,7 @@ class SessionPickerTests(unittest.TestCase):
                 terminals._TerminalTextOutput.write_text(
                     self, text, multiline=multiline, file=file)
 
-        with mock.patch.object(loki, 'CHAT_LOG_DIR', dirpath), \
+        with mock.patch.object(loki, 'chat_log_directory', return_value=dirpath), \
                 mock.patch.object(terminal_frontend, 'terminal', _FakeTerminal()):
             yield session
 

@@ -684,6 +684,8 @@ class Worker:
         self.protocol_version = version
         self.can_ask_user = params.get('formElicitation') is True
         self.can_report_compaction = version == 2 or params.get('compaction') is True
+        # Workspace ownership comes from this admission, never restored metadata.
+        self.session.workspace_cwd = cwd
         saved_descriptor = None
         connection_update = _UNCHANGED
         if open_method != "session/new":

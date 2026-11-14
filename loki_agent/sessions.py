@@ -50,6 +50,12 @@ class Session:
     # cwd never changes; subprocesses get an explicit cwd= argument.
     shell_cwd: str = ""
     previous_shell_cwd: str = ""
+    # History belongs to the frontend's initially selected workspace, not the
+    # fixed process cwd or the mutable tool cwd. The terminal binds this at
+    # startup and ACP at session admission. /cd and saved shell_cwd never move
+    # it. It is runtime ownership, not authority loaded from saved JSON; explicit
+    # log pathnames still select that exact file. No derived directory cache.
+    workspace_cwd: str = field(default="", kw_only=True)
 
     # RuntimeConfig, or None before startup config is applied.
     runtime_config: Any = None
@@ -123,6 +129,8 @@ class Session:
             self.shell_cwd = os.getcwd()
         if not self.previous_shell_cwd:
             self.previous_shell_cwd = self.shell_cwd
+        if not self.workspace_cwd:
+            self.workspace_cwd = self.shell_cwd
 
     @property
     def active(self):

@@ -528,10 +528,9 @@ LOKI_CONFIG_DIR_NAME = paths.LOKI_CONFIG_DIR_NAME
 LOKI_CONFIG_DIR = paths.loki_config_dir()
 LOKI_STATE_DIR = paths.loki_state_dir()
 LOKI_JOB_STATE_DIR = os.path.join(LOKI_STATE_DIR, "jobs")
+# Lookup context for operation pathnames (including PreCompact's chat_log_path),
+# not the workspace or the location of conversation storage.
 STARTUP_CWD = os.getcwd()
-
-
-CHAT_LOG_DIR = paths.chat_log_dir_for(STARTUP_CWD)
 
 
 CREDENTIALS: CredentialStore | CredentialInventory | None = None
@@ -2735,13 +2734,21 @@ def chat_log_filename(chat_id: str) -> str:
     return savefiles.chat_log_filename(chat_id)
 
 
+def chat_log_directory() -> str:
+    # Terminal allocation, picker and saved-ID lookup share this one derivation.
+    # The former import-time process-cwd constant was unrelated to the selected
+    # workspace on Windows. Derive from its session owner, never saved metadata
+    # or current shell_cwd; keep the supplied workspace lookup key unchanged.
+    return paths.chat_log_dir_for(current_session().workspace_cwd)
+
+
 def new_chat_log_path() -> str:
-    return savefiles.new_chat_log_path(CHAT_LOG_DIR)
+    return savefiles.new_chat_log_path(chat_log_directory())
 
 
 def resolve_chat_log_path(resume_arg: str) -> str:
     return savefiles.resolve_chat_log_path(
-        resume_arg, STARTUP_CWD, CHAT_LOG_DIR, _resolve_path)
+        resume_arg, STARTUP_CWD, chat_log_directory(), _resolve_path)
 
 
 def new_chat_log(filename):

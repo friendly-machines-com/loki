@@ -28,8 +28,10 @@ isolation, and follow the steps inside it. Do not give that VM writable access t
 your host's home directory or unrelated projects. Loki does not create the VM for
 you. A suitably configured container is another option, but not as secure as a VM.
 
-On Windows, Loki uses an AppContainer instead; follow
-[Windows installation](#windows-installation) before continuing with step 2.
+On Windows, Loki uses an AppContainer instead. Read
+[Windows installation](#windows-installation), including its
+[controlled process-directory rules](#windows-process-directory-and-history),
+before continuing with the terminal walkthrough.
 
 ### 1. Get Loki
 
@@ -123,9 +125,10 @@ into the conversation or commit it to a file in your project.
 
 ### 3. Open a project and select a model
 
-Create a demo directory **outside the Loki checkout**, then start Loki there.
-The startup directory is the workspace for saved conversations. Later, use your
-real project directory instead.
+Create a demo directory **outside the Loki checkout**. The POSIX example starts
+Loki there. On Windows, keep Loki's process cwd in the protected installation
+and pass the project separately as `--shell-cwd`. Later, substitute your real
+project for the demo directory.
 
 **In Bash:**
 
@@ -140,12 +143,15 @@ cd "$HOME/projects/loki-demo"
 ```powershell
 New-Item -ItemType Directory -Force "$HOME\projects\loki-demo" | Out-Null
 & "$HOME\src\loki\dist\loki-setup\loki-setup.exe" --configure "$HOME\projects\loki-demo"
-Set-Location "$HOME\projects\loki-demo"
-& $LOKI
+Set-Location "$HOME\src\loki\dist\loki"
+& $LOKI --shell-cwd "$HOME\projects\loki-demo"
 ```
 
 The PowerShell setup command configures **this project**, not the Loki
-installation. Configure each new Windows workspace before opening it.
+installation. Configure each new Windows workspace before opening it. The launch
+must retain the protected process cwd; do not replace it with the project path.
+The initial project selection owns history under that project's `.loki/chats`;
+changing `/cd` later does not move it.
 
 You are now typing **inside Loki**, not in your shell. Enter:
 
@@ -190,9 +196,15 @@ enter `/quit` to return to your shell. You can then check the result yourself:
 bash hello.sh
 ```
 
-The same command works in PowerShell when `bash.exe` is on `PATH`. It should
-print `Hello from Loki`. If it does not, reopen the conversation and give Loki
-the actual error rather than starting over without that evidence.
+In PowerShell, your shell remains in the protected launch directory, so use the
+script's project pathname instead:
+
+```powershell
+bash "$HOME\projects\loki-demo\hello.sh"
+```
+
+It should print `Hello from Loki`. If it does not, reopen the conversation and
+give Loki the actual error rather than starting over without that evidence.
 
 In a Git project, review `git status --short` and `git diff` after a task. New,
 untracked files appear in `git status` but not in ordinary `git diff`; open
@@ -200,7 +212,9 @@ those files too. The empty demo folder need not be a Git repository.
 
 ### 5. Return to the conversation
 
-From the **same project directory**, reopen its saved-chat picker.
+On POSIX, reopen the saved-chat picker from the **same project directory**.
+On Windows, retain the controlled process cwd instead; pass the tool directory
+as a parameter, as below.
 
 **In Bash:**
 
@@ -211,8 +225,14 @@ From the **same project directory**, reopen its saved-chat picker.
 **In PowerShell:**
 
 ```powershell
-& $LOKI resume
+Set-Location "$HOME\src\loki\dist\loki"
+& $LOKI --shell-cwd "$HOME\projects\loki-demo" --resume
 ```
+
+The Windows command uses `--resume`, not the POSIX positional `resume` form.
+Its picker reads the selected workspace's `.loki/chats`, independently of
+Loki's process cwd. For an existing log elsewhere, use `-r` with its full
+pathname; see [saved conversations](#saved-conversations).
 
 Choose the conversation by number. Supply API-key variables again when starting
 from a new shell; subscription login is stored separately. A saved connection
@@ -249,6 +269,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onedir --console --name loki-acp loki-acp
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean loki-setup.spec
 $LOKI = "$HOME\src\loki\dist\loki\loki.exe"
+Set-Location "$HOME\src\loki\dist\loki"
 ```
 
 These are the executable bundles built by the Windows CI workflow. Stop and fix
@@ -257,8 +278,27 @@ any build error before continuing. Keep the complete `dist\loki`,
 files; copying just the `.exe` files is insufficient. If you already have these
 built bundles, use their actual locations instead of rebuilding.
 
-Return to [step 2: connect an AI account](#2-connect-an-ai-account), then
-configure the demo workspace as shown in step 3.
+### Windows process directory and history
+
+Loki's Windows process cwd is a fixed, trusted launch location, not a project
+selector. Keep it in the protected deployment directory, outside locations the
+agent can modify. This includes the terminal runtime, ACP front/worker and helper
+processes. Windows relative-file, DLL and executable lookup must not acquire a
+model-writable search location through a user or model project request.
+
+The terminal's initial `--shell-cwd` selects the **workspace** and initial tool
+directory. ACP selects its workspace at session admission. History belongs to
+that workspace's `.loki/chats`, not to the deployment or process cwd. A later
+`/cd` changes only the logical directory for tools; neither it nor a restored
+chat's saved tool cwd relocates the workspace's history.
+
+Ordinary tool subprocesses may run in the requested project directory without
+moving Loki's agent process. The PowerShell examples keep `dist\loki` as the
+controlled launch directory and pass the project with `--shell-cwd`. Do not make
+the bundle writable or change the process cwd to select another project.
+
+Return to [step 2: connect an AI account](#2-connect-an-ai-account), then configure
+the workspace as shown in step 3.
 
 To check an existing workspace or edit its grants, use its actual directory:
 
@@ -345,9 +385,12 @@ run `"$LOKI" --help` in Bash or `& $LOKI --help` in PowerShell.
 - `/model` selects a connection/model; switching does not discard the chat.
 - `/todo` displays the current task list, including while the agent works.
 
-The launcher's `--shell-cwd DIR` option sets the initial tool directory without
-moving Loki's process cwd. Use the project-directory launch from the walkthrough
-when you want that project's saved-chat location.
+The launcher's `--shell-cwd DIR` option sets the initial logical tool directory;
+`/cd` updates that same kind of parameter. Neither changes Loki's OS process cwd.
+Loki runtimes, workers and helpers retain the controlled process cwd, while an
+ordinary tool subprocess can be launched with the requested project directory.
+Keep the Windows launch rules separate from the POSIX walkthrough; see
+[Windows process directory and history](#windows-process-directory-and-history).
 
 Most successful Bash stdout, Read file bodies, and loaded Skill instructions
 are hidden from automatic terminal display by default, but the model still
@@ -429,14 +472,31 @@ editor input queueing also depends on the client.
 
 ### Saved conversations
 
-Loki saves conversation history under the startup workspace's `.loki/chats`.
-The logs also retain the selected model, connection settings, and other session
-state, **not credential values**. They can still contain sensitive project data.
+Both frontends save and list chats under the selected workspace's `.loki/chats`.
+The terminal captures that workspace from its initial `--shell-cwd` argument, or
+its initial directory when the option is absent. ACP uses the workspace supplied
+when opening the session. Later `/cd` changes and restored tool directories do
+not relocate history. On Windows, select the project with `--shell-cwd` while
+retaining the [controlled process cwd](#windows-process-directory-and-history).
 
-From the original workspace, use `"$LOKI" resume` to choose a chat. You can also
-pass `resume LOG` to open a specific saved ID or log pathname; `--resume` and
-`-r` are supported alternatives. Quote pathnames containing spaces. In
-PowerShell, invoke the executable with `& $LOKI` instead of `"$LOKI"`.
+Logs retain the selected model, connection settings and other session state,
+**not credential values**. They can still contain sensitive project data.
+
+On POSIX, use `"$LOKI" resume` from the original startup directory for the picker,
+or `resume LOG` for a particular chat. On Windows, retain the protected launch
+directory and use `--resume` for the picker, as in the walkthrough; positional
+`resume` is rejected by its launch gate.
+
+If you selected a workspace with `--shell-cwd`, supply it again for the picker
+or saved-ID lookup. For a known existing log, use `-r LOG` (or `--resume=LOG`).
+Here `LOG` must be replaced with the actual pathname, not typed literally. For example, in
+PowerShell, substitute the actual log filename for `chat-ID.json`:
+
+```powershell
+& $LOKI --shell-cwd "$HOME\projects\loki-demo" -r "$HOME\projects\loki-demo\.loki\chats\chat-ID.json"
+```
+
+This does not change the process cwd. Quote pathnames containing spaces.
 
 Supply the connection's credentials again when necessary. Loki asks before
 using saved endpoints; missing credentials do not erase the saved connection.
@@ -462,11 +522,17 @@ already-running editor. Supply API-key environment variables before starting
 the editor/agent, or log in with the same user configuration directory for a
 subscription connection. Restart the ACP agent after changing startup settings.
 
+On Windows, the client must launch `loki-acp.exe` from a fixed, protected process
+directory, not from the project's writable directory. Pass the project as ACP
+session data instead. An absolute executable pathname alone does not fix its
+process cwd. A client configuration must preserve this distinction; do not infer
+a safe Windows setup by replacing the executable in a POSIX example.
+
 ### Emacs with agent-shell
 
 Install [agent-shell](https://github.com/xenodium/agent-shell#installation) and
-its dependencies, then add a custom agent configuration. This example uses the
-agent-shell/acp.el APIs present in this checkout and assumes the default
+its dependencies, then add a custom agent configuration. This POSIX example
+uses the agent-shell/acp.el APIs present in this checkout and assumes the default
 list-valued `agent-shell-agent-configs`:
 
 ```elisp
@@ -489,8 +555,9 @@ list-valued `agent-shell-agent-configs`:
      (agent-shell-make-environment-variables :inherit-env t)))))
 ```
 
-Replace the command with the **absolute path** to your checkout's `loki-acp`, or
-the built Windows `loki-acp.exe`. Do not leave `YOU` or use an unexpanded `~`.
+Replace the command with the **absolute path** to your POSIX checkout's
+`loki-acp`. Do not leave `YOU` or use an unexpanded `~`. This snippet does not
+establish the separately controlled server process cwd required on Windows.
 If you customize agent-shell's configuration through a function, return this
 configuration from that function rather than applying `add-to-list` to it.
 
