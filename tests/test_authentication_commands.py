@@ -1,12 +1,12 @@
 import asyncio
 import base64
 import hashlib
+import http.client
 import json
 import logging
 import threading
 import time
 import urllib.parse
-import urllib.request
 import contextlib
 import io
 import os
@@ -32,7 +32,7 @@ from test_oauth_logins import jwt, response
 
 @contextlib.contextmanager
 def separate_asyncio_diagnostics():
-    """Keep reactor diagnostics visible, separate from auth command stderr."""
+    """Keep reactor diagnostics visible, separate from application stderr."""
     logger = logging.getLogger('asyncio')
     handler = logging.StreamHandler(sys.__stderr__)
     previous = logger.propagate
@@ -77,7 +77,11 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(command.getvalue(), 'command error\n')
 
     async def test_browser_command_through_durable_subscription_lifecycle(self):
-        await self._subscription_workflow(device=False)
+        # The callback is real loopback HTTP; system CA loading is not part of
+        # this browser/OAuth journey, even on a host with certificates installed.
+        with mock.patch('ssl.SSLContext.load_default_certs', side_effect=AssertionError(
+                'loopback callback must not load system certificates')):
+            await self._subscription_workflow(device=False)
 
     async def test_device_command_through_durable_subscription_lifecycle(self):
         await self._subscription_workflow(device=True)
@@ -111,10 +115,18 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
                     "originator": authentications.OPENAI_ORIGINATOR}.items():
                 self.assertEqual(query[key], [value])
             self.assertIsNone(self.storage.load_openai_subscription())
-            target = query["redirect_uri"][0] + "?" + urllib.parse.urlencode({
+            redirect = urllib.parse.urlsplit(query["redirect_uri"][0])
+            self.assertEqual(redirect.scheme, 'http')
+            self.assertIn(redirect.hostname, ['localhost', '127.0.0.1'])
+            target = redirect.path + "?" + urllib.parse.urlencode({
                 "code": "authorization-secret", "state": query["state"][0]})
-            with urllib.request.urlopen(target) as answer:
-                callback_answers.append((answer.status, answer.read()))
+            # Keep the real callback exchange without urllib's default opener,
+            # which eagerly creates an HTTPS handler even for plain HTTP URLs.
+            with contextlib.closing(http.client.HTTPConnection(
+                    redirect.hostname, redirect.port)) as connection:
+                connection.request('GET', target)
+                with connection.getresponse() as answer:
+                    callback_answers.append((answer.status, answer.read()))
             return True
 
         async def request(method, url, **kwargs):
