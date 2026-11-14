@@ -4136,9 +4136,8 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
                 loki.apply_runtime_config(provider_config('A', protocols.OPENAI_RESPONSES))
                 loki.new_chat_log(path)
-                malformed_path = os.path.join(directory, '[source.txt](http://source.txt)')
                 await turn('A', protocols.OPENAI_RESPONSES, [
-                    ('a-read', 'Read', {'file_path': malformed_path}),
+                    ('a-read', 'Read', {'file_path': str(source)}),
                     ('a-search', 'WebSearch', {'query': 'loki', 'allowed_domains': '["example.com"]', 'blocked_domains': None}),
                 ], 'read and search', private=True)
                 self.assertEqual(dispatched[0], ('Read', {'file_path': str(source)}))
@@ -4152,7 +4151,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(source.read_text(), 'marker original\n')
                 await turn('B', protocols.OPENAI_RESPONSES, [
                     ('b-grep', 'Grep', {'pattern': 'marker', 'path': str(source), 'output_mode': 'content'}),
-                    ('b-write', 'Write', {'file_path': os.path.join(directory, '[notes.md](http://notes.md)'), 'content': '[notes.md](http://notes.md)'}),
+                    ('b-write', 'Write', {'file_path': str(notes), 'content': '[notes.md](http://notes.md)'}),
                 ], 'switch and write', private=True)
                 self.assertEqual(notes.read_text(), '[notes.md](http://notes.md)')
                 self.assertIn('marker original', outcomes['b-grep'])
@@ -4271,14 +4270,15 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(metadata['changed_paths'], [str(source)])
                     event_pairs = [(event['type'], event['call_id']) for event in events
                                    if event['type'] in ['tool_input_repaired', 'tool_call']]
-                    repaired_ids = {'a-read', 'a-search', 'b-write', 'chat-search', 'anthropic-search', 'c-search', 'off-search'}
+                    repaired_ids = {'a-search', 'chat-search', 'anthropic-search', 'c-search', 'off-search'}
                     self.assertEqual(event_pairs, [
                         (event_type, cid) for cid in originals
                         for event_type in (['tool_input_repaired', 'tool_call'] if cid in repaired_ids else ['tool_call'])])
                     self.assertTrue(all(event['cwd'] == directory for event in events if event['type'] == 'tool_call'))
                     repairs = {item['call_id']: item.get('execution', {}).get('adjustments', [])
                                for item in persisted if item.get('type') == 'tool_result'}
-                    self.assertEqual([r['rule'] for r in repairs['a-read']], ['path_markdown_autolink'])
+                    self.assertEqual(repairs['a-read'], [])
+                    self.assertEqual(repairs['b-write'], [])
                     self.assertEqual([r['rule'] for r in repairs['a-search'][:2]], ['json_encoded_array', 'optional_null_omission'])
                     for cid in ['chat-search', 'anthropic-search', 'c-search', 'off-search']:
                         self.assertEqual(repairs[cid][0]['rule'],

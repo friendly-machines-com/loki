@@ -4,7 +4,6 @@ import copy
 import inspect
 import json
 import os
-import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -29,9 +28,6 @@ SCHEMA_VALIDATION_KEYS = {
 }
 SCHEMA_ALLOWED_KEYS = SCHEMA_ANNOTATION_KEYS | SCHEMA_VALIDATION_KEYS
 
-FILESYSTEM_PATH = "filesystem_path"
-_PATH_AUTOLINK = re.compile(
-    r"\[(?P<label>[^\[\]\r\n/]+)\]\(https?://(?P=label)\)")
 _UNSET = object()
 
 
@@ -296,38 +292,6 @@ def _remove_at(value, path):
     del parent[path[-1]]
 
 
-def _semantic_issues(value, semantics):
-    issues = []
-    for raw_path, semantic in (semantics or {}).items():
-        path = list(raw_path)
-        if semantic != FILESYSTEM_PATH:
-            raise ToolSchemaError(
-                f"unsupported argument semantic {semantic!r} at "
-                f"{format_path(path)}")
-        try:
-            current = _value_at(value, path)
-        except (KeyError, IndexError, TypeError):
-            continue
-        if (isinstance(current, str)
-                and _PATH_AUTOLINK.search(current) is not None):
-            issues.append(ValidationIssue(
-                path,
-                "path_markdown_autolink",
-                f"{format_path(path)} contains a Markdown auto-link where "
-                "a plain filesystem path is required",
-                expected="plain filesystem path",
-                actual_type="string",
-            ))
-    return issues
-
-
-def validate_tool_input(schema, value, semantics=None):
-    issues = validate_schema(schema, value)
-    if not issues:
-        issues.extend(_semantic_issues(value, semantics))
-    return issues
-
-
 @dataclass
 class ToolAdjustment:
     hook: str
@@ -362,11 +326,10 @@ def _array_item_accepts(schema, value):
     return item_schema is None or not validate_schema(item_schema, value)
 
 
-def repair_tool_input(schema, value, semantics=None,
-                      hook_id="loki.input-repair") -> RepairResult:
+def repair_tool_input(schema, value, hook_id="loki.input-repair") -> RepairResult:
     effective = copy.deepcopy(value)
     adjustments = []
-    issues = validate_tool_input(schema, effective, semantics)
+    issues = validate_schema(schema, effective)
     if not issues:
         return RepairResult(effective, [], [])
 
@@ -378,21 +341,6 @@ def repair_tool_input(schema, value, semantics=None,
             except (KeyError, IndexError, TypeError):
                 continue
             field_schema = _schema_at(schema, issue.path)
-            if issue.code == "path_markdown_autolink":
-                replacement = _PATH_AUTOLINK.sub(
-                    lambda match: match.group("label"), current)
-                if replacement != current:
-                    effective = _replace_at(
-                        effective, issue.path, replacement)
-                    adjustments.append(ToolAdjustment(
-                        hook_id,
-                        "path_markdown_autolink",
-                        issue.path,
-                        "replace",
-                        replacement,
-                    ))
-                    changed = True
-                continue
             if issue.code != "type":
                 continue
             expected_types = _expected_types(field_schema, issue.path)
@@ -440,7 +388,7 @@ def repair_tool_input(schema, value, semantics=None,
                     replacement,
                 ))
                 changed = True
-        new_issues = validate_tool_input(schema, effective, semantics)
+        new_issues = validate_schema(schema, effective)
         if not new_issues:
             return RepairResult(effective, [], adjustments)
         if not changed:
@@ -503,7 +451,6 @@ class ToolInvocation:
     original_arguments: object
     effective_arguments: object
     schema: dict
-    semantics: dict = field(default_factory=dict)
     cwd: str | None = None
     model: str | None = None
     provider: str | None = None
@@ -738,10 +685,9 @@ class ToolHookPipeline:
                     before, after, registered.hook_id))
                 invocation.effective_arguments = after
                 invocation.parse_error = None
-                invocation.validation_issues = validate_tool_input(
+                invocation.validation_issues = validate_schema(
                     invocation.schema,
                     invocation.effective_arguments,
-                    invocation.semantics,
                 )
             invocation.hook_records.append(HookRecord(
                 registered.hook_id, phase, "ok"))
@@ -765,7 +711,6 @@ class ToolHookPipeline:
             repaired = repair_tool_input(
                 invocation.schema,
                 invocation.effective_arguments,
-                invocation.semantics,
             )
             invocation.effective_arguments = repaired.value
             invocation.adjustments.extend(repaired.adjustments)
@@ -788,10 +733,9 @@ class ToolHookPipeline:
                 return invocation
 
         if invocation.parse_error is None:
-            invocation.validation_issues = validate_tool_input(
+            invocation.validation_issues = validate_schema(
                 invocation.schema,
                 invocation.effective_arguments,
-                invocation.semantics,
             )
         if invocation.validation_issues:
             return invocation
@@ -1126,8 +1070,6 @@ def adjustment_summary(adjustment):
             f"{path}: replaced empty object placeholder with an empty array",
         "bare_string_array":
             f"{path}: wrapped a bare string as a one-item array",
-        "path_markdown_autolink":
-            f"{path}: unwrapped a degenerate Markdown path auto-link",
         "custom_hook":
             f"{path}: changed by hook {adjustment.hook!r}",
     }

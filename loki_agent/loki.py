@@ -819,8 +819,6 @@ def _build_tool_registry(tools: list, handlers: dict) -> dict:
             "definition": tool,
             "tool_kind": tool_kind,
             "schema": parameters,
-            "semantics": copy.deepcopy(
-                handler.get("semantics", {})),
             "handler": sync_handler,
             "async_handler": async_handler,
             "explore": handler.get("explore", False),
@@ -1367,7 +1365,6 @@ async def execute_tool_call_async(
         original_arguments=copy.deepcopy(original_args),
         effective_arguments=copy.deepcopy(original_args),
         schema=spec["schema"],
-        semantics=spec.get("semantics", {}),
         cwd=current_shell_cwd(),
         model=current_model() or None,
         provider=_runtime_provider_label(),
@@ -2367,22 +2364,9 @@ TOOL_HANDLERS = {
     "Read": {
         "handler": _handle_read,
         "explore": True,
-        "semantics": {
-            ("file_path",): tool_runtime.FILESYSTEM_PATH,
-        },
     },
-    "Write": {
-        "handler": _handle_write,
-        "semantics": {
-            ("file_path",): tool_runtime.FILESYSTEM_PATH,
-        },
-    },
-    "Edit": {
-        "handler": _handle_edit,
-        "semantics": {
-            ("file_path",): tool_runtime.FILESYSTEM_PATH,
-        },
-    },
+    "Write": {"handler": _handle_write},
+    "Edit": {"handler": _handle_edit},
     "Bash": {"async_handler": _handle_bash_async},
     "Jobs": {"handler": _handle_jobs, "explore": True},
     "JobStatus": {"handler": _handle_job_status, "explore": True},
@@ -2390,16 +2374,10 @@ TOOL_HANDLERS = {
     "Glob": {
         "async_handler": _handle_glob_async,
         "explore": True,
-        "semantics": {
-            ("path",): tool_runtime.FILESYSTEM_PATH,
-        },
     },
     "Grep": {
         "async_handler": _handle_grep_async,
         "explore": True,
-        "semantics": {
-            ("path",): tool_runtime.FILESYSTEM_PATH,
-        },
     },
     "TodoRead": {"handler": _handle_todoread, "explore": True},
     "TodoWrite": {"handler": _handle_todowrite, "plan": True},

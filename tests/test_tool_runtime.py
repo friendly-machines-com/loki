@@ -172,9 +172,9 @@ class StructuredValidationTests(unittest.TestCase):
 
 
 class InputRepairTests(unittest.TestCase):
-    def repair(self, value, semantics=None):
+    def repair(self, value):
         return tool_runtime.repair_tool_input(
-            ARRAY_SCHEMA, value, semantics)
+            ARRAY_SCHEMA, value)
 
     def test_optional_null_is_omitted(self):
         result = self.repair({
@@ -246,36 +246,28 @@ class InputRepairTests(unittest.TestCase):
             [(["values", 1], "type")],
         )
 
-    def test_degenerate_markdown_path_component_is_unwrapped(self):
+    def test_filename_is_unchanged_when_another_argument_is_repaired(self):
         schema = {
             "type": "object",
-            "properties": {"file_path": {"type": "string"}},
+            "properties": {
+                "file_path": {"type": "string"},
+                "optional": {"type": "string"},
+            },
             "required": ["file_path"],
             "additionalProperties": False,
         }
-        original = {
-            "file_path":
-                "/tmp/project/[notes.md](http://notes.md)",
-        }
+        path = "/tmp/project/[notes.md](http://notes.md)"
+        original = {"file_path": path, "optional": None}
 
-        result = tool_runtime.repair_tool_input(
-            schema,
-            original,
-            {("file_path",): tool_runtime.FILESYSTEM_PATH},
-        )
+        result = tool_runtime.repair_tool_input(schema, original)
 
-        self.assertEqual(
-            result.value["file_path"],
-            "/tmp/project/notes.md",
-        )
+        self.assertEqual(result.value, {"file_path": path})
+        self.assertEqual(result.issues, [])
         self.assertEqual(
             [item.rule for item in result.adjustments],
-            ["path_markdown_autolink"],
+            ["optional_null_omission"],
         )
-        self.assertEqual(
-            original["file_path"],
-            "/tmp/project/[notes.md](http://notes.md)",
-        )
+        self.assertEqual(original, {"file_path": path, "optional": None})
 
     def test_real_markdown_link_and_non_path_strings_are_untouched(self):
         schema = {
@@ -292,13 +284,10 @@ class InputRepairTests(unittest.TestCase):
             "content": "[notes.md](http://notes.md)",
         }
 
-        result = tool_runtime.repair_tool_input(
-            schema,
-            original,
-            {("file_path",): tool_runtime.FILESYSTEM_PATH},
-        )
+        result = tool_runtime.repair_tool_input(schema, original)
 
         self.assertEqual(result.value, original)
+        self.assertEqual(result.issues, [])
         self.assertEqual(result.adjustments, [])
 
     def test_successful_repairs_are_valid_idempotent_and_nonmutating(self):
@@ -923,6 +912,32 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
                         else tool_runtime.ToolHookPipeline()),
                 ))
         return result, execution, dispatched, events
+
+    def test_tool_paths_are_not_autocorrected(self):
+        paths = [
+            "/tmp/project/[notes.md](http://notes.md)",
+            "/tmp/project/[notes.md](https://notes.md)",
+            r"C:\project\[notes.md](http://notes.md)",
+            r"\\server\share\[notes.md](https://notes.md)",
+            "./[notes.md](http://notes.md)/",
+        ]
+        for path in paths:
+            for name, arguments in [
+                ["Read", {"file_path": path}],
+                ["Write", {"file_path": path, "content": "literal content"}],
+                ["Edit", {"file_path": path, "old_string": "old", "new_string": "new"}],
+                ["Glob", {"path": path, "pattern": "*"}],
+                ["Grep", {"path": path, "pattern": "notes"}],
+            ]:
+                with self.subTest(tool=name, path=path):
+                    call = formats.tool_call_item("call_path", name, arguments)
+                    result, execution, dispatched, events = self.execute_with_fake_dispatch(call)
+
+                    self.assertTrue(result["ok"], result)
+                    self.assertEqual(dispatched, [(name, arguments)])
+                    self.assertEqual(formats.tool_call_input(call), arguments)
+                    self.assertEqual((execution or {}).get("adjustments", []), [])
+                    self.assertNotIn("tool_input_repaired", [event["type"] for event in events])
 
     def test_custom_tool_executes_with_opaque_string_input(self):
         received = []
