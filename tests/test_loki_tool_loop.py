@@ -4851,7 +4851,9 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
 class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
     async def test_generated_chats_pick_render_resume_and_continue(self):
         from datetime import datetime
+        import logging
         import uuid
+        from test_authentication_commands import separate_asyncio_diagnostics
 
         for selected_index in [2, 3]:
             async with contextlib.AsyncExitStack() as job_scope:
@@ -4962,6 +4964,10 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                 real_present = terminal_frontend._ResumeTranscriptPresenter.write
 
                 def observe_present(presenter, events):
+                    # Exercise diagnostic separation without relying on a slow
+                    # callback happening to exceed asyncio's debug threshold.
+                    logging.getLogger('asyncio').warning(
+                        'synthetic reactor diagnostic during picker replay')
                     self.assertEqual(terminal_calls[-3:], [
                         ('goto_position', 1, 1), ('clear_to_end_of_screen',), ('flush',)])
                     self.assertTrue(input_session.active)
@@ -4981,6 +4987,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                         mock.patch.object(terminals, 'redraw_status_bar'), \
                         mock.patch.object(terminals, 'open_terminal_stdin'), \
                         mock.patch.object(terminal_frontend, 'restore_output_area_after_input'), \
+                        separate_asyncio_diagnostics(), \
                         contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                     # Creation order differs from mtime order, so creation-order picking cannot pass.
                     for label in ['newest', 'oldest', 'middle']:
