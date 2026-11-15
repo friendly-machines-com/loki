@@ -14,16 +14,21 @@ The project has no Python runtime dependencies.
    `debian.rules`, and include `loki.changes` so OBS can populate RPM changelog
    metadata. Run `osc addremove` and `osc commit`.
 3. Run the source service using `osc service remoterun` (or **Run services** in
-   the web UI), then wait for it to finish. OBS needs the `obs_scm`, `tar`,
+   the web UI), then wait for it to finish. OBS needs the `tar_scm`,
    `recompress`, and `set_version` source services on the source server, not in
    each distribution's build repository. For local builds, download the generated
    files with `osc update -S` after the remote services have finished.
 4. Add the desired distribution repositories in the project's **Repositories**
    tab. Package files do not configure repositories automatically.
 
-`_service` fetches the public upstream `master` branch and produces
-`loki-0.1.0.tar.gz`, with a `loki-0.1.0/` top-level directory. Tar creation,
-compression, and version substitution run server-side before distro builds.
+`_service` uses `tar_scm` to fetch the public upstream `master` branch and
+create a tarball directly, then `recompress` produces `loki-0.1.0.tar.gz`, with
+a `loki-0.1.0/` top-level directory. Tar creation, compression, and version
+substitution run server-side before distro builds. Although upstream recommends
+`obs_scm` plus build-time `tar`, those build-time helpers are not available in
+all configured target distributions. Running `tar` server-side instead failed
+on build.opensuse.org because `/usr/lib/obs/service/tar.service` was missing;
+this configuration avoids that separate service.
 The target build roots do not need `obs-service-tar`, `obs-service-recompress`,
 or `obs-service-set_version`. OBS strips service-output filename prefixes before
 invoking the distro build tools. For reproducible releases, change

@@ -1,5 +1,7 @@
 <services>
-  <service name="obs_scm">
+  <!-- tar_scm creates the tarball directly. The public OBS source-service
+       server does not provide the separate tar service used with obs_scm. -->
+  <service name="tar_scm">
     <param name="url">https://friendly-machines.com/git/loki.git</param>
     <param name="scm">git</param>
     <param name="revision">master</param>
@@ -10,7 +12,6 @@
   </service>
   <!-- Generate portable sources on the OBS server: service RPMs are not
        available in every target distribution's build repositories. -->
-  <service name="tar" mode="serveronly"/>
   <service name="recompress" mode="serveronly">
     <param name="file">*.tar</param>
     <param name="compression">gz</param>
