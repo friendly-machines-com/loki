@@ -128,8 +128,10 @@ check_imports() {
 check_imports %{loki_pypy_executable}
 %else
 %if 0%{?suse_version}
-# %%python_expand passed the flavor name instead of an existing interpreter.
-check_imports %{_bindir}/python%{python3_version}
+# %%python3_version probes the unversioned python3 binary, which SUSE build
+# roots do not install (only the versioned flavor binaries). %%__<flavor> is
+# the versioned executable that %%pyproject_wheel itself used.
+check_imports %__%{pythons}
 %else
 check_imports %{__python3}
 %endif

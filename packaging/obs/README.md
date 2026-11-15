@@ -164,9 +164,16 @@ Some resolver errors cannot be repaired by Loki's package recipes:
   `./build` on openSUSE, `./pyproject-wheeldir` inside the source directory on
   Mageia, and `../pyproject-wheeldir` beside it on Fedora. The spec's
   `%install` and `%check` therefore locate the wheel by globbing all three
-  locations instead of hardcoding one. SUSE's `%python_expand` passes the
-  flavor name (for example `python313`), which is not an executable; the
-  SUSE `%check` uses `%{_bindir}/python%{python3_version}` explicitly.
+  locations instead of hardcoding one. On SUSE, `%python_expand` passes the
+  flavor name (for example `python313`) and `%python3_version` probes the
+  unversioned `python3` binary that SLE build roots do not install; the SUSE
+  `%check` instead uses `%__%{pythons}`, the versioned executable that
+  `%pyproject_wheel` itself invoked.
+- **SLE 15.7 repository source:** the `15.7` repository must layer
+  `SUSE:SLE-15-SP7:Update` (the maintenance stream) rather than only
+  `SUSE:SLE-SP7:GA`: the published `python311-base` needs `libexpat1 >= 2.8.5`,
+  which exists only in the update stream. This matches how the official
+  `devel:languages:python:backports` project defines its own 15.7 repository.
 
 After uploading recipe changes, rerun the **remote** services before rebuilding.
 A published repository is not proof that this package's dependencies resolve.
