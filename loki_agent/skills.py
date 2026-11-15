@@ -53,17 +53,30 @@ def catalog(config_directory: str) -> dict:
 
 def available(config_directory: str) -> list[dict]:
     """Describe the same registered identifiers used by loading in either front."""
-    return [
-        {'name': name, 'description': description(path) or f'Skill: {name}'}
-        for name, (_directory, path) in catalog(config_directory).items()
-    ]
+    return [_describe(name, path) for name, (_directory, path) in catalog(config_directory).items()]
+
+
+def available_for_model(config_directory: str) -> list[dict]:
+    """Describe only the skills the model may discover and invoke on its own.
+
+    A frontmatter `disable-model-invocation: true` keeps the identifier in the
+    user fronts' catalogues while withholding it from the model, which then
+    cannot pick the skill unprompted. Loading still serves either front because
+    a user's slash command deliberately executes through the model.
+    """
+    return [_describe(name, path) for name, (_directory, path) in catalog(config_directory).items()
+            if not model_invocation_disabled(path)]
+
+
+def _describe(name, path):
+    return {'name': name, 'description': description(path) or f'Skill: {name}'}
 
 
 def tools_for_model(definitions: list, config_directory: str) -> list:
     """Attach catalogue data to Skill's description without changing permissions."""
     if not any(tool.get('function', {}).get('name') == 'Skill' for tool in definitions):
         return definitions
-    data = json.dumps(available(config_directory), ensure_ascii=True)
+    data = json.dumps(available_for_model(config_directory), ensure_ascii=True)
     described = []
     for tool in definitions:
         function = tool.get('function', {})
@@ -109,6 +122,30 @@ def read_text(path: str, limit: int, *, errors="strict") -> str:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def frontmatter(path: str) -> dict:
+    """Flat key/value pairs from the leading YAML header, best-effort."""
+    try:
+        head = read_text(path, _DESCRIPTION_CHARS, errors="replace")
+    except OSError:
+        return {}
+    lines = head.splitlines()
+    fields = {}
+    if lines and lines[0].strip() == "---":
+        for line in lines[1:]:
+            stripped = line.strip()
+            if stripped == "---":
+                break
+            key, separator, value = stripped.partition(":")
+            if separator:
+                fields[key.strip()] = value.strip().strip('"\'')
+    return fields
+
+
+def model_invocation_disabled(path: str) -> bool:
+    """Honour the frontmatter switch that hides a skill from the model alone."""
+    return frontmatter(path).get('disable-model-invocation', '').lower() == 'true'
 
 
 def description(path: str) -> str:

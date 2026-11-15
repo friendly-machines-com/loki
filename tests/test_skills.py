@@ -15,7 +15,7 @@ from process_lifecycle_fixtures import ProcessResources
 from test_acps import _ACPFrontFixture
 from test_pty_ui import _read_to_exit, _read_until, _SgrStreamTracker
 
-from loki_agent import connections, formats, loki, paths, pty_backend, terminal_frontend
+from loki_agent import connections, formats, loki, paths, pty_backend, skills, terminal_frontend
 from loki_agent.acp_worker import Worker
 from loki_agent.credentials import CredentialStore
 from loki_agent.sessions import Session
@@ -272,3 +272,59 @@ class SkillFrontendTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(results['load']['is_error'])
         self.assertTrue(results['write']['is_error'])
         self.assertEqual(os.listdir(self.workspace), [])
+
+
+class SkillModelInvocationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='loki-skill-invocation-')
+        self.addCleanup(temporary.cleanup)
+        self.config = os.path.join(temporary.name, 'config')
+        self.directory = os.path.join(self.config, 'skills', 'pack', 'inner')
+        os.makedirs(self.directory)
+        self.write_skill()
+
+    def write_skill(self, extra=''):
+        with open(os.path.join(self.directory, 'SKILL.md'), 'w', encoding='utf-8') as stream:
+            stream.write('---\ndescription: ' + _DESCRIPTION + '\n' + extra + '---\n' + _BODY)
+
+    @staticmethod
+    def names(catalogue):
+        return [entry['name'] for entry in catalogue]
+
+    def test_true_withholds_skill_from_model_catalogue_only(self):
+        """The front must keep advertising and loading what the model cannot discover."""
+        self.write_skill('disable-model-invocation: true\n')
+        self.assertEqual(self.names(skills.available(self.config)), [_NAME])
+        self.assertEqual(skills.available_for_model(self.config), [])
+        self.assertIn(_BODY, skills.load(self.config, _NAME))
+
+    def test_model_tool_description_and_offered_tools_omit_disabled_skill(self):
+        self.write_skill('disable-model-invocation: true\n')
+        definition = {'type': 'function', 'function': {
+            'name': 'Skill', 'description': 'Use skills.', 'parameters': {'type': 'object'}}}
+        described = skills.tools_for_model([definition], self.config)
+        self.assertNotIn(_NAME, described[0]['function']['description'])
+        self.assertNotIn(_DESCRIPTION, described[0]['function']['description'])
+        self.assertEqual(described[0]['function']['description'],
+                         'Use skills.\n\nAvailable skills (catalogue data):\n[]')
+        self.assertEqual(skills.tools_for_model(
+            [{'type': 'function', 'function': {'name': 'Read', 'description': 'r', 'parameters': {}}}],
+            self.config)[0]['function']['description'], 'r')
+        with mock.patch.object(loki, 'LOKI_CONFIG_DIR', self.config):
+            self.assertNotIn(_NAME, json.dumps(loki.offered_tools(allowed={'Skill'})))
+        self.write_skill()
+        with mock.patch.object(loki, 'LOKI_CONFIG_DIR', self.config):
+            self.assertIn(_NAME, json.dumps(loki.offered_tools(allowed={'Skill'})))
+
+    def test_only_true_disables_model_invocation(self):
+        for field, disabled in [('disable-model-invocation: true\n', True),
+                                ('disable-model-invocation: True\n', True),
+                                ('disable-model-invocation: "true"\n', True),
+                                ('disable-model-invocation: false\n', False),
+                                ('disable-model-invocation: yes\n', False),
+                                ('disable-model-invocation:\n', False)]:
+            with self.subTest(field=field):
+                self.write_skill(field)
+                self.assertEqual(
+                    skills.model_invocation_disabled(os.path.join(self.directory, 'SKILL.md')), disabled)
+                self.assertEqual(bool(skills.available_for_model(self.config)), not disabled)
