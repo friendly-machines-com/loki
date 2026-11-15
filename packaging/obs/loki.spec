@@ -128,10 +128,12 @@ check_imports() {
 check_imports %{loki_pypy_executable}
 %else
 %if 0%{?suse_version}
-# %%python3_version probes the unversioned python3 binary, which SUSE build
-# roots do not install (only the versioned flavor binaries). %%__<flavor> is
-# the versioned executable that %%pyproject_wheel itself used.
-check_imports %__%{pythons}
+# RPM expands macros in a single pass, so "%__%{pythons}" would stay literal.
+# %python3_version probes the unversioned python3 binary, which SUSE build
+# roots do not install; the flavor version macro probes the versioned
+# executable that %%pyproject_wheel itself used (same idiom as the sitelib
+# macro above).
+check_imports %{_bindir}/python%{%{pythons}_version}
 %else
 check_imports %{__python3}
 %endif
