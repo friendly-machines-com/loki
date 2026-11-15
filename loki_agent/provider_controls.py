@@ -13,6 +13,7 @@ the front-end, not here.
 
 from __future__ import annotations
 
+import datetime
 import json
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
@@ -74,20 +75,22 @@ class ControlSpec:
     destinations: Callable[[ControlContext], frozenset[str]] = lambda context: frozenset()
 
 
-def _registry() -> tuple[ControlSpec, ...]:
+def _registry() -> list[ControlSpec]:
     # Imported lazily so provider modules can import these types.
     from . import (
+        anthropic_controls,
         deepseek_controls,
         openai_controls,
         openrouter_controls,
         zai_controls,
     )
-    return (
+    return [
         *openai_controls.CONTROLS,
+        anthropic_controls.USAGE,
         *openrouter_controls.CONTROLS,
         *deepseek_controls.CONTROLS,
         *zai_controls.CONTROLS,
-    )
+    ]
 
 
 def available_controls(context: ControlContext) -> list[ControlSpec]:
@@ -194,15 +197,46 @@ async def authorized_request(context: ControlContext, spec, method, url, *,
 
 def json_document(response) -> object:
     """Parse a successful account response, or raise a user-facing error."""
-    if response.status >= 400:
-        raise OSError(
-            f"provider API returned HTTP {response.status} {response.reason}")
+    if not 200 <= response.status < 300:
+        # A redirect is not live account data, and the server's reason text
+        # must not reach the terminal unescaped.
+        raise OSError(f"provider API returned HTTP {response.status}")
     if response.truncated:
         raise OSError("provider response exceeds its size limit")
     try:
         return json.loads(response.body.decode("utf-8-sig"))
-    except (UnicodeDecodeError, ValueError) as error:
-        raise OSError(f"provider response is invalid: {error}") from error
+    except (ValueError, RecursionError) as error:
+        raise OSError("provider returned invalid account data") from error
+
+
+def account_time_utc(value) -> datetime.datetime | None:
+    """Share ISO timestamp parsing so reset and expiry displays agree on UTC."""
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value.strip())
+        if moment.tzinfo is None:
+            return moment.replace(tzinfo=datetime.timezone.utc)
+        return moment.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError):
+        # A valid-looking local date can still overflow when moved to UTC.
+        return None
+
+
+def relative_duration(seconds: float) -> str:
+    """Use the same units for account expiry and window reset countdowns."""
+    try:
+        seconds = max(0, int(seconds))
+    except (OverflowError, ValueError):
+        return "an unknown amount of time"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return f"{days} day{'' if days == 1 else 's'} {hours} hour{'' if hours == 1 else 's'}"
+    if hours:
+        return f"{hours} hour{'' if hours == 1 else 's'} {minutes} minute{'' if minutes == 1 else 's'}"
+    return f"{minutes} minute{'' if minutes == 1 else 's'}"
 
 
 def credential_spec(credential, *, scheme, authorized_urls=frozenset()):

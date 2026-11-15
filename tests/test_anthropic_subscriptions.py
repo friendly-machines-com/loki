@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from process_lifecycle_fixtures import observe_fixture, running_fixture_task
+from loki_agent import anthropic_controls
 from loki_agent import authentication_commands
 from loki_agent import authentications
 from loki_agent import connections
@@ -671,7 +672,7 @@ class AnthropicConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(models.provider_is_synthetic(after[provider_id]))
         self.assertNotIn(provider_id, anonymous)
 
-    async def test_selection_and_saved_connection_are_confined_to_messages(self):
+    async def test_selection_and_saved_connection_keep_separate_url_sets(self):
         raw_catalog = catalog_fixture()
         catalog = models.add_anthropic_subscription_catalog(raw_catalog)
         ref = authentications.CredentialRef.anthropic_subscription()
@@ -685,9 +686,12 @@ class AnthropicConnectionTests(unittest.IsolatedAsyncioTestCase):
         saved = connections.connection_descriptor_from_config(config).to_dict()
         restored = connections.config_from_connection_descriptor(connections.ConnectionDescriptor.from_dict(saved), inventory)
         for connection in [config, restored]:
-            # Adding a speculative discovery URL could prevent admission
-            # before the authorized chat endpoint is tried.
-            self.assertEqual(connection.credential_destinations(), [authentications.ANTHROPIC_MESSAGES_URL])
+            # Admission includes known account reads, not an unauthorized
+            # model-list route. Inference still owns only the Messages URL.
+            self.assertEqual(connection.credential_destinations(), [
+                authentications.ANTHROPIC_MESSAGES_URL, anthropic_controls.ANTHROPIC_USAGE_URL,
+            ])
+            self.assertEqual(connection.auth_spec.authorized_urls, authentications.ANTHROPIC_SUBSCRIPTION_URLS)
             self.assertEqual(connection.auth_spec.credential, ref)
             self.assertEqual(connection.context_capacity.source, "models.dev")
             self.assertIsNone(connection.chat_provider.models_url)

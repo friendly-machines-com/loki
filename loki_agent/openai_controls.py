@@ -40,33 +40,6 @@ def _text(value) -> str:
     return ascii(str(value))[1:-1]
 
 
-def _parse_time(value):
-    if not isinstance(value, str) or not value:
-        return None
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        moment = datetime.datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=datetime.timezone.utc)
-    return moment.astimezone(datetime.timezone.utc)
-
-
-def _relative(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    days, remainder = divmod(seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes = remainder // 60
-    if days:
-        return f"{days} day{'' if days == 1 else 's'} {hours} hour{'' if hours == 1 else 's'}"
-    if hours:
-        return f"{hours} hour{'' if hours == 1 else 's'} {minutes} minute{'' if minutes == 1 else 's'}"
-    return f"{minutes} minute{'' if minutes == 1 else 's'}"
-
-
 def _duration(minutes: int) -> str:
     if minutes % 1440 == 0:
         amount, unit = minutes // 1440, "day"
@@ -78,16 +51,16 @@ def _duration(minutes: int) -> str:
 
 
 def _expiry_text(value) -> str:
-    moment = _parse_time(value)
+    moment = provider_controls.account_time_utc(value)
     if moment is None:
         return "no expiry" if value in [None, ""] else f"expires {_text(value)}"
     now = datetime.datetime.now(datetime.timezone.utc)
     seconds = (moment - now).total_seconds()
     if seconds <= 0:
-        return f"expired {_relative(-seconds)} ago"
+        return f"expired {provider_controls.relative_duration(-seconds)} ago"
     return (
         f"expires {moment.date().isoformat()} "
-        f"(in {_relative(seconds)})")
+        f"(in {provider_controls.relative_duration(seconds)})")
 
 
 def _window_minutes(window) -> int | None:
@@ -117,7 +90,7 @@ def _window_line(label: str, window) -> str | None:
     if not isinstance(reset, (int, float)) or isinstance(reset, bool):
         reset = window.get("resets_in_seconds")
     if isinstance(reset, (int, float)) and not isinstance(reset, bool):
-        line += f"; resets in {_relative(reset)}"
+        line += f"; resets in {provider_controls.relative_duration(reset)}"
     return line
 
 

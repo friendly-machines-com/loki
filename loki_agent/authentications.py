@@ -62,7 +62,10 @@ ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
 ANTHROPIC_INFERENCE_SCOPE = "user:inference"
-ANTHROPIC_OAUTH_SCOPES = frozenset({ANTHROPIC_INFERENCE_SCOPE})
+ANTHROPIC_USAGE_SCOPE = "user:profile"
+# Request usage access because /account reads live quota; it does not need
+# upload, remote tool, or session-management permissions.
+ANTHROPIC_OAUTH_SCOPES = frozenset({ANTHROPIC_INFERENCE_SCOPE, ANTHROPIC_USAGE_SCOPE})
 # Bind bearer credentials to the exact inference URL, not the provider's host.
 ANTHROPIC_SUBSCRIPTION_URLS = frozenset({ANTHROPIC_MESSAGES_URL})
 # Try to refresh before expiry so a token can survive delivery and retries.
@@ -735,8 +738,11 @@ class CredentialBroker:
                 raise CredentialUnavailable(
                     "OpenAI subscription destination is not supported")
         if credential.kind == "anthropic-subscription":
-            if any(destination not in ANTHROPIC_SUBSCRIPTION_URLS
-                   for destination in destinations):
+            # The broker can lease for both operations, but each request path
+            # has its own exact AuthSpec; usage does not expand inference authority.
+            from .anthropic_controls import ANTHROPIC_ACCOUNT_URLS
+            canonical = ANTHROPIC_SUBSCRIPTION_URLS | ANTHROPIC_ACCOUNT_URLS
+            if any(destination not in canonical for destination in destinations):
                 raise CredentialUnavailable(
                     "Anthropic subscription destination is not supported")
 
@@ -794,9 +800,13 @@ class CredentialBroker:
         # capability writer, which itself checks channel revocation.
         await self._check_approval(credential, destination)
         if isinstance(record, AnthropicSubscriptionCredential):
-            # Check after rotation: the issuer may narrow the scopes on refresh.
-            if ANTHROPIC_INFERENCE_SCOPE not in record.tokens.scopes:
-                raise CredentialUnavailable("Anthropic login did not grant inference access")
+            # Only the two exact route sets above passed approval. Check the
+            # specific scope after refresh in case the issuer narrowed it.
+            inference = destination in ANTHROPIC_SUBSCRIPTION_URLS
+            scope = ANTHROPIC_INFERENCE_SCOPE if inference else ANTHROPIC_USAGE_SCOPE
+            if scope not in record.tokens.scopes:
+                purpose = "inference" if inference else "account usage"
+                raise CredentialUnavailable(f"Anthropic login did not grant access to {purpose}")
         return lease
 
 

@@ -1210,6 +1210,9 @@ provider request:
 
 - **ChatGPT subscription:** `usage` reports allowance windows/resets; `resets`
   lists banked reset credits and lets you redeem them.
+- **Anthropic subscription:** `usage` reports live windows, reset times and
+  extra spending when reported. The OAuth grant must include profile access;
+  this control does not change account settings or spending limits.
 - **OpenRouter:** `balance` reports the key's spend limit and prepaid credit.
 - **DeepSeek:** `balance` reports prepaid balance.
 

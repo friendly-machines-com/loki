@@ -79,33 +79,6 @@ def _integer(value):
     return None
 
 
-def _relative(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    days, remainder = divmod(seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes = remainder // 60
-    if days:
-        return f"{days} day{'' if days == 1 else 's'} {hours} hour{'' if hours == 1 else 's'}"
-    if hours:
-        return f"{hours} hour{'' if hours == 1 else 's'} {minutes} minute{'' if minutes == 1 else 's'}"
-    return f"{minutes} minute{'' if minutes == 1 else 's'}"
-
-
-def _parse_time(value):
-    if not isinstance(value, str) or not value:
-        return None
-    text = value.strip().replace(" ", "T")
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        moment = datetime.datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=datetime.timezone.utc)
-    return moment.astimezone(datetime.timezone.utc)
-
-
 def _epoch_text(value) -> str | None:
     """Render ``nextResetTime`` epoch milliseconds."""
     milliseconds = _integer(value)
@@ -116,21 +89,21 @@ def _epoch_text(value) -> str | None:
     seconds = (moment - datetime.datetime.now(
         datetime.timezone.utc)).total_seconds()
     if seconds < 0:
-        return f"resets {moment:%Y-%m-%d %H:%M} UTC ({_relative(-seconds)} ago)"
+        return f"resets {moment:%Y-%m-%d %H:%M} UTC ({provider_controls.relative_duration(-seconds)} ago)"
     return (
-        f"resets {moment:%Y-%m-%d %H:%M} UTC (in {_relative(seconds)})")
+        f"resets {moment:%Y-%m-%d %H:%M} UTC (in {provider_controls.relative_duration(seconds)})")
 
 
 def _expiry_text(value) -> str:
-    moment = _parse_time(value)
+    moment = provider_controls.account_time_utc(value)
     if moment is None:
         return "no expiry" if value in [None, ""] else f"expires {_text(value)}"
     now = datetime.datetime.now(datetime.timezone.utc)
     seconds = (moment - now).total_seconds()
     if seconds <= 0:
-        return f"expired {_relative(-seconds)} ago"
+        return f"expired {provider_controls.relative_duration(-seconds)} ago"
     return (
-        f"expires {moment.date().isoformat()} (in {_relative(seconds)})")
+        f"expires {moment.date().isoformat()} (in {provider_controls.relative_duration(seconds)})")
 
 
 def _credential(context):
