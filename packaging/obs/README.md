@@ -164,11 +164,16 @@ Some resolver errors cannot be repaired by Loki's package recipes:
   `./build` on openSUSE, `./pyproject-wheeldir` inside the source directory on
   Mageia, and `../pyproject-wheeldir` beside it on Fedora. The spec's
   `%install` and `%check` therefore locate the wheel by globbing all three
-  locations instead of hardcoding one. On SUSE, `%python_expand` passes the
-  flavor name (for example `python313`) and `%python3_version` probes the
-  unversioned `python3` binary that SLE build roots do not install; the SUSE
-  `%check` instead uses `%__%{pythons}`, the versioned executable that
-  `%pyproject_wheel` itself invoked.
+  locations instead of hardcoding one. Naming the SUSE check interpreter has
+  four documented dead ends, each observed in a real build: `%python_expand`
+  passes the flavor name (`python313`), `%python3_version` probes the
+  unversioned `python3` binary that SLE roots never install, computed macro
+  names (`%__%{pythons}`, `%{%{pythons}_version}`) stay literal because RPM
+  expands macros in a single pass even when the target macro exists, and a
+  bare `%??` is consumed by RPM's `%?` conditional syntax before bash runs.
+  The spec therefore derives `/usr/bin/pythonX.Y` from `%{pythons}` in shell
+  with doubled percent signs, and `rpmspec -P` oracle tests in
+  `packaging/obs/tests/` verify the expansion statically.
 - **SLE 15.7 repository source:** the `15.7` repository must layer
   `SUSE:SLE-15-SP7:Update` (the maintenance stream) rather than only
   `SUSE:SLE-SP7:GA`: the published `python311-base` needs `libexpat1 >= 2.8.5`,
