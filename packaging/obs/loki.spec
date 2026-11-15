@@ -79,9 +79,22 @@ sed -i '1{/^#!/d;}' loki_agent/loki.py loki_agent/dbus_clients.py
 %pyproject_wheel
 
 %install
+# %%pyproject_wheel leaves the wheel in a distribution-specific directory
+# (openSUSE: ./build, Mageia: ./pyproject-wheeldir, Fedora: ../pyproject-wheeldir).
+find_wheel() {
+    local candidate
+    for candidate in dist/*.whl build/*.whl pyproject-wheeldir/*.whl ../pyproject-wheeldir/*.whl; do
+        if [ -f "$candidate" ]; then
+            printf '%%s\n' "$candidate"
+            return 0
+        fi
+    done
+    echo 'no wheel produced by %%pyproject_wheel was found' >&2
+    return 1
+}
 %if %{with pypy}
 sitelib=$(python3 %{SOURCE1} --python %{loki_pypy_executable} \
-    --destdir %{buildroot} dist/*.whl)
+    --destdir %{buildroot} "$(find_wheel)")
 printf '%%s/loki_agent/\n%%s/loki_agent-*.dist-info/\n' "$sitelib" "$sitelib" > loki.files
 %else
 %pyproject_install
@@ -93,8 +106,21 @@ printf '%%s/loki_agent/\n%%s/loki_agent-*.dist-info/\n' "$sitelib" "$sitelib" > 
 %endif
 
 %check
+# %%pyproject_wheel leaves the wheel in a distribution-specific directory
+# (openSUSE: ./build, Mageia: ./pyproject-wheeldir, Fedora: ../pyproject-wheeldir).
+find_wheel() {
+    local candidate
+    for candidate in dist/*.whl build/*.whl pyproject-wheeldir/*.whl ../pyproject-wheeldir/*.whl; do
+        if [ -f "$candidate" ]; then
+            printf '%%s\n' "$candidate"
+            return 0
+        fi
+    done
+    echo 'no wheel produced by %%pyproject_wheel was found' >&2
+    return 1
+}
 check_imports() {
-    "$1" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import loki_agent.__main__, loki_agent.acp_main, loki_agent.windows_setup, loki_agent.loki, loki_agent.dbus_clients' dist/*.whl
+    "$1" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import loki_agent.__main__, loki_agent.acp_main, loki_agent.windows_setup, loki_agent.loki, loki_agent.dbus_clients' "$(find_wheel)"
 }
 # Import from the built wheel, not the checkout, without starting a frontend,
 # opening credentials, contacting a provider, or requiring a writable HOME.
@@ -102,7 +128,8 @@ check_imports() {
 check_imports %{loki_pypy_executable}
 %else
 %if 0%{?suse_version}
-%python_expand check_imports $python
+# %%python_expand passed the flavor name instead of an existing interpreter.
+check_imports %{_bindir}/python%{python3_version}
 %else
 check_imports %{__python3}
 %endif

@@ -67,6 +67,12 @@ snapshot timestamp must not silently disagree with the wheel's version.
   debtransform constructs the Debian source package.
 - **Arch:** builds with CPython without build isolation, then
   installs for the distro's `/usr/bin/pypy3` using `install-wheels.py`.
+  The recipe's dependency assignments must stay unconditional: OBS extracts
+  them with line-based parsing (`Build/Arch.pm`) that stops at the first line
+  that is not an assignment, so `case` statements or `LOKI_PYTHON`-style
+  environment selection silently drop every dependency from the build root.
+  Derivatives that need CPython instead of PyPy must edit `depends` and the
+  `package()` interpreter in the recipe itself.
 
 Upstream requires `>=3.11.10` and excludes Python `3.12.0` through `3.12.3`.
 Unmodified Debian 12 (3.11.2) and Ubuntu 24.04 (3.12.3) therefore are not targets.
@@ -124,8 +130,9 @@ at package-build configuration time:
   `DEB_BUILD_PROFILES=cpython` with normal Debian build tools. The profile must
   apply to dependency resolution as well as `debian.rules`; it removes the PyPy
   build dependency and restores the CPython shebangs and runtime dependency.
-- **Arch derivatives:** build with `LOKI_PYTHON=python`. Arch Extra itself defaults
-  to PyPy. Only `python` and `pypy3` are accepted values.
+- **Arch derivatives:** edit `depends` and the `--python=` interpreter in
+  `package()` within the PKGBUILD. Only `python` and `pypy3` are accepted
+  values, and OBS builds always use the committed static selection.
 
 If PyPy is explicitly selected but unavailable or incompatible, fix the target's
 build configuration to select CPython rather than downloading an interpreter or
@@ -139,15 +146,27 @@ Some resolver errors cannot be repaired by Loki's package recipes:
   is available.** The selected interpreter and library providers are incompatible.
   Select a Leap-compatible Python repository/package, or provide its matching
   Expat dependency. Do not lower Loki's Python floor or ignore RPM dependencies.
+- **openEuler 24.03: `python3` is 3.11.6 (below the floor) and
+  `pyproject-rpm-macros` does not exist there.** Both are resolver facts of that
+  repository, not Loki dependency errors. Disable that repository unless it
+  gains a newer Python stack with the RPM macros.
 - **Fedora: choice between `wget1-wget` and `wget2-wget` for
   `obs-service-download_files`.** In the OBS project's **Project Config**, add
   `Prefer: wget1-wget` to resolve the provider ambiguity. This is a solver
   preference, not a Loki runtime dependency or an addition to `_service`.
 - **AppImage:** this directory supplies no AppImage build description. Disable
   that repository unless an AppImage recipe is separately added.
-- **Mageia:** moving services server-side removes the reported service-package
-  blocker, but the RPM macros and package names still need a native Mageia build
-  check; the Fedora/openSUSE spec has not been qualified for Mageia.
+- **Mageia:** the RPM `%check` glob now covers Mageia's in-source
+  `pyproject-wheeldir`, removing the reported blocker, but the RPM macros and
+  package names still need a native Mageia build check; the Fedora/openSUSE
+  spec has not been qualified for Mageia.
+- **Wheeled build macro divergence:** `%pyproject_wheel` writes its wheel to
+  `./build` on openSUSE, `./pyproject-wheeldir` inside the source directory on
+  Mageia, and `../pyproject-wheeldir` beside it on Fedora. The spec's
+  `%install` and `%check` therefore locate the wheel by globbing all three
+  locations instead of hardcoding one. SUSE's `%python_expand` passes the
+  flavor name (for example `python313`), which is not an executable; the
+  SUSE `%check` uses `%{_bindir}/python%{python3_version}` explicitly.
 
 After uploading recipe changes, rerun the **remote** services before rebuilding.
 A published repository is not proof that this package's dependencies resolve.

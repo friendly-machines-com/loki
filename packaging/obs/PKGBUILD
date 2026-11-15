@@ -5,19 +5,19 @@ pkgdesc="Really really minimal-dependency coding agent"
 arch=('any')
 url="https://friendly-machines.com/git/loki.git"
 license=('MIT')
-# Arch Extra supplies a supported PyPy. Derivatives without it can build with
-# LOKI_PYTHON=python; this is a package-build choice, never a runtime fallback.
-_loki_python=${LOKI_PYTHON:-pypy3}
-case "$_loki_python" in
-  pypy3) depends=('pypy3>=8.0.1') ;;
-  python) depends=('python>=3.11.10') ;;
-  *) printf 'LOKI_PYTHON must be pypy3 or python\n' >&2; return 1 ;;
-esac
+# OBS extracts dependencies with line-based parsing (obs-build Build/Arch.pm)
+# that stops at the first line which is not a variable assignment: no case
+# statements, no conditionals, no environment-dependent selection. All
+# dependencies must therefore stay static. The wheel is built with CPython
+# tooling and installed for the distribution PyPy. Derivatives without a
+# suitable pypy3 must edit depends and the package() interpreter by hand.
+depends=('pypy3>=8.0.1')
 makedepends=('python-build' 'python-flit-core' 'python-installer' 'python-packaging' 'python-wheel')
 source=("$pkgname-$pkgver.tar.gz" 'install-wheels.py')
 # OBS produces this archive from the Git revision selected in _service.
 # set_version resets this assignment to one SKIP; append the local helper's
 # checksum separately so its rewrite preserves one checksum per source.
+# The += append form is understood by the OBS parser.
 sha256sums=('SKIP')
 sha256sums+=('SKIP')
 
@@ -28,7 +28,7 @@ build() {
 
 package() {
   cd "$pkgname-$pkgver"
-  python "$srcdir/install-wheels.py" --python="/usr/bin/$_loki_python" \
+  python "$srcdir/install-wheels.py" --python=/usr/bin/pypy3 \
     --destdir="$pkgdir" dist/*.whl
   install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
 }
