@@ -61,7 +61,9 @@ _LOKI_OPENAI_REQUEST_PROFILE_KEY = "_loki_openai_request_profile"
 _LOKI_REASONING_EFFORT_PROFILE_KEY = "_loki_reasoning_effort_profile"
 _LOKI_SYNTHETIC_KEY = "_loki_synthetic"
 _OPENAI_SUBSCRIPTION_SENTINEL = object()
+_ANTHROPIC_SUBSCRIPTION_SENTINEL = object()
 OPENAI_SUBSCRIPTION_PROVIDER_ID = "openai-subscription"
+ANTHROPIC_SUBSCRIPTION_PROVIDER_ID = "anthropic-subscription"
 
 # Feature flags shown in the pickers, in a stable order. A provider may set
 # each one differently for the same model; menus show the ones that are on.
@@ -347,12 +349,12 @@ def normalize_catalog(data):
 
     This function never mutates the raw downloaded or cached catalog.
     """
-    # This namespace belongs to Loki's authenticated ChatGPT discovery. Never
-    # let downloaded catalog data manufacture or shadow that provider.
+    # Only Loki can bind these provider IDs to broker-owned credentials.
+    # Downloaded data must not manufacture or shadow either provider.
+    reserved = {OPENAI_SUBSCRIPTION_PROVIDER_ID, ANTHROPIC_SUBSCRIPTION_PROVIDER_ID}
     normalized = data
-    if OPENAI_SUBSCRIPTION_PROVIDER_ID in data:
-        normalized = dict(data)
-        normalized.pop(OPENAI_SUBSCRIPTION_PROVIDER_ID, None)
+    if reserved.intersection(data):
+        normalized = {key: value for key, value in data.items() if key not in reserved}
 
     provider_entry = data.get("openai")
     if not isinstance(provider_entry, dict) or provider_entry.get("api"):
@@ -540,6 +542,35 @@ def add_openai_subscription_catalog(
         # accepts broker authority only for a provider constructed in memory
         # by this function.
         _LOKI_SYNTHETIC_KEY: _OPENAI_SUBSCRIPTION_SENTINEL,
+    }
+    return normalized
+
+
+def add_anthropic_subscription_catalog(data):
+    """Offer public model metadata without treating it as account entitlements."""
+    provider = data.get("anthropic")
+    entries = provider.get("models") if isinstance(provider, dict) else None
+    if not isinstance(entries, dict):
+        return data
+    # API-key prices do not describe subscription billing, and API-key
+    # endpoint overrides cannot grant new OAuth destinations.
+    leaves = {
+        model_id: {key: value for key, value in entry.items() if key not in {"cost", "provider"}}
+        for model_id, entry in entries.items() if isinstance(entry, dict)
+    }
+    if not leaves:
+        return data
+    normalized = dict(data)
+    normalized[ANTHROPIC_SUBSCRIPTION_PROVIDER_ID] = {
+        "id": ANTHROPIC_SUBSCRIPTION_PROVIDER_ID,
+        "name": "Anthropic subscription",
+        "npm": "@ai-sdk/anthropic",
+        "api": authentications.ANTHROPIC_MESSAGES_URL,
+        "env": [],
+        "models": leaves,
+        _LOKI_CREDENTIAL_REF_KEY: authentications.CredentialRef.anthropic_subscription().encode(),
+        # A JSON catalog cannot create the in-process marker for broker access.
+        _LOKI_SYNTHETIC_KEY: _ANTHROPIC_SUBSCRIPTION_SENTINEL,
     }
     return normalized
 
@@ -759,8 +790,7 @@ def effective_provider(provider_entry, model_entry):
     headers. Only the transport-selection fields are projected here.
     """
     override = model_entry.get("provider")
-    if override is None or provider_entry.get(_LOKI_SYNTHETIC_KEY) is (
-            _OPENAI_SUBSCRIPTION_SENTINEL):
+    if override is None or provider_is_synthetic(provider_entry):
         return provider_entry
     resolved = dict(provider_entry)
     if not isinstance(override, dict):
@@ -838,6 +868,13 @@ async def ensure_index(
             )
         except Exception as error:
             subscription_error = error
+
+    anthropic_credential = authentications.CredentialRef.anthropic_subscription()
+    if (credential_authority is not None
+            and anthropic_credential in credential_authority.available()):
+        # No discovery URL is authorized for this grant. Use public metadata
+        # without sending the credential to the catalog or caching it there.
+        data = add_anthropic_subscription_catalog(data)
 
     if models_dev_error is not None and not (
             has_subscription and subscription_error is None):
@@ -988,8 +1025,7 @@ def provider_display_name(provider_id, provider_entry):
     if provider_entry.get(_LOKI_API_SOURCE_KEY) == (
             _OPENAI_PLATFORM_API_SOURCE):
         return f"{name} Platform API [endpoint supplied by Loki]"
-    if provider_entry.get(_LOKI_API_SOURCE_KEY) == (
-            _OPENAI_SUBSCRIPTION_API_SOURCE):
+    if provider_is_synthetic(provider_entry):
         return f"{name} [endpoint supplied by Loki]"
     return name
 
@@ -1007,6 +1043,9 @@ def provider_description(provider_entry):
         return (
             f"{description}; ChatGPT subscription provider synthesized "
             "by Loki from the canonical OpenAI catalog entry")
+    if provider_entry.get(_LOKI_SYNTHETIC_KEY) is _ANTHROPIC_SUBSCRIPTION_SENTINEL:
+        return (f"{description}; model metadata from models.dev; "
+                "availability depends on the grant")
     return description
 
 
@@ -1023,8 +1062,7 @@ def provider_access(
         return None
     encoded_ref = provider_entry.get(_LOKI_CREDENTIAL_REF_KEY)
     if encoded_ref is not None:
-        if provider_entry.get(_LOKI_SYNTHETIC_KEY) is not (
-                _OPENAI_SUBSCRIPTION_SENTINEL):
+        if not provider_is_synthetic(provider_entry):
             return None
         try:
             credential_ref = authentications.CredentialRef.decode(
@@ -1348,14 +1386,12 @@ def flattened_config_option_choices(
 def provider_is_synthetic(provider_entry) -> bool:
     """Whether this provider entry was built in-process, not downloaded.
 
-    The endpoint-approval check exists because the *catalog* decides where a
-    credential goes.  An entry Loki synthesized from authenticated discovery
-    decides nothing: its endpoint is one of Loki's own constants and its
-    credential is the in-process reference JSON cannot forge, with the AuthSpec
-    already bound to those exact URLs.
+    A synthetic entry's endpoint is an exact Loki-owned constant, not a
+    URL the model catalog can choose. Use identity rather than set membership
+    because downloaded JSON can put an unhashable value in this field.
     """
-    return provider_entry.get(_LOKI_SYNTHETIC_KEY) is (
-        _OPENAI_SUBSCRIPTION_SENTINEL)
+    marker = provider_entry.get(_LOKI_SYNTHETIC_KEY)
+    return marker is _OPENAI_SUBSCRIPTION_SENTINEL or marker is _ANTHROPIC_SUBSCRIPTION_SENTINEL
 
 
 async def _confirm_catalog_endpoint(

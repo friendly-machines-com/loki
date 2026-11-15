@@ -18,7 +18,7 @@ import json
 import math
 import time
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Awaitable, Callable, Protocol
 
 from . import http_client
@@ -58,6 +58,20 @@ OPENAI_CHATGPT_CODEX_URLS = frozenset({
     OPENAI_CHATGPT_MODELS_REQUEST_URL,
 })
 
+ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
+ANTHROPIC_INFERENCE_SCOPE = "user:inference"
+ANTHROPIC_OAUTH_SCOPES = frozenset({ANTHROPIC_INFERENCE_SCOPE})
+# Bind bearer credentials to the exact inference URL, not the provider's host.
+ANTHROPIC_SUBSCRIPTION_URLS = frozenset({ANTHROPIC_MESSAGES_URL})
+# Try to refresh before expiry so a token can survive delivery and retries.
+# Opaque tokens without an expiry can only be scheduled by age.
+ANTHROPIC_ACCESS_TOKEN_REFRESH_WINDOW_S = 5 * 60
+ANTHROPIC_FALLBACK_REFRESH_INTERVAL_S = 60 * 60
+ANTHROPIC_REFRESH_TIMEOUT_S = 30
+ANTHROPIC_REFRESH_MAX_BYTES = 256 * 1024
+
 
 @dataclass(frozen=True, order=True)
 class CredentialRef:
@@ -79,6 +93,10 @@ class CredentialRef:
     @classmethod
     def openai_subscription(cls) -> "CredentialRef":
         return cls("openai-subscription", "openai")
+
+    @classmethod
+    def anthropic_subscription(cls) -> "CredentialRef":
+        return cls("anthropic-subscription", "anthropic")
 
     def encode(self) -> str:
         return f"{self.kind}:{self.name}"
@@ -246,6 +264,144 @@ class RefreshResult:
     id_token: str | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True)
+class AnthropicAccount:
+    """Non-secret account identity reported by the Anthropic token endpoint."""
+
+    uuid: str
+    email_address: str | None = None
+    organization_uuid: str | None = None
+
+
+def _visible_ascii(value, *, max_size=8192) -> bool:
+    # A bearer must be header-safe and fit in a bounded credential IPC frame
+    # even after JSON quoting.
+    return (isinstance(value, str) and 0 < len(value) <= max_size
+            and all("!" <= char <= "~" for char in value))
+
+
+def validate_anthropic_client_id(value) -> None:
+    if not _visible_ascii(value, max_size=512):
+        raise ValueError("Anthropic requires a registered OAuth client ID")
+
+
+def _valid_anthropic_scopes(scopes) -> bool:
+    return (isinstance(scopes, frozenset) and bool(scopes)
+            and all(_visible_ascii(scope) and '"' not in scope and '\\' not in scope
+                    for scope in scopes))
+
+
+def parse_anthropic_scopes(value) -> frozenset[str]:
+    scopes = frozenset(value.split(" ")) if isinstance(value, str) else frozenset()
+    if not _valid_anthropic_scopes(scopes):
+        raise ValueError("Anthropic returned invalid OAuth scopes")
+    return scopes
+
+
+def anthropic_access_expiration(expires_in, now) -> float | None:
+    if expires_in is None:
+        return None
+    # Bound the duration before adding it to a floating-point timestamp.
+    if type(expires_in) is not int or not 0 < expires_in <= 30 * 24 * 60 * 60:
+        raise ValueError("Anthropic returned invalid expires_in")
+    return now + expires_in
+
+
+def validate_anthropic_token_type(data) -> None:
+    token_type = data.get("token_type", "Bearer")
+    if not isinstance(token_type, str) or token_type.lower() != "bearer":
+        raise ValueError("Anthropic returned an unsupported token type")
+
+
+def parse_anthropic_account(data) -> AnthropicAccount | None:
+    account = data.get("account")
+    if account is None:
+        return None
+    if not isinstance(account, dict):
+        raise ValueError("Anthropic returned an invalid account")
+    org = data.get("organization")
+    if org is not None and not isinstance(org, dict):
+        raise ValueError("Anthropic returned an invalid organization")
+    return AnthropicAccount(
+        uuid=account.get("uuid"),
+        email_address=account.get("email_address"),
+        organization_uuid=org.get("uuid") if org is not None else None,
+    )
+
+
+@dataclass(frozen=True)
+class AnthropicTokenSet:
+    """The supervisor's stored and in-memory Anthropic login.
+
+    Unlike OpenAI's JWT-based token set, this grant has an opaque access token
+    and explicit scopes, and refresh must use its original client registration.
+    Only the access token and lease metadata cross into a worker; replacing or
+    removing the durable grant disallows any further rotation of the old grant.
+    """
+
+    access_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
+    # Refresh must use the registration to which the token was issued.
+    client_id: str
+    scopes: frozenset[str]
+    account: AnthropicAccount | None = None
+    expires_at: float | None = None
+    last_refresh: float | None = None
+    # A later login may be a different account even if both responses omit
+    # identity. Only replacements from the same durable grant are reusable.
+    grant_id: str | None = None
+
+    def normalized(self, now: float | None = None) -> "AnthropicTokenSet":
+        if not (_visible_ascii(self.access_token) and _visible_ascii(self.refresh_token)):
+            raise ValueError("Anthropic subscription requires valid access and refresh tokens")
+        validate_anthropic_client_id(self.client_id)
+        if not _valid_anthropic_scopes(self.scopes):
+            raise ValueError("Anthropic subscription requires valid OAuth scopes")
+        if self.grant_id is not None and not _visible_ascii(self.grant_id, max_size=128):
+            raise ValueError("Anthropic subscription has an invalid grant ID")
+        if self.account is not None and (
+                not isinstance(self.account, AnthropicAccount)
+                or not _visible_ascii(self.account.uuid, max_size=128)
+                or any(field is not None and (not isinstance(field, str) or not field)
+                       for field in [self.account.email_address, self.account.organization_uuid])):
+            raise ValueError("Anthropic returned an invalid account identity")
+        for label, value in [("expiry", self.expires_at), ("last refresh", self.last_refresh)]:
+            if value is None:
+                continue
+            try:
+                if type(value) in {int, float} and math.isfinite(value):
+                    continue
+            except OverflowError:
+                pass
+            raise ValueError(f"Anthropic token {label} must be finite or null")
+        return AnthropicTokenSet(
+            access_token=self.access_token,
+            refresh_token=self.refresh_token,
+            client_id=self.client_id,
+            scopes=self.scopes,
+            account=self.account,
+            expires_at=self.expires_at,
+            last_refresh=(self.last_refresh if self.last_refresh is not None
+                          else (time.time() if now is None else now)),
+            grant_id=self.grant_id,
+        )
+
+
+@dataclass(frozen=True)
+class AnthropicRefreshResult:
+    """The response before rotation merges it with the existing grant.
+
+    A login must supply a refresh token, while a refresh may omit unchanged
+    fields. Do not treat a partial response as a new leaseable token set.
+    """
+
+    access_token: str = field(repr=False)
+    refresh_token: str | None = field(default=None, repr=False)
+    expires_in: int | None = None
+    scopes: frozenset[str] | None = None
+    account: AnthropicAccount | None = None
+
+
 class CredentialError(RuntimeError):
     pass
 
@@ -304,35 +460,152 @@ RotationFunction = Callable[
     Awaitable[OpenAITokenSet],
 ]
 
+AnthropicRotationFunction = Callable[
+    [AnthropicTokenSet],
+    Awaitable[AnthropicTokenSet],
+]
 
-class OpenAIChatGPTCredential:
-    """One rotating ChatGPT token set with single-flight refresh."""
+
+class _RotatingSubscriptionCredential:
+    """Serialize refresh and never replay a possibly consumed token.
+
+    Share the generation rules across providers so their delivery and
+    cancellation handling cannot diverge. Only expiry and lease fields vary.
+    """
+
+    _provider_label: str
+    _token_set_type: type
 
     def __init__(
-            self, tokens: OpenAITokenSet, *,
-            rotate: RotationFunction | None = None,
-            clock: Callable[[], float] = time.time,
-            generation: int = 0):
-        self.credential = CredentialRef.openai_subscription()
+            self, credential: CredentialRef, tokens, *,
+            rotate, clock: Callable[[], float], generation: int = 0):
+        self.credential = credential
         self._clock = clock
-        self._tokens = tokens.normalized(clock())
-        self._rotate = rotate or rotate_openai_tokens
+        self._tokens = self._accepted(tokens)
+        self._rotate = rotate
         self._generation = generation
         self._refresh_lock = asyncio.Lock()
-        self._permanent_failure: tuple[int, CredentialError] | None = None
+        self._permanent_failure: CredentialError | None = None
 
     @property
-    def tokens(self) -> OpenAITokenSet:
+    def tokens(self):
         return self._tokens
 
     @property
     def generation(self) -> int:
         return self._generation
 
-    def replace(self, tokens: OpenAITokenSet):
-        self._tokens = tokens.normalized(self._clock())
+    def replace(self, tokens):
+        self._tokens = self._accepted(tokens)
         self._generation += 1
         self._permanent_failure = None
+
+    def _accepted(self, tokens):
+        if not isinstance(tokens, self._token_set_type):
+            raise ValueError(
+                f"{self._provider_label} rotation produced an invalid result")
+        return tokens.normalized(self._clock())
+
+    def _lease(self) -> CredentialLease:
+        raise NotImplementedError
+
+    def _needs_proactive_refresh(self, now: float) -> bool:
+        raise NotImplementedError
+
+    def _expired(self, now: float) -> bool:
+        return (
+            self._tokens.expires_at is not None
+            and self._tokens.expires_at <= now)
+
+    def _refresh_required(self, rejected_generation) -> bool:
+        if self._permanent_failure is not None:
+            raise self._permanent_failure
+        now = self._clock()
+        if rejected_generation is None:
+            return self._needs_proactive_refresh(now)
+        # A delayed rejection must not force rotation of a newer token, but
+        # the newer token can independently have expired while we waited.
+        return rejected_generation == self._generation or self._expired(now)
+
+    async def lease(
+            self, rejected_generation: int | None = None) -> CredentialLease:
+        if not self._refresh_required(rejected_generation):
+            return self._lease()
+
+        observed_generation = self._generation
+        async with self._refresh_lock:
+            if not self._refresh_required(rejected_generation):
+                return self._lease()
+            if (observed_generation != self._generation
+                    and rejected_generation != self._generation
+                    and not self._expired(self._clock())):
+                # One refresh already served this burst of waiters. A short
+                # expiry on the new token must not turn it into N rotations.
+                return self._lease()
+            refresh_generation = self._generation
+            try:
+                tokens = await self._rotate(self._tokens)
+                if refresh_generation == self._generation:
+                    self._install_rotation_result(tokens)
+            except asyncio.CancelledError as error:
+                if (refresh_generation == self._generation
+                        and getattr(error, "request_may_have_been_sent", True)):
+                    # Cancelling the caller says nothing about whether the
+                    # issuer consumed a token whose bytes may have reached it.
+                    self._permanent_failure = RefreshIndeterminateError(
+                        f"{self._provider_label} token refresh was cancelled after it "
+                        "may have been sent; the refresh token will not be replayed")
+                raise
+            except RefreshPermanentError as error:
+                # An explicit replacement wins over both late results and
+                # late failures. The failed exchange concerned an older token.
+                if refresh_generation == self._generation:
+                    self._permanent_failure = error
+                    raise
+            except RefreshTransientError as error:
+                if refresh_generation == self._generation:
+                    if error.request_may_have_been_sent:
+                        self._permanent_failure = RefreshIndeterminateError(
+                            f"{self._provider_label} token refresh outcome is unknown; "
+                            "the refresh token will not be replayed")
+                        raise self._permanent_failure from error
+                    # An unsent proactive refresh may fall back only if the
+                    # old token survived the time spent waiting for refresh.
+                    if rejected_generation is not None or self._expired(self._clock()):
+                        raise
+            if self._expired(self._clock()):
+                raise CredentialUnavailable(f"{self._provider_label} access token is expired")
+            return self._lease()
+
+    def _install_rotation_result(self, tokens) -> None:
+        try:
+            self._tokens = self._accepted(tokens)
+        except ValueError as error:
+            raise RefreshIndeterminateError(
+                f"{self._provider_label} token rotation returned invalid "
+                f"tokens: {error}") from error
+        self._generation += 1
+        self._permanent_failure = None
+
+
+class OpenAIChatGPTCredential(_RotatingSubscriptionCredential):
+    """One rotating ChatGPT token set with single-flight refresh."""
+
+    _provider_label = "OpenAI"
+    _token_set_type = OpenAITokenSet
+
+    def __init__(
+            self, tokens: OpenAITokenSet, *,
+            rotate: RotationFunction | None = None,
+            clock: Callable[[], float] = time.time,
+            generation: int = 0):
+        super().__init__(
+            CredentialRef.openai_subscription(),
+            tokens,
+            rotate=rotate or rotate_openai_tokens,
+            clock=clock,
+            generation=generation,
+        )
 
     def _lease(self) -> CredentialLease:
         return CredentialLease(
@@ -345,11 +618,6 @@ class OpenAIChatGPTCredential:
             fedramp=self._tokens.fedramp,
         )
 
-    def _expired(self, now: float) -> bool:
-        return (
-            self._tokens.expires_at is not None
-            and self._tokens.expires_at <= now)
-
     def _needs_proactive_refresh(self, now: float) -> bool:
         if self._tokens.expires_at is not None:
             return (
@@ -360,98 +628,57 @@ class OpenAIChatGPTCredential:
             and self._tokens.last_refresh
             < now - OPENAI_FALLBACK_REFRESH_INTERVAL_S)
 
-    async def lease(
-            self, rejected_generation: int | None = None) -> CredentialLease:
-        now = self._clock()
-        rejected_current = (
-            rejected_generation is not None
-            and rejected_generation == self._generation)
-        if (not rejected_current
-                and rejected_generation is not None):
-            return self._lease()
-        if (not rejected_current
-                and not self._needs_proactive_refresh(now)):
-            return self._lease()
 
-        async with self._refresh_lock:
-            now = self._clock()
-            if (rejected_generation is not None
-                    and rejected_generation != self._generation):
-                return self._lease()
-            if (rejected_generation is None
-                    and not self._needs_proactive_refresh(now)):
-                return self._lease()
-            if (self._permanent_failure is not None
-                    and self._permanent_failure[0] == self._generation):
-                raise self._permanent_failure[1]
+class AnthropicSubscriptionCredential(_RotatingSubscriptionCredential):
+    """Lease only the access token; refresh state stays in the supervisor."""
 
-            try:
-                refresh_generation = self._generation
-                tokens = await self._rotate(self._tokens)
-                if refresh_generation != self._generation:
-                    # An explicit credential replacement won the race while
-                    # the exchange was in flight. Its newer state is
-                    # authoritative; never overwrite it with the old
-                    # generation's late response.
-                    return self._lease()
-                self._install_rotation_result(tokens)
-            except asyncio.CancelledError as error:
-                if (refresh_generation == self._generation
-                        and getattr(
-                            error, "request_may_have_been_sent", True)):
-                    # Capability revocation cancels in-flight broker work.
-                    # Once request bytes may have reached the token endpoint,
-                    # cancellation cannot make replaying that rotating token
-                    # safe; remember the indeterminate generation first.
-                    self._permanent_failure = (
-                        self._generation,
-                        RefreshIndeterminateError(
-                            "OpenAI token refresh was cancelled after it "
-                            "may have been sent; the refresh token will not "
-                            "be replayed"),
-                    )
-                raise
-            except RefreshPermanentError as error:
-                self._permanent_failure = (self._generation, error)
-                raise
-            except RefreshTransientError as error:
-                if error.request_may_have_been_sent:
-                    permanent = RefreshIndeterminateError(
-                        "OpenAI token refresh outcome is unknown; the "
-                        "refresh token will not be replayed")
-                    self._permanent_failure = (
-                        self._generation, permanent)
-                    raise permanent from error
-                if rejected_generation is not None or self._expired(self._clock()):
-                    # The clock is reobserved here: the earlier sample was
-                    # taken before the awaited refresh, and elapsed real time
-                    # during that await is not captured by it.
-                    raise
-                # A proactive refresh is best-effort while the current token
-                # is still valid.  A later request can try again.
-                return self._lease()
-            return self._lease()
+    _provider_label = "Anthropic"
+    _token_set_type = AnthropicTokenSet
 
-    def _install_rotation_result(
-            self, tokens: OpenAITokenSet) -> None:
-        if not isinstance(tokens, OpenAITokenSet):
-            raise RefreshIndeterminateError(
-                "OpenAI token rotation returned an invalid result")
-        try:
-            self._tokens = tokens.normalized(self._clock())
-        except ValueError as error:
-            raise RefreshIndeterminateError(
-                f"OpenAI token rotation returned invalid tokens: "
-                f"{error}") from error
-        self._generation += 1
-        self._permanent_failure = None
+    def __init__(
+            self, tokens: AnthropicTokenSet, *,
+            rotate: AnthropicRotationFunction | None = None,
+            clock: Callable[[], float] = time.time,
+            generation: int = 0):
+        super().__init__(
+            CredentialRef.anthropic_subscription(),
+            tokens,
+            rotate=rotate or rotate_anthropic_tokens,
+            clock=clock,
+            generation=generation,
+        )
+
+    def _lease(self) -> CredentialLease:
+        return CredentialLease(
+            credential=self.credential,
+            value=self._tokens.access_token,
+            generation=self._generation,
+            expires_at=self._tokens.expires_at,
+            refreshable=True,
+            account_id=(
+                self._tokens.account.uuid
+                if self._tokens.account is not None else None),
+        )
+
+    def _needs_proactive_refresh(self, now: float) -> bool:
+        if self._tokens.expires_at is not None:
+            # A token issued for less than the usual margin must still be
+            # usable without refreshing before every request.
+            lifetime = self._tokens.expires_at - self._tokens.last_refresh
+            margin = min(ANTHROPIC_ACCESS_TOKEN_REFRESH_WINDOW_S, max(0, lifetime / 10))
+            return self._tokens.expires_at <= now + margin
+        return self._tokens.last_refresh <= now - ANTHROPIC_FALLBACK_REFRESH_INTERVAL_S
 
 
 class CredentialBroker:
     """Root-process credential registry and local authority."""
 
     def __init__(self, storage=None):
-        self._records: dict[CredentialRef, StaticCredential | OpenAIChatGPTCredential] = {}
+        self._records: dict[
+            CredentialRef,
+            StaticCredential
+            | OpenAIChatGPTCredential
+            | AnthropicSubscriptionCredential] = {}
         self._storage = storage
         # Launch configuration belongs to this supervisor's lifetime. Only
         # storage-free authorities need in-memory user approvals; production
@@ -479,6 +706,18 @@ class CredentialBroker:
         self._records[credential] = OpenAIChatGPTCredential(
             tokens, rotate=rotate, clock=clock)
 
+    def install_anthropic_subscription(
+            self, tokens: AnthropicTokenSet, *,
+            rotate: AnthropicRotationFunction | None = None,
+            clock: Callable[[], float] = time.time) -> None:
+        credential = CredentialRef.anthropic_subscription()
+        current = self._records.get(credential)
+        if isinstance(current, AnthropicSubscriptionCredential):
+            current.replace(tokens)
+            return
+        self._records[credential] = AnthropicSubscriptionCredential(
+            tokens, rotate=rotate, clock=clock)
+
     def _check_destinations(self, credential, destinations):
         if credential not in self._records:
             raise CredentialUnavailable(
@@ -495,6 +734,11 @@ class CredentialBroker:
             if any(destination not in canonical for destination in destinations):
                 raise CredentialUnavailable(
                     "OpenAI subscription destination is not supported")
+        if credential.kind == "anthropic-subscription":
+            if any(destination not in ANTHROPIC_SUBSCRIPTION_URLS
+                   for destination in destinations):
+                raise CredentialUnavailable(
+                    "Anthropic subscription destination is not supported")
 
     def allow_startup_destinations(self, credential, destinations):
         """Grant only the exact URLs derived from captured launch configuration."""
@@ -503,7 +747,8 @@ class CredentialBroker:
 
     async def unapproved_destinations(self, credential, destinations):
         self._check_destinations(credential, destinations)
-        if credential.kind == "openai-subscription":
+        if credential.kind in {
+                "openai-subscription", "anthropic-subscription"}:
             return []
         approved = self._startup_destinations.get(credential, frozenset())
         if all(destination in approved for destination in destinations):
@@ -542,11 +787,16 @@ class CredentialBroker:
             self, credential: CredentialRef, destination: str,
             rejected_generation: int | None = None) -> CredentialLease:
         await self._check_approval(credential, destination)
-        lease = await self._records[credential].lease(rejected_generation)
+        record = self._records[credential]
+        lease = await record.lease(rejected_generation)
         # Refresh may have awaited network/storage while an approval changed.
         # No await follows the final check before returning the value to the
         # capability writer, which itself checks channel revocation.
         await self._check_approval(credential, destination)
+        if isinstance(record, AnthropicSubscriptionCredential):
+            # Check after rotation: the issuer may narrow the scopes on refresh.
+            if ANTHROPIC_INFERENCE_SCOPE not in record.tokens.scopes:
+                raise CredentialUnavailable("Anthropic login did not grant inference access")
         return lease
 
 
@@ -569,6 +819,12 @@ def authorization_headers(
         return headers
     if spec.scheme == "anthropic":
         return {"x-api-key": lease.value}
+    if spec.scheme == "anthropic-subscription":
+        # Select OAuth bearer handling without changing API-key requests.
+        return {
+            "Authorization": f"Bearer {lease.value}",
+            "anthropic-beta": ANTHROPIC_OAUTH_BETA,
+        }
     if spec.scheme == "custom":
         if not spec.header_name:
             raise ValueError(
@@ -890,3 +1146,116 @@ async def request_openai_token_refresh(
         refresh_token=refresh_value,
         id_token=id_token,
     )
+
+
+async def request_anthropic_token_refresh(
+        current: AnthropicTokenSet) -> AnthropicRefreshResult:
+    """Exchange a refresh token for the same client and scopes, without retries."""
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": current.refresh_token,
+        "client_id": current.client_id,
+        "scope": " ".join(sorted(current.scopes)),
+    }, separators=(",", ":")).encode("utf-8")
+    try:
+        # Timing out a sent exchange would leave us unable to tell whether
+        # the provider consumed the token. Bound delivery, not the response.
+        response = await http_client.async_http_request(
+            "POST",
+            ANTHROPIC_TOKEN_URL,
+            body=body,
+            headers_in={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=ANTHROPIC_REFRESH_TIMEOUT_S,
+            response_timeout=None,
+            max_bytes=ANTHROPIC_REFRESH_MAX_BYTES,
+            retry_max_attempts=1,
+        )
+    except Exception as error:
+        raise RefreshTransientError(
+            "Anthropic token refresh transport failed",
+            request_may_have_been_sent=getattr(error, "request_may_have_been_sent", True),
+        ) from error
+
+    success = 200 <= response.status < 300
+    if response.truncated and success:
+        raise RefreshIndeterminateError("Anthropic token refresh response exceeded the size limit")
+    try:
+        data = json.loads(response.body.decode("utf-8")) if not response.truncated else None
+    except (ValueError, RecursionError):
+        data = None
+    if not success:
+        code = (_refresh_error_code(data) or "").lower()
+        if response.status == 401 or code in {
+                "invalid_client", "invalid_grant", "invalid_token", "invalid_request"}:
+            raise RefreshPermanentError("Anthropic rejected the token refresh; log in again")
+        # A server or intermediary error does not prove the issuer left the
+        # refresh token unconsumed, so the broker must not replay it.
+        raise RefreshTransientError(
+            f"Anthropic token refresh returned HTTP {response.status}",
+            request_may_have_been_sent=True,
+        )
+    if not isinstance(data, dict):
+        raise RefreshIndeterminateError("Anthropic token refresh did not return a JSON object")
+    try:
+        validate_anthropic_token_type(data)
+        access_token = data.get("access_token")
+        if not _visible_ascii(access_token):
+            raise ValueError("Anthropic token refresh returned invalid access_token")
+        refresh_token = data.get("refresh_token")
+        if "refresh_token" in data and not _visible_ascii(refresh_token):
+            raise ValueError("Anthropic token refresh returned invalid refresh_token")
+        expires_in = data.get("expires_in")
+        if "expires_in" in data and anthropic_access_expiration(expires_in, 0) is None:
+            raise ValueError("Anthropic token refresh returned invalid expires_in")
+        return AnthropicRefreshResult(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=expires_in,
+            scopes=parse_anthropic_scopes(data["scope"]) if "scope" in data else None,
+            account=parse_anthropic_account(data),
+        )
+    except ValueError as error:
+        raise RefreshIndeterminateError(str(error)) from error
+
+
+def refreshed_anthropic_tokens(
+        current: AnthropicTokenSet,
+        result: AnthropicRefreshResult,
+        now: float | None = None) -> AnthropicTokenSet:
+    """Validate a refresh before replacing the root broker's credential."""
+    if not isinstance(result, AnthropicRefreshResult):
+        raise RefreshIndeterminateError("Anthropic token refresh returned an invalid result")
+    timestamp = time.time() if now is None else now
+    try:
+        refreshed = AnthropicTokenSet(
+            access_token=result.access_token,
+            # OAuth permits the server to omit an unchanged refresh token or scope.
+            refresh_token=(current.refresh_token if result.refresh_token is None else result.refresh_token),
+            client_id=current.client_id,
+            scopes=current.scopes if result.scopes is None else result.scopes,
+            account=current.account if result.account is None else result.account,
+            expires_at=anthropic_access_expiration(result.expires_in, timestamp),
+            last_refresh=timestamp,
+            grant_id=current.grant_id,
+        ).normalized(timestamp)
+    except ValueError as error:
+        raise RefreshIndeterminateError(str(error)) from error
+    if not refreshed.scopes.issubset(current.scopes):
+        raise RefreshPermanentError("Anthropic refresh widened the originally granted scopes")
+    if current.account is not None:
+        account = refreshed.account
+        if (account.uuid != current.account.uuid
+                or (current.account.organization_uuid is not None
+                    and account.organization_uuid is not None
+                    and account.organization_uuid != current.account.organization_uuid)):
+            raise RefreshPermanentError("Anthropic refresh changed the selected account")
+        # An omitted organization is not evidence that the account can move
+        # to another organization on a later refresh.
+        if account.organization_uuid is None and current.account.organization_uuid is not None:
+            refreshed = replace(refreshed, account=replace(account, organization_uuid=current.account.organization_uuid))
+    return refreshed
+
+
+async def rotate_anthropic_tokens(
+        current: AnthropicTokenSet) -> AnthropicTokenSet:
+    return refreshed_anthropic_tokens(current, await request_anthropic_token_refresh(current))

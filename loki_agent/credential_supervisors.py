@@ -48,6 +48,14 @@ class CredentialSupervisor:
                     stored.tokens,
                     rotate=storage.rotate_openai_subscription,
                 )
+            stored_anthropic = storage.load_anthropic_subscription(strict=False)
+            if (stored_anthropic is not None
+                    and stored_anthropic.state == "active"
+                    and stored_anthropic.tokens is not None):
+                self.broker.install_anthropic_subscription(
+                    stored_anthropic.tokens,
+                    rotate=storage.rotate_anthropic_subscription,
+                )
         self.inventory = CredentialInventory(
             self.environment,
             self.broker.available(),

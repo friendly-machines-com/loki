@@ -22,7 +22,11 @@ def _parser(program):
 
     login = commands.add_parser(
         "login", help="sign in to a provider")
-    login.add_argument("provider", choices=["openai"])
+    login.add_argument("provider", choices=["openai", "anthropic"])
+    login.add_argument(
+        "--client-id",
+        help="OAuth client ID registered by Anthropic for this integration (Anthropic only)",
+    )
     method = login.add_mutually_exclusive_group()
     method.add_argument(
         "--device-code",
@@ -38,11 +42,11 @@ def _parser(program):
     status = commands.add_parser(
         "status", help="show persistent login status")
     status.add_argument(
-        "provider", nargs="?", choices=["openai"])
+        "provider", nargs="?", choices=["openai", "anthropic"])
 
     logout = commands.add_parser(
         "logout", help="remove a persistent login")
-    logout.add_argument("provider", choices=["openai"])
+    logout.add_argument("provider", choices=["openai", "anthropic"])
     return parser
 
 
@@ -57,7 +61,30 @@ def _time_text(value):
         return f"timestamp {value:g}"
 
 
+async def _complete_browser_login(login, *, no_browser, provider):
+    try:
+        print("Open this URL in a browser:")
+        print(login.authorization_url)
+        if not no_browser:
+            try:
+                # The standard library's system-browser launcher is synchronous.
+                # A text-mode browser must not block the loop that serves its callback.
+                opened = await asyncio.to_thread(webbrowser.open, login.authorization_url, new=2)
+            except (OSError, webbrowser.Error):
+                opened = False
+            if not opened:
+                print("The browser could not be opened automatically; use the URL above.", file=sys.stderr)
+        print(f"Waiting for {provider} authorization...")
+        return await login.complete()
+    finally:
+        # Cancellation can arrive during browser launch, before complete().
+        await login.aclose()
+
+
 async def _login_openai(arguments, storage):
+    if arguments.client_id is not None:
+        print("--client-id is only supported for Anthropic login.", file=sys.stderr)
+        return 2
     if arguments.device_code:
         authorization = (
             await oauth_logins.request_openai_device_authorization())
@@ -70,29 +97,7 @@ async def _login_openai(arguments, storage):
             authorization)
     else:
         login = await oauth_logins.start_openai_browser_login()
-        print("Open this URL in a browser:")
-        print(login.authorization_url)
-        if not arguments.no_browser:
-            try:
-                # Some webbrowser controllers synchronously run a text-mode
-                # browser. The OAuth callback server uses this event loop, so
-                # blocking it here can prevent the login we just opened from
-                # completing.
-                opened = await asyncio.to_thread(
-                    webbrowser.open,
-                    login.authorization_url,
-                    new=2,
-                )
-            except webbrowser.Error:
-                opened = False
-            if not opened:
-                print(
-                    "The browser could not be opened automatically; "
-                    "use the URL above.",
-                    file=sys.stderr,
-                )
-        print("Waiting for OpenAI authorization...")
-        tokens = await login.complete()
+        tokens = await _complete_browser_login(login, no_browser=arguments.no_browser, provider="OpenAI")
 
     await storage.store_openai_login(tokens)
     print("Logged in: OpenAI ChatGPT subscription")
@@ -120,16 +125,78 @@ def _show_openai_status(storage):
     return 0
 
 
+async def _login_anthropic(arguments, storage):
+    if arguments.device_code:
+        print(
+            "Anthropic does not offer a device-code flow; use the browser "
+            "flow (optionally with --no-browser).",
+            file=sys.stderr,
+        )
+        return 2
+    if not arguments.client_id:
+        print(
+            "Anthropic login requires --client-id registered for this integration. "
+            "For ordinary API access, use ANTHROPIC_API_KEY.", file=sys.stderr,
+        )
+        return 2
+    login = await oauth_logins.start_anthropic_browser_login(client_id=arguments.client_id)
+    tokens = await _complete_browser_login(login, no_browser=arguments.no_browser, provider="Anthropic")
+
+    await storage.store_anthropic_login(tokens)
+    print("Logged in: Anthropic subscription")
+    if tokens.account is not None:
+        identity = tokens.account.email_address or tokens.account.uuid
+        print(f"Account: {identity!r}")
+    print(f"Credentials: {storage.file_path!r}")
+    return 0
+
+
+def _show_anthropic_status(storage):
+    stored = storage.load_anthropic_subscription()
+    if stored is None:
+        print("Anthropic subscription: not logged in")
+        return 1
+    if stored.state != "active" or stored.tokens is None:
+        print("Anthropic subscription: no active login")
+        return 1
+    print("Anthropic subscription: logged in")
+    if stored.tokens.account is not None:
+        identity = (
+            stored.tokens.account.email_address
+            or stored.tokens.account.uuid)
+        print(f"Account: {identity!r}")
+    print(f"Access token expires: {_time_text(stored.tokens.expires_at)}")
+    print(f"Last refresh: {_time_text(stored.tokens.last_refresh)}")
+    return 0
+
+
 async def run(arguments, *, program="loki", storage=None):
     parsed = _parser(program).parse_args(arguments)
     credential_storage = (
         storage if storage is not None else credential_storages.JsonCredentialStorage())
     try:
         if parsed.command == "login":
+            if parsed.provider == "anthropic":
+                return await _login_anthropic(parsed, credential_storage)
             return await _login_openai(parsed, credential_storage)
         if parsed.command == "status":
-            return _show_openai_status(credential_storage)
+            if parsed.provider == "anthropic":
+                return _show_anthropic_status(credential_storage)
+            if parsed.provider == "openai":
+                return _show_openai_status(credential_storage)
+            openai_code = _show_openai_status(credential_storage)
+            anthropic_code = _show_anthropic_status(credential_storage)
+            # Providers are alternatives; a missing optional login must not
+            # make an existing login look like a failed status check.
+            return min(openai_code, anthropic_code)
         if parsed.command == "logout":
+            if parsed.provider == "anthropic":
+                removed = await credential_storage.remove_anthropic_subscription()
+                if removed:
+                    print("Logged out: Anthropic subscription")
+                else:
+                    print("Anthropic subscription: not logged in")
+                return 0
             removed = await credential_storage.remove_openai_subscription()
             if removed:
                 print("Logged out: OpenAI ChatGPT subscription")

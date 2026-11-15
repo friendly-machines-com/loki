@@ -2025,7 +2025,8 @@ def build_headers(protocol, anthropic_version="2023-06-01"):
 def make_provider(input_url, provider=AUTO, models_url=None,
                   max_tokens=4096, anthropic_version="2023-06-01",
                   provider_id=None, provider_name=None, prompt_cache=False,
-                  openai_request_profile=None, reasoning_field=None):
+                  openai_request_profile=None, reasoning_field=None,
+                  model_discovery=True):
     protocol = resolve_protocol(input_url, provider)
     if (openai_request_profile is not None
             and not isinstance(
@@ -2060,8 +2061,14 @@ def make_provider(input_url, provider=AUTO, models_url=None,
             openai_request_profile=None,
         )
     chat_url, resolved_models_url = endpoint_urls(input_url, protocol, models_url=models_url)
-    model_urls = model_url_candidates(input_url, protocol, resolved_models_url,
-                                      explicit_models_url=models_url)
+    if model_discovery:
+        model_urls = model_url_candidates(input_url, protocol, resolved_models_url,
+                                          explicit_models_url=models_url)
+    else:
+        # A derived model-list URL would add a destination this connection
+        # has no authority to use and make an otherwise valid selection fail.
+        resolved_models_url = None
+        model_urls = []
     headers = build_headers(
         protocol, anthropic_version=anthropic_version)
     if (openai_request_profile is not None

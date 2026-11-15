@@ -374,6 +374,8 @@ def _auth_spec(provider_kind, credential_ref, request_urls,
         scheme = auth_scheme
     elif credential_ref.kind == "openai-subscription":
         scheme = "openai-subscription"
+    elif credential_ref.kind == "anthropic-subscription":
+        scheme = "anthropic-subscription"
     elif auth_header:
         scheme = "custom"
     elif provider_kind == protocols.ANTHROPIC_MESSAGES:
@@ -381,28 +383,35 @@ def _auth_spec(provider_kind, credential_ref, request_urls,
     else:
         scheme = "bearer"
     if scheme not in {
-            "anthropic", "bearer", "custom", "openai-subscription"}:
+            "anthropic", "bearer", "custom", "openai-subscription",
+            "anthropic-subscription"}:
         raise ValueError(f"unknown authentication scheme {scheme!r}")
     if ((credential_ref.kind == "openai-subscription")
             != (scheme == "openai-subscription")):
         raise ValueError(
             "OpenAI subscription credentials require the "
             "openai-subscription authentication scheme")
+    if ((credential_ref.kind == "anthropic-subscription")
+            != (scheme == "anthropic-subscription")):
+        raise ValueError(
+            "Anthropic subscription credentials require the "
+            "anthropic-subscription authentication scheme")
     if scheme == "custom" and not auth_header:
         raise ValueError(
             "custom authentication requires an authentication header")
+    if scheme == "openai-subscription":
+        authorized_urls = authentications.OPENAI_CHATGPT_CODEX_URLS
+    elif scheme == "anthropic-subscription":
+        # A saved connection or catalog override cannot widen OAuth authority.
+        authorized_urls = authentications.ANTHROPIC_SUBSCRIPTION_URLS
+    else:
+        authorized_urls = frozenset(
+            url for url in request_urls if url is not None)
     return authentications.AuthSpec(
         credential=credential_ref,
         scheme=scheme,
         header_name=auth_header if scheme == "custom" else None,
-        # The subscription scheme is bound to the canonical Codex URLs here
-        # rather than to whatever endpoints the provider happens to expose, so
-        # a provider-configuration change cannot widen credential authority.
-        authorized_urls=(
-            authentications.OPENAI_CHATGPT_CODEX_URLS
-            if scheme == "openai-subscription"
-            else frozenset(url for url in request_urls if url is not None)
-        ),
+        authorized_urls=authorized_urls,
     )
 
 
@@ -449,6 +458,9 @@ def make_runtime_config(
         reasoning_field=(
             reasoning_capabilities.interleaved_field
             if reasoning_capabilities is not None else None),
+        # Discovery uses public metadata; the OAuth grant has no authorized
+        # model-list endpoint, even if the base URL suggests one.
+        model_discovery=provider_id != models.ANTHROPIC_SUBSCRIPTION_PROVIDER_ID,
     )
     if (reasoning_effort_profile is not None
             and not protocols.reasoning_effort_supported(
@@ -470,6 +482,14 @@ def make_runtime_config(
         raise ValueError(
             "OpenAI subscription authentication requires the "
             "openai-subscription provider identity")
+    anthropic_subscription = auth_spec is not None and auth_spec.scheme == "anthropic-subscription"
+    if anthropic_subscription != (provider_id == models.ANTHROPIC_SUBSCRIPTION_PROVIDER_ID):
+        raise ValueError("Anthropic subscription authentication and provider identity must match")
+    if anthropic_subscription and (
+            credential_ref != authentications.CredentialRef.anthropic_subscription()
+            or chat_provider.kind != protocols.ANTHROPIC_MESSAGES
+            or models_url is not None):
+        raise ValueError("Anthropic subscription requires the Messages protocol without model discovery")
     authentications.validate_authorization_target(
         auth_spec, chat_provider.chat_url)
     return RuntimeConfig(
@@ -812,7 +832,7 @@ def config_from_modelsdev_selection(
         ),
         prompt_cache=_bool_setting(
             "LOKI_PROMPT_CACHE",
-            provider_id == "anthropic",
+            provider_id in {"anthropic", models.ANTHROPIC_SUBSCRIPTION_PROVIDER_ID},
             credentials,
         ),
         openai_request_profile=models.openai_request_profile(

@@ -121,7 +121,10 @@ Remove-Variable key
 ```
 
 The variable must be set in the terminal that starts Loki. Do not paste the key
-into the conversation or commit it to a file in your project.
+into the conversation or commit it to a file in your project. For the Anthropic
+API, use `ANTHROPIC_API_KEY` with a key from the
+[Claude Console](https://platform.claude.com/); a Claude subscription alone
+does not grant Loki API access.
 
 ### 3. Open a project and select a model
 
@@ -759,12 +762,26 @@ examples run outside Loki:
 "$LOKI" auth login openai --device-code
 ```
 
-In PowerShell, use `& $LOKI` for the executable. Browser login tries to open a URL
-and needs localhost port **1455 or 1457** for confirmation. Add `--no-browser` to
-print the URL without launching a browser; that still requires the callback to
-reach the machine running Loki. Device-code login avoids that local callback
-and is useful for remote/headless machines when the account permits it. An
-interrupted credential refresh may require logging in again.
+In PowerShell, use `& $LOKI` for the executable. OpenAI browser login uses
+localhost port **1455 or 1457**. Add `--no-browser` to print the URL without
+launching a browser; the callback must still reach the machine running Loki.
+OpenAI device-code login avoids the callback when the account permits it.
+An interrupted credential refresh may require logging in again. `auth status`
+without a provider reports both logins and succeeds if either one is stored
+and active.
+
+**Anthropic OAuth is for approved integrations only.** Anthropic's
+[credential-use policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
+does not permit ordinary third-party Claude account sign-in. Use an API key
+unless Anthropic has explicitly approved your integration and registered a
+public OAuth client for it. Loki does not ship an Anthropic client ID.
+
+With an authorized client that allows an ephemeral `127.0.0.1` port at
+`/callback`, run `"$LOKI" auth login anthropic --client-id CLIENT_ID`, then
+restart Loki and select **Anthropic subscription**. The model list is public
+metadata, not confirmation that the account has access to a specific model.
+Use `"$LOKI" auth status anthropic` or `"$LOKI" auth logout anthropic` to manage
+the login. Only the browser flow is available.
 
 Subscription tokens are stored in the user configuration directory's
 `credentials/tokens.json`, normally `~/.config/loki/credentials/tokens.json` on
