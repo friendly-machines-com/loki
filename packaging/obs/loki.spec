@@ -128,14 +128,19 @@ check_imports() {
 check_imports %{loki_pypy_executable}
 %else
 %if 0%{?suse_version}
-# Flavor version macros (%python311_version and friends) are not defined in
-# every SUSE build root, and RPM expands in a single pass, so computed macro
-# names stay literal there. %{pythons} is a plain %define that has expanded
-# reliably in every build: derive the versioned binary name in shell instead.
+# Check the wheel with the interpreter the wheel was built with. A Python
+# flavor name (%{pythons}: python311 on SLE 15.x, python313 on
+# Tumbleweed/Slowroll) maps to its binary by inserting a dot after the
+# major version: python313 -> python3.13. RPM cannot perform that mapping:
+# %python_expand inserts the flavor name itself, the flavor version macros
+# (python313_version and friends) are not defined in every SUSE build root,
+# and computed macro names stay literal because RPM expands macros in a
+# single pass. Convert the name in shell instead; the doubled percent signs
+# are required because RPM unescapes them before bash runs.
 flavor=%{pythons}
 suffix=${flavor#python}
 case $suffix in
-    ???) interpreter=%{_bindir}/python${suffix%??}.${suffix#?} ;;
+    ???) interpreter=%{_bindir}/python${suffix%%??}.${suffix#?} ;;
     *)   interpreter=%{_bindir}/python$suffix ;;
 esac
 check_imports "$interpreter"
