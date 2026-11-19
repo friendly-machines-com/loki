@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -115,6 +116,24 @@ class UsageControlTests(unittest.IsolatedAsyncioTestCase):
         await controls.USAGE.read(subscription_context(broker=broker, request=request))
         rotate.assert_awaited_once()
         self.assertEqual(requests, ["Bearer anthropic-access", "Bearer anthropic-new-access"])
+
+    async def test_inference_only_grant_is_denied_without_refreshing(self):
+        now = 1000
+        scopes = frozenset({auth.ANTHROPIC_INFERENCE_SCOPE})
+        expiring = replace(tokens(scopes=scopes), expires_at=now + 1, last_refresh=now - 3600)
+        rotate = mock.AsyncMock(return_value=tokens("new-access", scopes))
+        request = mock.AsyncMock()
+        broker = auth.CredentialBroker()
+        broker.install_anthropic_subscription(expiring, rotate=rotate, clock=lambda: now)
+
+        with self.assertRaisesRegex(auth.CredentialUnavailable, "account usage"):
+            await controls.USAGE.read(subscription_context(broker=broker, request=request))
+        rotate.assert_not_awaited()
+        request.assert_not_awaited()
+
+        lease = await broker.lease(auth.CredentialRef.anthropic_subscription(), auth.ANTHROPIC_BETA_MESSAGES_URL)
+        self.assertEqual(lease.value, "new-access")
+        rotate.assert_awaited_once()
 
     async def test_narrowed_grant_cannot_retry_usage(self):
         rotate = mock.AsyncMock(return_value=tokens("new-access", frozenset({auth.ANTHROPIC_INFERENCE_SCOPE})))

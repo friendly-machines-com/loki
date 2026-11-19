@@ -547,12 +547,19 @@ class _RotatingSubscriptionCredential:
         return rejected_generation == self._generation or self._expired(now)
 
     async def lease(
-            self, rejected_generation: int | None = None) -> CredentialLease:
+            self, rejected_generation: int | None = None, *,
+            check_scope: Callable[[], None] | None = None) -> CredentialLease:
+        if check_scope is not None:
+            check_scope()
         if not self._refresh_required(rejected_generation):
             return self._lease()
 
         observed_generation = self._generation
         async with self._refresh_lock:
+            # A different request may have narrowed this grant while we
+            # queued. Only a request still authorized can rotate it again.
+            if check_scope is not None:
+                check_scope()
             if not self._refresh_required(rejected_generation):
                 return self._lease()
             if (observed_generation != self._generation
@@ -678,6 +685,14 @@ class AnthropicSubscriptionCredential(_RotatingSubscriptionCredential):
                 self._tokens.account.uuid
                 if self._tokens.account is not None else None),
         )
+
+    def require_scope_for(self, destination: str) -> None:
+        # The broker already confined this lease to the two exact route sets.
+        inference = destination in ANTHROPIC_SUBSCRIPTION_URLS
+        scope = ANTHROPIC_INFERENCE_SCOPE if inference else ANTHROPIC_USAGE_SCOPE
+        if scope not in self._tokens.scopes:
+            purpose = "inference" if inference else "account usage"
+            raise CredentialUnavailable(f"Anthropic login did not grant access to {purpose}")
 
     def _needs_proactive_refresh(self, now: float) -> bool:
         if self._tokens.expires_at is not None:
@@ -810,19 +825,19 @@ class CredentialBroker:
             rejected_generation: int | None = None) -> CredentialLease:
         await self._check_approval(credential, destination)
         record = self._records[credential]
-        lease = await record.lease(rejected_generation)
+        if isinstance(record, AnthropicSubscriptionCredential):
+            # Check inside the shared refresh gate too: a check only in this
+            # broker would go stale while the request queued for rotation.
+            lease = await record.lease(rejected_generation, check_scope=lambda: record.require_scope_for(destination))
+        else:
+            lease = await record.lease(rejected_generation)
         # Refresh may have awaited network/storage while an approval changed.
-        # No await follows the final check before returning the value to the
+        # No await follows the final checks before returning the value to the
         # capability writer, which itself checks channel revocation.
         await self._check_approval(credential, destination)
         if isinstance(record, AnthropicSubscriptionCredential):
-            # Only the two exact route sets above passed approval. Check the
-            # specific scope after refresh in case the issuer narrowed it.
-            inference = destination in ANTHROPIC_SUBSCRIPTION_URLS
-            scope = ANTHROPIC_INFERENCE_SCOPE if inference else ANTHROPIC_USAGE_SCOPE
-            if scope not in record.tokens.scopes:
-                purpose = "inference" if inference else "account usage"
-                raise CredentialUnavailable(f"Anthropic login did not grant access to {purpose}")
+            # The issuer may have narrowed the newly rotated grant.
+            record.require_scope_for(destination)
         return lease
 
 
