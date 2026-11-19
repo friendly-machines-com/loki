@@ -312,7 +312,7 @@ ANTHROPIC_BILLING_SALT = ""
 
 
 def _first_user_text(payload):
-    messages = payload.get("messages") if isinstance(payload, dict) else None
+    messages = payload.get("messages")
     if not isinstance(messages, list):
         return ""
     for message in messages:
@@ -1252,8 +1252,7 @@ def decode_chat_response(data, *, context: RequestContext, effective_model=None,
             payload=data,
         )
     try:
-        turn = formats.coerce_decoded_turn(
-            context.config.chat_provider.parse_chat_response(data))
+        turn = context.config.chat_provider.parse_chat_response(data)
     except formats.TranscriptFormatError as e:
         raise protocols.ProtocolError(
             f"invalid {context.config.chat_provider.kind} response: {e}",

@@ -1042,13 +1042,14 @@ class Worker:
                 "prompt must be an array of content blocks",
                 code=acps.INVALID_PARAMS,
             )
-        supported_types = {"text", "resource_link"}
-        unsupported = [
-            block.get("type") if isinstance(block, dict) else type(block).__name__
-            for block in blocks
-            if (not isinstance(block, dict)
-                or block.get("type") not in supported_types)
-        ]
+        unsupported = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                unsupported.append(type(block).__name__)
+                continue
+            kind = block.get("type")
+            if kind not in ["text", "resource_link"]:
+                unsupported.append(kind)
         if unsupported:
             raise acps.TransportError(
                 "unsupported prompt content block types: "

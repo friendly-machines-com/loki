@@ -405,7 +405,7 @@ class LoopAdvertisementTests(unittest.IsolatedAsyncioTestCase):
                     ]
 
                     async def chat(items, *, codex_turn_state):
-                        return replies.pop(0)
+                        return formats.DecodedTurn(replies.pop(0))
 
                     if question:
                         replies.insert(1, [

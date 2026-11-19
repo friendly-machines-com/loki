@@ -45,12 +45,12 @@ def _spec(credential):
 
 def _balance_lines(payload) -> list[str]:
     lines = [f"{_PROVIDER_LABEL} - live"]
-    available = payload.get("is_available") if isinstance(payload, dict) else None
+    available = payload.get("is_available")
     if isinstance(available, bool):
         lines.append(
             "  Balance sufficient for API calls: "
             + ("yes" if available else "no"))
-    balance_infos = payload.get("balance_infos") if isinstance(payload, dict) else None
+    balance_infos = payload.get("balance_infos")
     if not isinstance(balance_infos, list) or not balance_infos:
         lines.append("  (no balance reported)")
         return lines

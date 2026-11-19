@@ -311,15 +311,6 @@ class DecodedTurn:
         )
 
 
-def coerce_decoded_turn(value):
-    if isinstance(value, DecodedTurn):
-        return value
-    if isinstance(value, list):
-        return DecodedTurn(value)
-    raise TranscriptFormatError(
-        "chat adapter must return DecodedTurn or a list of response items")
-
-
 def blocks_text(blocks):
     parts = []
     for block in blocks or []:
@@ -616,12 +607,7 @@ def _native_replay_allowed(event, protocol, target):
 
 
 def response_tool_calls(value):
-    if isinstance(value, DecodedTurn):
-        values = value.items
-    elif isinstance(value, dict):
-        values = _event_items(value)
-    else:
-        values = value or []
+    values = _event_items(value) if isinstance(value, dict) else value or []
     calls = []
     for event in values:
         for item in _event_items(event):

@@ -126,13 +126,17 @@ def encoded_messages(message: dict):
     """
     params = message.get('params')
     update = params.get('update') if isinstance(params, dict) else None
-    content = update.get('content') if isinstance(update, dict) else None
-    text = content.get('text') if isinstance(content, dict) else None
-    if (message.get('method') != 'session/update' or 'id' in message
-            or not isinstance(params, dict) or not isinstance(update, dict)
-            or not isinstance(content, dict) or not isinstance(text, str) or content.get('type') != 'text'
-            or update.get('sessionUpdate') not in [
-                'user_message_chunk', 'agent_message_chunk', 'agent_thought_chunk']):
+    content = (
+        update.get('content')
+        if isinstance(update, dict) and update.get('sessionUpdate') in [
+            'user_message_chunk', 'agent_message_chunk', 'agent_thought_chunk']
+        else None
+    )
+    text = (
+        content.get('text')
+        if isinstance(content, dict) and content.get('type') == 'text' else None
+    )
+    if message.get('method') != 'session/update' or 'id' in message or not isinstance(text, str):
         yield encode_message(message)
         return
     packet, params, update, content = dict(message), dict(params), dict(update), dict(content)

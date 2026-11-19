@@ -1275,14 +1275,6 @@ class OpenAIChatStreamAccumulator:
                     call["function"]["name"] += name
                 if isinstance(arguments, str):
                     call["function"]["arguments"] += arguments
-            unknown_call = {
-                key: value for key, value in delta.items()
-                if key not in ["index", "id", "type", "function"]
-            }
-            for key, value in unknown_call.items():
-                call[key] = self._merge_delta_value(
-                    call.get(key), value)
-            if isinstance(function, dict):
                 unknown_function = {
                     key: value for key, value in function.items()
                     if key not in ["name", "arguments"]
@@ -1290,6 +1282,13 @@ class OpenAIChatStreamAccumulator:
                 for key, value in unknown_function.items():
                     call["function"][key] = self._merge_delta_value(
                         call["function"].get(key), value)
+            unknown_call = {
+                key: value for key, value in delta.items()
+                if key not in ["index", "id", "type", "function"]
+            }
+            for key, value in unknown_call.items():
+                call[key] = self._merge_delta_value(
+                    call.get(key), value)
 
     def _accumulate_legacy_function_call(self, delta):
         if not isinstance(delta, dict):

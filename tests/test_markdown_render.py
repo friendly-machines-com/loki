@@ -769,7 +769,7 @@ class ToolLoopWiringTests(unittest.TestCase):
                 items, on_text_delta, *, codex_turn_state):
             for chunk in ["prefix **hel", "lo** `wor", "ld`"]:
                 on_text_delta(chunk)
-            return [formats.message_item("assistant", reply)]
+            return formats.DecodedTurn([formats.message_item("assistant", reply)])
 
         result = asyncio.run(loki.run_tool_loop_async(
             transcript,

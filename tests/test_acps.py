@@ -300,6 +300,20 @@ class FramingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(''.join(json.loads(line)['params']['update']['content']['text']
                                  for line in lines), text)
 
+    def test_oversized_updates_without_appendable_text_emit_no_frame(self):
+        output = io.StringIO()
+        write = self.checked_writer(output)
+        large = 'x' * 512
+        with mock.patch.object(acps, 'MAX_MESSAGE_BYTES', 256):
+            for update in [
+                    [large],
+                    {'sessionUpdate': 'agent_message_chunk', 'content': [large]},
+                    {'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'resource_link', 'text': large}},
+                    {'sessionUpdate': 'plan', 'content': {'type': 'text', 'text': large}}]:
+                with self.assertRaises(acps.MessageTooLarge):
+                    write(acps.notification('session/update', {'sessionId': 's', 'update': update}))
+        self.assertEqual(output.getvalue(), '')
+
     async def test_worker_returns_a_bounded_error_for_an_oversized_result(self):
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
@@ -619,12 +633,13 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         # A worker that exits without answering must fail the request that
         # waits on it, not leave the caller waiting for a reply that cannot
         # arrive.
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, "-c", "pass",
+        transport, protocol = await asyncio.get_running_loop().subprocess_exec(
+            streams.ProcessProtocol,
+            sys.executable, "-c", "import sys; sys.stdin.buffer.readline()",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
-        channel = acp.WorkerChannel("dying", process, lambda message: None)
+        channel = acp.WorkerChannel("dying", streams.Process(transport, protocol), lambda message: None)
         try:
-            with self.assertRaises(acps.TransportError):
+            with self.assertRaisesRegex(acps.TransportError, "exited with status 0"):
                 await channel.request("session/new", {})
         finally:
             await channel.close()
@@ -747,7 +762,7 @@ class FrontSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
         failure = windows_api.WindowsApiError('CloseHandle failed', status=6)
         delegation = mock.Mock(child_spawned=mock.Mock(side_effect=failure), close=mock.AsyncMock())
-        process = mock.Mock(stdin=None, stdout=asyncio.StreamReader(), returncode=None)
+        process = mock.Mock(stdin=None, stdout=asyncio.StreamReader(), returncode=None, aclose=mock.AsyncMock())
 
         async def wait():
             process.returncode = 0
@@ -762,6 +777,7 @@ class FrontSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*list(front._tasks), return_exceptions=True)
         self.assertIs(caught.exception, failure)
         process.wait.assert_awaited()
+        process.aclose.assert_awaited_once_with()
         delegation.close.assert_awaited()
         self.assertEqual(process.returncode, 0)
         self.assertFalse(front._sessions)
@@ -1664,6 +1680,11 @@ class WorkerSessionNameTests(unittest.TestCase):
                             try:
                                 front.handle(acps.request(1, method, params))
                                 self.assertEqual(messages[0]['error']['code'], acps.INVALID_PARAMS)
+                                # A direct restore also needs an existing name,
+                                # not the generated ID used for a new session.
+                                with self.assertRaises(acps.TransportError) as rejected:
+                                    await front.restore_session(method, params)
+                                self.assertEqual(rejected.exception.code, acps.INVALID_PARAMS)
                                 self.assertEqual(front._sessions, {})
                                 self.assertFalse(front._tasks)
                                 delegate.assert_not_awaited()
@@ -3827,7 +3848,6 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
             resources.push_async_callback(session.close_state)
             stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
             stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
-            stack.enter_context(mock.patch.object(acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
             loki.apply_runtime_config(connections.build_config_from_env(credentials=loki.CREDENTIALS))
             messages = []
             requests = []
@@ -3981,6 +4001,10 @@ class _LocalWorkerProcess:
     async def wait_closed(self):
         await self.wait()
 
+    async def aclose(self):
+        self.close()
+        await self.wait()
+
     async def wait(self):
         await self.finished.wait()
         await asyncio.shield(self.close_task)
@@ -3988,6 +4012,22 @@ class _LocalWorkerProcess:
 
 
 class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_malformed_prompt_block_types_are_invalid_params(self):
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        session = Session()
+        self.addAsyncCleanup(session.close_state)
+        replies = []
+        worker = Worker(session, replies.append)
+        self.addAsyncCleanup(worker.close)
+        for block in [[], {'type': ['text'], 'text': 'not a text block'}]:
+            replies.clear()
+            await worker.handle(acps.request(1, 'session/prompt', {'prompt': [block]}))
+            self.assertEqual(replies[0]['error']['code'], acps.INVALID_PARAMS)
+            self.assertIn('unsupported prompt content block types', replies[0]['error']['message'])
+            self.assertEqual(session.transcript_items, [])
+
     async def test_pending_open_rejects_local_commands_before_prompt_admission(self):
         from loki_agent import acp_worker
         from loki_agent.sessions import Session
@@ -4048,9 +4088,6 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(mock.patch.object(loki, "current_model", return_value="model"))
                 stack.enter_context(mock.patch.object(loki, "async_chat_completion", new=completion))
             stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(state_root, "jobs")))
-            # The process seam owns byte transport, not an OS process.
-            stack.enter_context(mock.patch.object(
-                acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
             process = _LocalWorkerProcess(session, "prompt-owner", lambda message: None)
             channel = acp.WorkerChannel("prompt-owner", process, messages.append)
             try:
@@ -4778,8 +4815,6 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
 
                     stack.enter_context(mock.patch.object(acp.runtime_isolation, "start_worker", new=launch))
                     stack.enter_context(mock.patch.object(acp, "WorkerChannel", new=channel))
-                    # OS process release is outside this byte-transport lane.
-                    stack.enter_context(mock.patch.object(acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
 
                     async def backstop():
                         for source in sources:
@@ -6174,7 +6209,6 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                     return process
 
                 stack.enter_context(mock.patch.object(acp.runtime_isolation, 'start_worker', new=launch))
-                stack.enter_context(mock.patch.object(acp.runtime_isolation, 'close_runtime_process', new=lambda process: None))
 
                 async def wait_message(predicate, *finished):
                     while True:

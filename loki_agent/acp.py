@@ -77,7 +77,7 @@ class WorkerChannel:
     """One request multiplexer around one worker subprocess."""
 
     def __init__(self, session_id: str,
-                 process: asyncio.subprocess.Process | streams.Process,
+                 process: streams.Process,
                  forward, credential_delegation=None, reverse_handler=None):
         self.session_id = session_id
         self.process = process
@@ -263,14 +263,9 @@ class WorkerChannel:
             async with contextlib.AsyncExitStack() as cleanup:
                 if delegation is not None:
                     cleanup.push_async_callback(delegation.close)
-                if isinstance(self.process, streams.Process):
-                    # Loki owns its transport/native observers as well as the
-                    # leader. Join that existing owner, including close errors.
-                    cleanup.push_async_callback(self.process.aclose)
-                else:
-                    # Standard-library fixture processes retain their fixture's
-                    # stream owner; do not invent Session-completion semantics.
-                    cleanup.callback(runtime_isolation.close_runtime_process, self.process)
+                # Leader exit alone does not retire the worker's transport
+                # and observers. Join the process owner's cleanup as well.
+                cleanup.push_async_callback(self.process.aclose)
                 try:
                     try:
                         if self.process.stdin is not None:
@@ -447,8 +442,7 @@ class Front:
             self.write(acps.error_response(message["id"], detail))
 
     def _reserve_session(self, session_id: object):
-        # Wire values are untrusted; the shared bool predicate is not a type guard.
-        if not isinstance(session_id, str) or not savefiles.valid_chat_id(session_id):
+        if not savefiles.valid_chat_id(session_id):
             raise acps.TransportError(
                 "session name is invalid", code=acps.INVALID_PARAMS)
         if session_id in self._sessions:
@@ -719,8 +713,7 @@ class Front:
         if updates:
             # The client learns the session before commands and current plan.
             # These are fresh state, not conversation replay on resume.
-            session_id = (
-                result.get("sessionId") if isinstance(result, dict) else None)
+            session_id = result.get("sessionId")
             if not isinstance(session_id, str) or not session_id:
                 session_id = (message.get("params") or {}).get("sessionId")
             if isinstance(session_id, str) and session_id:
@@ -1121,14 +1114,11 @@ class Front:
             },
         }, owner=owner)
         content = (
-            result.get("content") if isinstance(result, dict) else None)
-        accepted = (
-            isinstance(result, dict)
-            and result.get("action") == "accept"
-            and isinstance(content, dict)
-            and content.get("authorize") is True
+            result.get("content")
+            if isinstance(result, dict) and result.get("action") == "accept"
+            else None
         )
-        if not accepted:
+        if not (isinstance(content, dict) and content.get("authorize") is True):
             raise acps.TransportError(
                 "saved connection authorization was not accepted",
                 code=acps.INVALID_PARAMS,
@@ -1182,8 +1172,11 @@ class Front:
                            session_id: str | None = None,
                            restore_request_id=None, owner=None) -> tuple[str, dict]:
         if owner is None:
-            owner = self._reserve_session(
-                session_id or f"loki-{uuid.uuid4()}")
+            # A restore must pass the saved name through the same reservation
+            # as a wire request. Only a fresh session may generate a name.
+            if open_method == "session/new" and session_id is None:
+                session_id = f"loki-{uuid.uuid4()}"
+            owner = self._reserve_session(session_id)
         session_id = owner.session_id
         self._check_owner(owner)
         channel = None
@@ -1300,17 +1293,11 @@ class Front:
     async def restore_session(
             self, method: str, params: dict, request_id=None, owner=None) -> dict:
         """Restore one saved session with the method's ACP replay semantics."""
-        saved_id = params.get("sessionId")
-        if not isinstance(saved_id, str) or not saved_id:
-            raise acps.TransportError(
-                f"{method} requires sessionId",
-                code=acps.INVALID_PARAMS,
-            )
         self._validate_session_setup(params)
         _, worker_reply = await self._open_worker(
             cwd=self._working_directory(params),
             open_method=("session/load" if self.protocol_version == 2 and params.get("replayFrom") is not None else method),
-            session_id=saved_id,
+            session_id=params.get("sessionId"),
             restore_request_id=request_id,
             owner=owner,
         )
@@ -1454,14 +1441,11 @@ class Front:
             },
         }, owner=owner)
         content = (
-            result.get("content") if isinstance(result, dict) else None)
-        approved = (
-            isinstance(result, dict)
-            and result.get("action") == "accept"
-            and isinstance(content, dict)
-            and content.get("approve") is True
+            result.get("content")
+            if isinstance(result, dict) and result.get("action") == "accept"
+            else None
         )
-        if not approved:
+        if not (isinstance(content, dict) and content.get("approve") is True):
             raise acps.TransportError(
                 "the provider endpoint was not approved",
                 code=acps.INVALID_PARAMS,

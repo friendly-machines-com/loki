@@ -220,7 +220,7 @@ def _usage_lines(data) -> list[str]:
     level = data.get("level")
     if isinstance(level, str) and level:
         lines.append(f"Plan: {_text(level)}")
-    limits = data.get("limits") if isinstance(data, dict) else None
+    limits = data.get("limits")
     rendered = [
         line for line in (
             _limit_line(limit) for limit in (
@@ -234,7 +234,7 @@ def _usage_lines(data) -> list[str]:
 
 
 def _cards(data, source_key):
-    entries = data.get(source_key) if isinstance(data, dict) else None
+    entries = data.get(source_key)
     if not isinstance(entries, list):
         return []
     cards = []

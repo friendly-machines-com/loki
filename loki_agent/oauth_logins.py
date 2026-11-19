@@ -172,8 +172,6 @@ async def exchange_openai_authorization_code(
         *,
         request=None,
         now=None):
-    if not isinstance(code, str) or not code:
-        raise OAuthLoginError("OpenAI callback omitted its authorization code")
     body = urllib.parse.urlencode({
         "grant_type": "authorization_code",
         "code": code,
@@ -481,8 +479,6 @@ def anthropic_authorization_url(redirect_uri: str, pkce: PkceCodes, state: str, 
 async def exchange_anthropic_authorization_code(
         code: str, redirect_uri: str, pkce: PkceCodes, state: str, *,
         client_id: str, request=None, now=None):
-    if not isinstance(code, str) or not code:
-        raise OAuthLoginError("Anthropic callback omitted its authorization code")
     body = json.dumps({
         "grant_type": "authorization_code",
         "code": code,

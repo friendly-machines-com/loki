@@ -181,7 +181,6 @@ class ChannelInsertionTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(session.close_state)
         process = fixtures._LocalWorkerProcess(session, "insertion", lambda message: None)
         process.worker.protocol_version = 2
-        self.enterContext(mock.patch.object(acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
         channel = acp.WorkerChannel("insertion", process, lambda message: None)
         self.addAsyncCleanup(channel.close)
         return channel

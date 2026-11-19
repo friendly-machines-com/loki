@@ -1615,6 +1615,8 @@ async def run_tool_loop_async(
         compaction_requests=None) -> str:
     """Run the model/tool loop over canonical session events.
 
+    ``chat_fn`` returns a DecodedTurn carrying completion and response metadata
+    along with the items; the loop needs those facts before appending the turn.
     Mutates ``transcript_items`` by appending one ``model_response`` for each
     actual provider response and one event for each local tool result. The
     callback receives ``codex_turn_state`` explicitly because it changes the
@@ -1835,9 +1837,9 @@ async def run_tool_loop_async(
                 stream_kwargs = {"codex_turn_state": codex_turn_state}
                 if thinking.traces == "on":
                     stream_kwargs["on_reasoning_delta"] = on_reasoning_delta
-                response_items = await chat_fn(transcript_items, on_text_delta, **stream_kwargs)
+                turn = await chat_fn(transcript_items, on_text_delta, **stream_kwargs)
             else:
-                response_items = await chat_fn(
+                turn = await chat_fn(
                     transcript_items,
                     codex_turn_state=codex_turn_state)
         except recoveries.Cancelled:
@@ -1879,7 +1881,6 @@ async def run_tool_loop_async(
                 "saved": False,
             })
             return ""
-        turn = formats.coerce_decoded_turn(response_items)
         buffered_reasoning = thinking.traces == "on" and not (live_reasoning or live_text_parts)
         if thinking.traces == "on" and not buffered_reasoning:
             source = next((key[1] for key in live_reasoning if key[0] == "chat"), formats.reasoning_field(turn))
@@ -2060,10 +2061,9 @@ async def run_toolless_completion_async(
     # WebFetch's processing request is part of that tool operation. Returning
     # an exception's prose here would turn the failed request into page content;
     # let the existing outer tool exception boundary carry its failed status.
-    response_items = await async_chat_completion(
+    turn = await async_chat_completion(
         transcript_items, tools=[], codex_turn_state=codex_turn_state,
         reasoning_effort=reasoning_effort, thinking=thinking, **kwargs)
-    turn = formats.coerce_decoded_turn(response_items)
     if not turn:
         return ""
     return "\n".join(
@@ -2075,18 +2075,10 @@ async def run_toolless_completion_async(
         if text)
 
 
-def _subprocess_stream_text(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode('utf-8', errors='replace')
-    return str(value)
-
-
 def _format_subagent_result(agent_type: str, description: str, status: str,
-                            exit_code: int | None, stdout, stderr) -> str:
-    stdout_text = _subprocess_stream_text(stdout).strip()
-    stderr_text = _subprocess_stream_text(stderr).strip()
+                            exit_code: int | None, stdout: str, stderr: str) -> str:
+    stdout_text = stdout.strip()
+    stderr_text = stderr.strip()
     parts = [
         f"[{agent_type} subagent: {description or 'subagent task'}]",
         f"status: {status}",
@@ -2936,8 +2928,6 @@ def load_chat_log(filename, loaded=None, *, apply_shell_cwd=True):
 
 
 def load_session_state(state: dict, *, apply_shell_cwd=True):
-    if not isinstance(state, dict):
-        return
     session = current_session()
     # This describes an instruction already recorded in the transcript, not
     # the operating mode to activate or a server acknowledgement.
@@ -2993,7 +2983,7 @@ def load_session_state(state: dict, *, apply_shell_cwd=True):
 
 
 def reasoning_effort_from_session_state(state: dict) -> str | None:
-    if not isinstance(state, dict) or "reasoning_effort" not in state:
+    if "reasoning_effort" not in state:
         return None
     try:
         return modelsdev.validate_reasoning_effort(
@@ -3003,7 +2993,7 @@ def reasoning_effort_from_session_state(state: dict) -> str | None:
 
 
 def connection_from_session_state(state: dict) -> ConnectionDescriptor | None:
-    if not isinstance(state, dict) or "connection" not in state:
+    if "connection" not in state:
         return None
     return ConnectionDescriptor.from_dict(state["connection"])
 

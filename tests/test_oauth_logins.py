@@ -90,6 +90,17 @@ class OpenAIBrowserLoginTests(unittest.IsolatedAsyncioTestCase):
         login.close()
         await login._server.wait_closed()
 
+    async def test_callback_requires_one_nonempty_code(self):
+        login = await oauth_logins.start_openai_browser_login(ports=[0])
+        self.addAsyncCleanup(login.aclose)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(login.authorization_url).query)
+        for codes in [[], [""], ["one", "two"]]:
+            with self.subTest(codes=codes):
+                parameters = urllib.parse.urlencode({"state": query["state"], "code": codes}, doseq=True)
+                answer = await self._callback(login, f"GET /auth/callback?{parameters} HTTP/1.1\r\n\r\n".encode("ascii"))
+                self.assertIn(b"400 Bad Request", answer)
+                self.assertFalse(login._result.done())
+
     async def test_oversized_callback_cannot_finish_login(self):
         login = await oauth_logins.start_openai_browser_login(
             ports=(0,))

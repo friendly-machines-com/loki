@@ -215,8 +215,10 @@ class SkillFrontendTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                                              if tool.get('function', {}).get('name') == 'Skill'))
                     if len(received) == 1:
                         self.write_skill('Changed after first request')
-                        return [formats.tool_call_item('load', 'Skill', {'skill': _NAME, 'args': _ARGUMENT})]
-                    return [formats.message_item('assistant', 'complete')]
+                        return formats.DecodedTurn([
+                            formats.tool_call_item('load', 'Skill', {'skill': _NAME, 'args': _ARGUMENT}),
+                        ])
+                    return formats.DecodedTurn([formats.message_item('assistant', 'complete')])
 
                 async def run_turn():
                     if frontend == 'terminal':
@@ -246,7 +248,7 @@ class SkillFrontendTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                         received.append(copy.deepcopy(items))
                         descriptions.append(next(tool['function']['description'] for tool in tools
                                                  if tool.get('function', {}).get('name') == 'Skill'))
-                        return [formats.message_item('assistant', 'next')]
+                        return formats.DecodedTurn([formats.message_item('assistant', 'next')])
 
                     with mock.patch.object(loki, 'async_chat_completion', new=next_turn):
                         await run_turn()
@@ -265,7 +267,7 @@ class SkillFrontendTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
         ]
 
         async def model(items, *, codex_turn_state):
-            return replies.pop(0)
+            return formats.DecodedTurn(replies.pop(0))
 
         await loki.run_tool_loop_async(transcript, allowed=loki.EXPLORE_TOOLS, chat_fn=model)
         results = {event['call_id']: event for event in transcript if event.get('type') == 'tool_result'}

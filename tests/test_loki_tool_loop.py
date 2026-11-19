@@ -2970,7 +2970,7 @@ class HeadlessRequestOutcomeTests(unittest.IsolatedAsyncioTestCase):
     async def request(self, *, error=None, answer=''):
         output, diagnostics = io.StringIO(), io.StringIO()
         completion = mock.AsyncMock(side_effect=error) if error is not None else mock.AsyncMock(
-            return_value=[formats.message_item('assistant', answer)])
+            return_value=formats.DecodedTurn([formats.message_item('assistant', answer)]))
         with mock.patch.object(loki.current_session(), 'agent_mode', 'normal'), \
                 mock.patch.object(loki, 'async_chat_completion', new=completion), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(diagnostics):
@@ -7480,7 +7480,7 @@ class StreamingToolLoopTests(unittest.TestCase):
                 items, on_text_delta, *, codex_turn_state):
             on_text_delta("hel")
             on_text_delta("lo")
-            return [formats.message_item("assistant", "hello")]
+            return formats.DecodedTurn([formats.message_item("assistant", "hello")])
 
         result = asyncio.run(loki.run_tool_loop_async(
             transcript,
@@ -8033,7 +8033,7 @@ class QuestionGuardTests(unittest.TestCase):
         ]
 
         async def scripted_chat(items, *, codex_turn_state):
-            return first_calls.pop(0)
+            return formats.DecodedTurn(first_calls.pop(0))
 
         self.runner.run(loki.run_tool_loop_async(
             transcript, chat_fn=scripted_chat))
@@ -8048,7 +8048,7 @@ class QuestionGuardTests(unittest.TestCase):
         ]
 
         async def scripted_chat2(items, *, codex_turn_state):
-            return second_calls.pop(0)
+            return formats.DecodedTurn(second_calls.pop(0))
 
         before = len(transcript)
         self.runner.run(loki.run_tool_loop_async(
@@ -8152,7 +8152,7 @@ class QuestionGuardTests(unittest.TestCase):
         ]
 
         async def scripted_chat(items, *, codex_turn_state):
-            return replies.pop(0)
+            return formats.DecodedTurn(replies.pop(0))
 
         self.runner.run(loki.run_tool_loop_async(
             transcript, chat_fn=scripted_chat))

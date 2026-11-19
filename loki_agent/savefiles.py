@@ -455,7 +455,7 @@ def read_chat_log(file_obj) -> tuple[list, list, dict, list]:
         # nesting limit must not turn such a file into an uncaught startup error.
         raise ValueError('saved conversation JSON nesting is too deep') from error
     events, todos = formats.load_log_blob(blob)
-    state = blob.get("session_state", {}) if isinstance(blob, dict) else {}
+    state = blob.get("session_state", {})
     if not isinstance(state, dict):
         state = {}
     return (

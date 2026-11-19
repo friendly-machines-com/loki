@@ -594,8 +594,6 @@ class BoundedMarkdownAnsi:
     def feed(self, text):
         if self._closed:
             raise RuntimeError("cannot feed a finished Markdown renderer")
-        if not isinstance(text, str):
-            raise TypeError("Markdown chunks must be strings")
         escaped_text = escape_terminal_text(text, multiline=True)
         if not self.style:
             return (escaped_text,) if escaped_text else ()
@@ -1351,12 +1349,8 @@ def _modify_other_keys_parameters(parameters):
     return fields[2][0], modifiers, event_type
 
 
-def _unicode_scalar(code):
-    return (
-        isinstance(code, int)
-        and 0 <= code <= 0x10ffff
-        and not 0xd800 <= code <= 0xdfff
-    )
+def _unicode_scalar(code: int) -> bool:
+    return 0 <= code <= 0x10ffff and not 0xd800 <= code <= 0xdfff
 
 
 def _kitty_text_scalar(code):
@@ -2279,12 +2273,13 @@ class UserMessageQueue(asyncio.Queue):
                 pass
 
     def put_nowait(self, item):
-        entry = item if item is None or item is CONTROL_WAKE else QueuedText(self._next_id, item)
-        super().put_nowait(entry)
-        if isinstance(entry, QueuedText):
-            self._next_id += 1
-            self._message_count += 1
-            self._notify_size_change()
+        if item is None or item is CONTROL_WAKE:
+            super().put_nowait(item)
+            return
+        super().put_nowait(QueuedText(self._next_id, item))
+        self._next_id += 1
+        self._message_count += 1
+        self._notify_size_change()
 
     def get_nowait(self):
         entry = super().get_nowait()

@@ -37,7 +37,7 @@ def _tool_call(name, call_id, arguments=None):
 
 
 class _ScriptedChat:
-    """chat_fn that returns scripted response item lists, counting calls."""
+    """chat_fn that returns scripted turns, counting calls."""
 
     def __init__(self, responses):
         # Each response is a list of canonical output items for one turn.
@@ -47,7 +47,7 @@ class _ScriptedChat:
     async def __call__(
             self, items, on_text_delta=None, *, codex_turn_state):
         self.calls += 1
-        return self.responses.pop(0)
+        return formats.DecodedTurn(self.responses.pop(0))
 
 
 class _CancelAfter:
@@ -175,10 +175,9 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
         async def response_and_cancel(
                 _items, *, codex_turn_state):
             cancel.cancelled = True
-            return [
-                formats.message_item(
-                    "assistant", "must not be accepted"),
-            ]
+            return formats.DecodedTurn([
+                formats.message_item("assistant", "must not be accepted"),
+            ])
 
         result = asyncio.run(loki.run_tool_loop_async(
             transcript,
