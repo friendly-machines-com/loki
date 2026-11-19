@@ -825,9 +825,14 @@ def config_from_modelsdev_selection(
             provider_id, provider_entry),
         credential_ref=access.credential_ref,
         model_status=model_status,
+        # Show output as it arrives on known subscription routes. Sharing
+        # their API protocol does not guarantee other endpoints support SSE.
         stream=_bool_setting(
             "LOKI_STREAM",
-            provider_id == models.OPENAI_SUBSCRIPTION_PROVIDER_ID,
+            provider_id in {
+                models.OPENAI_SUBSCRIPTION_PROVIDER_ID,
+                models.ANTHROPIC_SUBSCRIPTION_PROVIDER_ID,
+            },
             credentials,
         ),
         prompt_cache=_bool_setting(

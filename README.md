@@ -674,9 +674,11 @@ not its complete internal reasoning.
 
 ### Streaming and context usage
 
-`LOKI_STREAM=1` requests streamed assistant display. Streaming is off by default;
-if the server rejects it, use `LOKI_STREAM=0`. Provider-specific connections can
-have their own streaming requirements.
+Streaming is on by default when you select an OpenAI ChatGPT or Anthropic Claude
+subscription model, and off by default for other new connections. Set
+`LOKI_STREAM=1` before launch to request streamed assistant output, or
+`LOKI_STREAM=0` to request a buffered response where the provider supports it.
+Resumed chats keep their saved setting unless you set `LOKI_STREAM`.
 
 The status area's `Context: 37%` is the **last reported** context usage, not a
 precise estimate of your next prompt. `*` marks an older/incomplete measurement;

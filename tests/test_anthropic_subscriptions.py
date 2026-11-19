@@ -752,6 +752,33 @@ class AnthropicConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(models.provider_is_synthetic(after[provider_id]))
         self.assertNotIn(provider_id, anonymous)
 
+    def test_subscription_streaming_default_and_opt_out(self):
+        catalog = catalog_fixture()
+        model = "claude-sonnet-4-6"
+        # Compare the same model on the two first-party Anthropic routes.
+        catalog["anthropic"]["models"][model].pop("provider")
+        catalog = models.add_anthropic_subscription_catalog(catalog)
+        subscription = models.ANTHROPIC_SUBSCRIPTION_PROVIDER_ID
+        refs = [
+            authentications.CredentialRef.anthropic_subscription(),
+            authentications.CredentialRef.environment("ANTHROPIC_API_KEY"),
+        ]
+        no_override = CredentialInventory({}, refs)
+        for provider_id, settings, expected in [
+                [subscription, {}, True],
+                [subscription, {"LOKI_STREAM": "0"}, False],
+                ["anthropic", {}, False]]:
+            with self.subTest(provider_id=provider_id, settings=settings):
+                provider = catalog[provider_id]
+                config = connections.config_from_modelsdev_selection(
+                    provider_id, provider, provider["models"][model],
+                    CredentialInventory(settings, refs))
+                self.assertIs(config.stream, expected)
+                descriptor = connections.connection_descriptor_from_config(config)
+                restored = connections.config_from_connection_descriptor(
+                    descriptor, no_override)
+                self.assertIs(restored.stream, expected)
+
     async def test_selection_and_saved_connection_keep_separate_url_sets(self):
         raw_catalog = catalog_fixture()
         catalog = models.add_anthropic_subscription_catalog(raw_catalog)
