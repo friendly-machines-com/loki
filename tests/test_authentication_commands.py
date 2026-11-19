@@ -744,6 +744,47 @@ connection.close()
         self.assertEqual(terminal.returncode, 0, terminal.stderr)
         self.assertEqual(acp.returncode, 0, acp.stderr)
 
+    def test_acp_can_initialize_and_exit_while_anthropic_refresh_is_pending(self):
+        async def exercise(directory):
+            environment = child_environment(
+                PATH=os.environ.get("PATH", ""), HOME=directory,
+                XDG_CONFIG_HOME=directory, XDG_STATE_HOME=directory)
+            with contextlib.closing(credential_storages.JsonCredentialStorage(
+                    paths.credential_directory(environment))) as storage:
+                stored = await storage.store_anthropic_login(authentications.AnthropicTokenSet(
+                    "fixture-access", "fixture-refresh", "fixture-client", authentications.ANTHROPIC_OAUTH_SCOPES))
+                refreshing, release = asyncio.Event(), asyncio.Event()
+
+                async def refresh(_current):
+                    refreshing.set()
+                    await release.wait()
+                    return authentications.AnthropicRefreshResult("new-access", "new-refresh")
+
+                async with running_fixture_task(storage.rotate_anthropic_subscription(stored.tokens, refresh)) as rotation:
+                    await observe_fixture(refreshing.wait(), rotation)
+                    process = await asyncio.create_subprocess_exec(
+                        entrypoint("loki-acp"), cwd=directory, env=environment,
+                        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    )
+                    resources = ProcessResources(process)
+                    try:
+                        initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}}
+                        process.stdin.write(json.dumps(initialize).encode("utf-8") + b"\n")
+                        await process.stdin.drain()
+                        reply = json.loads(await process.stdout.readline())
+                        self.assertEqual(reply["result"]["protocolVersion"], 1)
+                        _stdout, stderr = await process.communicate(input=b"")
+                        self.assertEqual(process.returncode, 0, stderr.decode("utf-8"))
+                        self.assertFalse(rotation.done())
+                        self.assertEqual(storage.load_anthropic_subscription().state, "refreshing")
+                    finally:
+                        await resources.cleanup()
+                    release.set()
+                    self.assertEqual((await rotation).access_token, "new-access")
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(exercise(directory))
+
     def test_real_loki_status_and_logout_use_xdg_store(self):
         with tempfile.TemporaryDirectory() as temporary:
             config_home = os.path.join(temporary, "config")

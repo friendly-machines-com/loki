@@ -139,19 +139,16 @@ def main() -> int:
 
     storage = None
     try:
-        try:
-            storage = JsonCredentialStorage()
-            supervisor = CredentialSupervisor(credentials, storage)
-        except CredentialStorageError as error:
-            print(f"Credential storage error: {error}", file=sys.stderr)
-            return 2
-        try:
-            return asyncio.run(supervisor.run_terminal_runtime(
-                sys.argv[0], sys.argv[1:]))
-        except (OSError, RuntimeIsolationError, WindowsApiError) as error:
-            # Reuse the exact sanctioned executable selected by the caller.
-            print(f"Could not start Loki runtime: {error}", file=sys.stderr)
-            return 2
+        storage = JsonCredentialStorage()
+        supervisor = CredentialSupervisor(credentials, storage)
+        return asyncio.run(supervisor.run_terminal_runtime(sys.argv[0], sys.argv[1:]))
+    except CredentialStorageError as error:
+        print(f"Credential storage error: {error}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeIsolationError, WindowsApiError) as error:
+        # Reuse the exact sanctioned executable selected by the caller.
+        print(f"Could not start Loki runtime: {error}", file=sys.stderr)
+        return 2
     finally:
         if storage is not None:
             storage.close()

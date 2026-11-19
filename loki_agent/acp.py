@@ -34,7 +34,7 @@ from .connections import (
     ConnectionDescriptorError,
     connection_display_fields,
 )
-from .credentials import CredentialStore
+from .credentials import CredentialInventory, CredentialStore
 from .lifetimes import finish_cleanup
 # The Ask bounds are the tool's public contract and live with the tool
 # definition; the front validates against the same values instead of
@@ -331,7 +331,6 @@ class Front:
             credential_supervisors.CredentialSupervisor(
                 credentials, credential_storage))
         self.environment = self.credential_supervisor.environment
-        self.credentials = self.credential_supervisor.inventory
         self.credential_broker = self.credential_supervisor.broker
         self._sessions: dict[str, SessionOperations] = {}
         self._connected = True
@@ -355,19 +354,47 @@ class Front:
                 for session_id, owner in self._sessions.items()
                 if owner.state == "active"}
 
+    @property
+    def credentials(self) -> CredentialInventory:
+        return self.credential_supervisor.inventory
+
     async def run(self):
+        startup_tasks = []
         try:
-            async for message in self.read():
-                if self.protocol_version is None and message.get("method") not in [None, "initialize"]:
-                    # The wire connection has no dialect/capabilities yet.
-                    # Direct resource-owner methods remain usable internally;
-                    # uninitialized peers cannot create workers or send controls.
-                    if message.get("id") is not None:
-                        self._error(message, acps.TransportError("initialize is required first", code=acps.INVALID_REQUEST))
-                    continue
-                self.handle(message)
+            if not self.credential_supervisor.startup_pending:
+                await self._dispatch_input()
+                return
+            # Keep the reader live while startup waits on an external refresh.
+            # Operations cannot delegate early, and peer EOF must release the
+            # wait without cancelling the other supervisor's token exchange.
+            startup = asyncio.create_task(self.credential_supervisor.prepare_startup())
+            startup_tasks.append(startup)
+            reader = asyncio.create_task(self._dispatch_input())
+            startup_tasks.append(reader)
+            await asyncio.wait(startup_tasks, return_when=asyncio.FIRST_COMPLETED)
+            if startup.done():
+                startup.result()
+            await reader
         finally:
-            await self.shutdown()
+            for task in startup_tasks:
+                task.cancel()
+            try:
+                await self.shutdown()
+            finally:
+                if startup_tasks:
+                    await finish_cleanup(asyncio.gather(*startup_tasks, return_exceptions=True),
+                                         preserve_failure=sys.exc_info()[0] is not None)
+
+    async def _dispatch_input(self):
+        async for message in self.read():
+            if self.protocol_version is None and message.get("method") not in [None, "initialize"]:
+                # The wire connection has no dialect/capabilities yet.
+                # Direct resource-owner methods remain usable internally;
+                # uninitialized peers cannot create workers or send controls.
+                if message.get("id") is not None:
+                    self._error(message, acps.TransportError("initialize is required first", code=acps.INVALID_REQUEST))
+                continue
+            self.handle(message)
 
     async def shutdown(self):
         self._connected = False

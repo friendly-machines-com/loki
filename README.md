@@ -792,7 +792,9 @@ Subscription tokens are stored in the user configuration directory's
 `credentials/tokens.json`, normally `~/.config/loki/credentials/tokens.json` on
 POSIX. No desktop credential service or message bus is required. Logout removes
 the local login but does not immediately revoke credentials already issued to
-running sessions; close those sessions too.
+running sessions; close those sessions too. If an Anthropic login is already
+being refreshed when Loki starts, Loki waits for the result before opening
+new sessions.
 
 Loki captures credentials at startup, then removes variables ending in `_KEY`,
 `_TOKEN`, or `_PAT` from environments passed to tools and hooks. On Linux it also

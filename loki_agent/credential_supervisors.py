@@ -15,6 +15,7 @@ runtime itself even if it is not currently requesting a credential.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import sys
 from dataclasses import dataclass
@@ -34,6 +35,9 @@ class CredentialSupervisor:
         self.broker = CredentialBroker(storage=storage)
         credentials.install_static_credentials(self.broker)
         self.storage = storage
+        self._inventory = None
+        self._startup_lock = asyncio.Lock()
+        stored_anthropic = None
         if storage is not None:
             # This must happen before a runtime starts.  Even an empty
             # credential directory has to exist when Linux establishes the
@@ -49,24 +53,46 @@ class CredentialSupervisor:
                     rotate=storage.rotate_openai_subscription,
                 )
             stored_anthropic = storage.load_anthropic_subscription(strict=False)
-            if (stored_anthropic is not None
-                    and stored_anthropic.state == "active"
-                    and stored_anthropic.tokens is not None):
-                self.broker.install_anthropic_subscription(
-                    stored_anthropic.tokens,
-                    rotate=storage.rotate_anthropic_subscription,
-                )
-        self.inventory = CredentialInventory(
-            self.environment,
-            self.broker.available(),
-        )
+        if stored_anthropic is None or stored_anthropic.state != "refreshing":
+            self._finish_startup(stored_anthropic)
+
+    @property
+    def startup_pending(self) -> bool:
+        return self._inventory is None
+
+    @property
+    def inventory(self) -> CredentialInventory:
+        if self._inventory is None:
+            raise RuntimeError("startup credential capture is not complete")
+        return self._inventory
+
+    async def prepare_startup(self):
+        # A refreshing record has no tokens to snapshot. Settle it once,
+        # before any delegation or advertised inventory; do not reload
+        # logins into a supervisor that has already started its runtimes.
+        # ACP can pump input during this wait. Its first worker and the
+        # startup task share the same gate, which cancellation never publishes.
+        if self.startup_pending:
+            async with self._startup_lock:
+                if self.startup_pending:
+                    self._finish_startup(await self.storage.wait_for_anthropic_refresh())
+
+    def _finish_startup(self, stored_anthropic):
+        if (stored_anthropic is not None
+                and stored_anthropic.state == "active"
+                and stored_anthropic.tokens is not None):
+            self.broker.install_anthropic_subscription(
+                stored_anthropic.tokens,
+                rotate=self.storage.rotate_anthropic_subscription,
+            )
+        inventory = CredentialInventory(self.environment, self.broker.available())
 
         # Use the same pure configuration/route derivation as the runtime.
         # Only the captured explicit connection is prior consent; saved logs
         # and catalog selections cannot claim to be launch configuration.
-        if connections.explicit_api_base_configured(self.inventory):
+        if connections.explicit_api_base_configured(inventory):
             try:
-                config = connections.build_config_from_env(credentials=self.inventory)
+                config = connections.build_config_from_env(credentials=inventory)
             except (ValueError, protocols.ProtocolError):
                 # The runtime reports invalid configuration through its usual
                 # UI. It must not create any implicit destination permissions.
@@ -74,8 +100,10 @@ class CredentialSupervisor:
             if config is not None and config.auth_spec is not None:
                 self.broker.allow_startup_destinations(
                     config.auth_spec.credential, config.credential_destinations())
+        self._inventory = inventory
 
     async def delegate(self, allowed=None, *, manage_approvals=False) -> "RuntimeDelegation":
+        await self.prepare_startup()
         return await RuntimeDelegation.create(
             self.broker, allowed, manage_approvals=manage_approvals)
 

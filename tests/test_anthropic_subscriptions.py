@@ -649,6 +649,77 @@ class AnthropicStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(ref, supervisor.broker.available())
             self.assertTrue(supervisor.inventory.has_ref(ref))
 
+    async def test_startup_delegates_rotated_login(self):
+        await self._startup_during_refresh(logout=False)
+
+    async def test_startup_observes_logout_without_waiting_for_obsolete_refresh(self):
+        await self._startup_during_refresh(logout=True)
+
+    async def _startup_during_refresh(self, *, logout):
+        stored = await self.storage.store_anthropic_login(anthropic_tokens())
+        refreshing, release, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        reopened = self.enterContext(contextlib.closing(
+            credential_storages.JsonCredentialStorage(self.storage.directory)))
+        ref = authentications.CredentialRef.anthropic_subscription()
+
+        async def refresh(_current):
+            refreshing.set()
+            await release.wait()
+            return authentications.AnthropicRefreshResult("new-access", "new-refresh", expires_in=3600)
+
+        real_lock = file_locks.try_lock_exclusive
+
+        def observe_lock(fd):
+            try:
+                return real_lock(fd)
+            except BlockingIOError:
+                waiting.set()
+                raise
+
+        async with running_fixture_task(self.storage.rotate_anthropic_subscription(stored.tokens, refresh)) as rotation:
+            await observe_fixture(refreshing.wait(), rotation)
+            supervisor = credential_supervisors.CredentialSupervisor(CredentialStore({}), reopened)
+
+            async def delegate():
+                delegation = await supervisor.delegate()
+                try:
+                    return delegation.credential_server.allowed
+                finally:
+                    await delegation.close()
+
+            with mock.patch.object(file_locks, "try_lock_exclusive", observe_lock):
+                async with running_fixture_task(delegate()) as startup:
+                    await observe_fixture(waiting.wait(), startup, rotation)
+                    self.assertFalse(startup.done())
+                    if logout:
+                        self.assertTrue(await self.storage.remove_anthropic_subscription())
+                        self.assertNotIn(ref, await startup)
+                        self.assertFalse(rotation.done())
+                        self.assertFalse(supervisor.inventory.has_ref(ref))
+                        release.set()
+                        with self.assertRaises(authentications.RefreshPermanentError):
+                            await rotation
+                    else:
+                        release.set()
+                        await rotation
+                        self.assertIn(ref, await startup)
+                        self.assertTrue(supervisor.inventory.has_ref(ref))
+                        lease = await supervisor.broker.lease(ref, authentications.ANTHROPIC_BETA_MESSAGES_URL)
+                        self.assertEqual(lease.value, "new-access")
+
+    async def test_startup_leaves_an_orphaned_refresh_unavailable(self):
+        stored = await self.storage.store_anthropic_login(anthropic_tokens())
+        refresh = mock.AsyncMock(return_value=authentications.AnthropicRefreshResult("new-access", "new-refresh"))
+        with mock.patch.object(self.storage, "_finish_anthropic_attempt",
+                               side_effect=credential_storages.CredentialStorageError("could not write")):
+            with self.assertRaises(authentications.RefreshIndeterminateError):
+                await self.storage.rotate_anthropic_subscription(stored.tokens, refresh)
+
+        supervisor = credential_supervisors.CredentialSupervisor(CredentialStore({}), self.storage)
+        await supervisor.prepare_startup()
+        self.assertFalse(supervisor.inventory.has_ref(authentications.CredentialRef.anthropic_subscription()))
+        self.assertEqual(self.storage.load_anthropic_subscription().state, "refreshing")
+
 
 def catalog_fixture():
     return {"anthropic": {

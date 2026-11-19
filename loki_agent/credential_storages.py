@@ -518,7 +518,7 @@ class JsonCredentialStorage:
             yield directory_fd, self._read_document_at(directory_fd)
 
     @asynccontextmanager
-    async def _locked_file(self, filename):
+    async def _locked_file(self, filename, *, wait_while=None):
         self.ensure_directory()
         directory_fd = self._directory_fd
         lock_fd = self._open_lock_at(directory_fd, filename)
@@ -531,8 +531,15 @@ class JsonCredentialStorage:
                         acquired = True
                         break
                     except BlockingIOError:
+                        # Only the read-only startup waiter can stop early:
+                        # logout or replacement may settle its read while the
+                        # refresh owner is still waiting for the HTTP response.
+                        if wait_while is not None and not wait_while():
+                            break
                         await asyncio.sleep(LOCK_RETRY_DELAY_S)
-                yield directory_fd
+                    except OSError as error:
+                        raise CredentialStorageError(f"could not lock credential file: {error}") from error
+                yield directory_fd if acquired else None
             finally:
                 if acquired:
                     with contextlib.suppress(OSError):
@@ -704,6 +711,28 @@ class JsonCredentialStorage:
             if strict:
                 raise
             return None
+
+    async def wait_for_anthropic_refresh(self):
+        """Settle a refreshing record before the startup broker takes ownership.
+
+        The plain loader also serves status and cannot wait. Only the refresh
+        owner's lock distinguishes a live exchange from an orphaned marker.
+        Startup borrows that lock to re-read the store, never to send a token
+        or recover an orphan. Cancellation just closes the startup lock handle.
+        """
+        stored = None
+
+        def still_refreshing():
+            nonlocal stored
+            stored = self.load_anthropic_subscription(strict=False)
+            return stored is not None and stored.state == "refreshing"
+
+        async with self._locked_file(ANTHROPIC_REFRESH_LOCK, wait_while=still_refreshing) as directory_fd:
+            if directory_fd is not None:
+                # A live owner may have committed while we waited. A marker
+                # still present under the lock has no live owner; leave it be.
+                stored = self.load_anthropic_subscription(strict=False)
+        return stored
 
     async def store_anthropic_login(self, tokens):
         normalized = replace(tokens, grant_id=secrets.token_urlsafe(24)).normalized()
