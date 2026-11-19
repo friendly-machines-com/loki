@@ -80,11 +80,13 @@ def _amount(value) -> float | None:
 def _extra_usage_lines(extra) -> list[str]:
     if not isinstance(extra, dict) or extra.get("is_enabled") is not True:
         return []
-    # A missing field is not evidence of an unlimited plan.
-    if "monthly_limit" in extra and extra["monthly_limit"] is None:
-        return ["  Extra usage: Unlimited"]
-    limit = _amount(extra.get("monthly_limit"))
     used = _amount(extra.get("used_credits"))
+    # An explicit null means no cap, not that the reported spend is unknown.
+    if "monthly_limit" in extra and extra["monthly_limit"] is None:
+        if used is None:
+            return ["  Extra usage: Unlimited"]
+        return [f"  Extra usage: ${used / 100:.2f} spent (unlimited)"]
+    limit = _amount(extra.get("monthly_limit"))
     if limit is None or limit == 0 or used is None:
         return ["  Extra usage: enabled; spending unavailable"]
     # Spending is in cents. Derive the percentage from amounts in the same

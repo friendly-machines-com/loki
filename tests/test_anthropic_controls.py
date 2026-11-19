@@ -60,8 +60,10 @@ class UsageRenderingTests(unittest.TestCase):
         enabled = {"is_enabled": True, "monthly_limit": 5000, "used_credits": 1234}
         self.assertIn("  Extra usage: $12.34 / $50.00 spent; 24.68% used",
                       controls._usage_lines({"extra_usage": enabled}))
-        self.assertIn("  Extra usage: Unlimited",
+        self.assertIn("  Extra usage: $12.34 spent (unlimited)",
                       controls._usage_lines({"extra_usage": dict(enabled, monthly_limit=None)}))
+        self.assertIn("  Extra usage: Unlimited",
+                      controls._usage_lines({"extra_usage": dict(enabled, monthly_limit=None, used_credits=None)}))
         for extra in [{"is_enabled": True}, dict(enabled, monthly_limit=float("inf")),
                       dict(enabled, used_credits=10**500), dict(enabled, used_credits=float("nan"))]:
             self.assertIn("  Extra usage: enabled; spending unavailable",
