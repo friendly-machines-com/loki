@@ -768,7 +768,7 @@ launching a browser; the callback must still reach the machine running Loki.
 OpenAI device-code login avoids the callback when the account permits it.
 An interrupted credential refresh may require logging in again. `auth status`
 without a provider reports both logins and succeeds if either one is stored
-and active.
+and active, even if the other saved login is invalid.
 
 **Anthropic subscription.** If your Claude account supports this connection,
 log in before starting Loki:

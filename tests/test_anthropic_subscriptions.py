@@ -1022,6 +1022,47 @@ class AnthropicLoginCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("OpenAI ChatGPT subscription: logged in", output.getvalue())
         self.assertIn("Anthropic subscription: not logged in", output.getvalue())
 
+    async def test_unqualified_status_reports_healthy_peer_and_bad_record(self):
+        await self.storage.store_anthropic_login(anthropic_tokens())
+        await self.storage.store_openai_login(authentications.OpenAITokenSet("a", "r"))
+        original = self.storage.load_document()
+        for provider, key, invalid_record, healthy_status in [
+                ["anthropic", credential_storages.ANTHROPIC_CREDENTIAL_KEY, None,
+                 "OpenAI ChatGPT subscription: logged in"],
+                ["openai", credential_storages.OPENAI_CREDENTIAL_KEY,
+                 {"type": credential_storages.OPENAI_RECORD_TYPE, "state": []},
+                 "Anthropic subscription: logged in"]]:
+            with self.subTest(provider=provider):
+                document = dict(original, credentials=dict(original["credentials"]))
+                document["credentials"][key] = invalid_record
+                with open(self.storage.file_path, "w", encoding="utf-8") as stream:
+                    json.dump(document, stream)
+                output, errors = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    self.assertEqual(await authentication_commands.run(["status"], storage=self.storage), 0)
+                self.assertIn(healthy_status, output.getvalue())
+                self.assertIn(f"{provider}: saved login is invalid", errors.getvalue())
+
+                # With no healthy peer the same bad record remains an error.
+                other = next(name for name in document["credentials"] if name != key)
+                del document["credentials"][other]
+                with open(self.storage.file_path, "w", encoding="utf-8") as stream:
+                    json.dump(document, stream)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(await authentication_commands.run(["status"], storage=self.storage), 2)
+
+    async def test_unqualified_status_does_not_ignore_damage_to_shared_document(self):
+        await self.storage.store_anthropic_login(anthropic_tokens())
+        document = self.storage.load_document()
+        document["version"] += 1
+        with open(self.storage.file_path, "w", encoding="utf-8") as stream:
+            json.dump(document, stream)
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            with self.assertRaisesRegex(credential_storages.CredentialStorageError, "format version"):
+                await authentication_commands.run(["status"], storage=self.storage)
+        self.assertEqual(output.getvalue(), "")
+
     async def test_device_code_is_rejected_for_anthropic(self):
         output, errors = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(output), \

@@ -128,7 +128,10 @@ def _validate_document(value):
         if not isinstance(key, str) or not key:
             raise CredentialStorageError(
                 "credential record names must be non-empty strings")
-        if not isinstance(record, dict):
+        # Known subscription parsers validate their own records. One bad
+        # login must not prevent status (or logout) for the other provider.
+        if (key not in {OPENAI_CREDENTIAL_KEY, ANTHROPIC_CREDENTIAL_KEY}
+                and not isinstance(record, dict)):
             raise CredentialStorageError(
                 f"credential record {key!r} must be an object")
     approvals = value.get("endpoint_approvals", {})
@@ -167,17 +170,29 @@ def _tokens_from_record(record):
         ).normalized()
     except ValueError as error:
         raise CredentialStorageError(str(error)) from error
+    except (OverflowError, RecursionError) as error:
+        raise CredentialStorageError("OpenAI subscription record has invalid token data") from error
+
+
+def _provider_record(document, key, label):
+    records = document["credentials"]
+    if key not in records:
+        return None
+    record = records[key]
+    if not isinstance(record, dict):
+        raise CredentialStorageError(f"{label} subscription record must be an object")
+    return record
 
 
 def _openai_record(document):
-    record = document["credentials"].get(OPENAI_CREDENTIAL_KEY)
+    record = _provider_record(document, OPENAI_CREDENTIAL_KEY, "OpenAI")
     if record is None:
         return None
     if record.get("type") != OPENAI_RECORD_TYPE:
         raise CredentialStorageError(
             "OpenAI subscription record has an unsupported type")
     state = record.get("state")
-    if state not in {"active", "refreshing", "reauth-required"}:
+    if state not in ["active", "refreshing", "reauth-required"]:
         raise CredentialStorageError(
             "OpenAI subscription record has an invalid state")
     revision = _integer(
@@ -222,7 +237,7 @@ def _anthropic_tokens_from_record(record):
 
 
 def _anthropic_record(document):
-    record = document["credentials"].get(ANTHROPIC_CREDENTIAL_KEY)
+    record = _provider_record(document, ANTHROPIC_CREDENTIAL_KEY, "Anthropic")
     if record is None:
         return None
     if record.get("type") != ANTHROPIC_RECORD_TYPE:
@@ -442,6 +457,22 @@ class JsonCredentialStorage:
 
     def load_openai_subscription(self):
         return _openai_record(self.load_document())
+
+    def load_subscription_statuses(self):
+        """Report both login records from one validated snapshot for auth status.
+
+        The individual loaders raise on bad records. Combined status needs to
+        report those errors alongside a healthy peer, but must still fail if
+        the file or top-level document cannot be trusted.
+        """
+        document = self.load_document()
+        statuses = {}
+        for provider, parse in {"openai": _openai_record, "anthropic": _anthropic_record}.items():
+            try:
+                statuses[provider] = parse(document)
+            except CredentialStorageError as error:
+                statuses[provider] = error
+        return statuses
 
     def _write_document_at(self, directory_fd, document):
         document = _validate_document(document)

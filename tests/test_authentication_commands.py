@@ -811,6 +811,14 @@ connection.close()
                     stderr=subprocess.PIPE,
                     check=False,
                 )
+                document = storage.load_document()
+                document["credentials"][credential_storages.ANTHROPIC_CREDENTIAL_KEY] = {"type": "invalid"}
+                with open(storage.file_path, "w", encoding="utf-8") as stream:
+                    json.dump(document, stream)
+                combined = subprocess.run(
+                    command + ["status"], env=environment, cwd=temporary,
+                    text=True, capture_output=True, check=False,
+                )
                 logout = subprocess.run(
                     command + ["logout", "openai"],
                     env=environment,
@@ -822,6 +830,9 @@ connection.close()
                 )
 
         self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(combined.returncode, 0, combined.stderr)
+        self.assertIn("OpenAI ChatGPT subscription: logged in", combined.stdout)
+        self.assertIn("anthropic: saved login is invalid", combined.stderr)
         self.assertEqual(logout.returncode, 0, logout.stderr)
         self.assertIn(
             "OpenAI ChatGPT subscription: logged in",

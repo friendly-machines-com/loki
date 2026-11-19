@@ -107,8 +107,7 @@ async def _login_openai(arguments, storage):
     return 0
 
 
-def _show_openai_status(storage):
-    stored = storage.load_openai_subscription()
+def _show_openai_status(stored):
     if stored is None:
         print("OpenAI ChatGPT subscription: not logged in")
         return 1
@@ -145,8 +144,7 @@ async def _login_anthropic(arguments, storage):
     return 0
 
 
-def _show_anthropic_status(storage):
-    stored = storage.load_anthropic_subscription()
+def _show_anthropic_status(stored):
     if stored is None:
         print("Anthropic subscription: not logged in")
         return 1
@@ -164,6 +162,21 @@ def _show_anthropic_status(storage):
     return 0
 
 
+def _show_combined_status(storage):
+    statuses = storage.load_subscription_statuses()
+    codes = []
+    for provider, show in {"openai": _show_openai_status, "anthropic": _show_anthropic_status}.items():
+        stored = statuses[provider]
+        if isinstance(stored, credential_storages.CredentialStorageError):
+            print(f"{provider}: saved login is invalid; log in again", file=sys.stderr)
+            codes.append(2)
+        else:
+            codes.append(show(stored))
+    # A healthy provider is sufficient. Without one, a read error is more
+    # informative than the ordinary "not logged in" result.
+    return 0 if 0 in codes else max(codes)
+
+
 async def run(arguments, *, program="loki", storage=None):
     parsed = _parser(program).parse_args(arguments)
     credential_storage = (
@@ -175,14 +188,10 @@ async def run(arguments, *, program="loki", storage=None):
             return await _login_openai(parsed, credential_storage)
         if parsed.command == "status":
             if parsed.provider == "anthropic":
-                return _show_anthropic_status(credential_storage)
+                return _show_anthropic_status(credential_storage.load_anthropic_subscription())
             if parsed.provider == "openai":
-                return _show_openai_status(credential_storage)
-            openai_code = _show_openai_status(credential_storage)
-            anthropic_code = _show_anthropic_status(credential_storage)
-            # Providers are alternatives; a missing optional login must not
-            # make an existing login look like a failed status check.
-            return min(openai_code, anthropic_code)
+                return _show_openai_status(credential_storage.load_openai_subscription())
+            return _show_combined_status(credential_storage)
         if parsed.command == "logout":
             if parsed.provider == "anthropic":
                 removed = await credential_storage.remove_anthropic_subscription()
