@@ -387,7 +387,7 @@ async def _read_chunked_body(reader: asyncio.StreamReader, max_bytes: int) -> tu
 
 
 def _build_raw_request(method: str, request_url: str, headers_in: dict | None = None,
-                       body: bytes = b''):
+                       body: bytes = b'', user_agent: str | None = None):
     parsed = urllib.parse.urlparse(request_url)
     if parsed.scheme not in ['http', 'https'] or not parsed.hostname:
         raise ValueError(f"unsupported URL: {request_url}")
@@ -396,10 +396,15 @@ def _build_raw_request(method: str, request_url: str, headers_in: dict | None = 
             for name in (headers_in or {})):
         raise ValueError(
             "User-Agent is owned by Loki's HTTP transport")
+    if user_agent is not None:
+        # The transport still validates the value it emits; a caller may
+        # select an identity but never inject header syntax through it.
+        _validate_header_line("User-Agent", user_agent)
     request_headers = {
         'Host': _host_header(parsed),
         'Connection': 'close',
-        'User-Agent': APPLICATION_USER_AGENT,
+        'User-Agent': (
+            APPLICATION_USER_AGENT if user_agent is None else user_agent),
     }
     if headers_in:
         request_headers.update(headers_in)
@@ -419,12 +424,13 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
                                    response_timeout: float | None = None,
                                    max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                                    cancel_check=None,
-                                   on_response_headers=None) -> HttpResponse:
+                                   on_response_headers=None,
+                                   user_agent: str | None = None) -> HttpResponse:
     # Validate and format caller-controlled URL/header data before entering
     # transport delivery tracking. A local ValueError is not a failed network
     # delivery and must remain distinguishable to callers.
     parsed, raw_request = _build_raw_request(
-        method, request_url, headers_in, body)
+        method, request_url, headers_in, body, user_agent)
     delivery = {"request_may_have_been_sent": False}
     cancel = cancel_check or (lambda: False)
 
@@ -516,7 +522,8 @@ async def async_http_stream(method: str, request_url: str, *,
                             timeout: int = HTTP_DEFAULT_TIMEOUT_S,
                             response_timeout: float | None = None,
                             max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
-                            cancel_check=None):
+                            cancel_check=None,
+                            user_agent: str | None = None):
     """Open an HTTP request and expose its response body as an async iterator.
 
     ``timeout`` bounds connection setup and request delivery. Waiting for
@@ -526,7 +533,7 @@ async def async_http_stream(method: str, request_url: str, *,
     passes one -- cancellation still applies at once.
     """
     parsed, raw_request = _build_raw_request(
-        method, request_url, headers_in, body)
+        method, request_url, headers_in, body, user_agent)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     ssl_context = (
         ssl.create_default_context() if parsed.scheme == "https" else None)
@@ -576,7 +583,8 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
                              retry_backoff_factor: float = HTTP_RETRY_BACKOFF_FACTOR,
                              cancel_check=None,
                              prepare_attempt_headers=None,
-                             on_response_headers=None) -> HttpResponse:
+                             on_response_headers=None,
+                             user_agent: str | None = None) -> HttpResponse:
     """Deliver one request through fresh connections.
 
     ``timeout`` bounds connection setup and request delivery per attempt.
@@ -608,6 +616,7 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
                 max_bytes=max_bytes,
                 cancel_check=cancel,
                 on_response_headers=on_response_headers,
+                user_agent=user_agent,
             )
         except Exception as exc:
             if attempt >= retry_max_attempts or not _is_transient(exc):

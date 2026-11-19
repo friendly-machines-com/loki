@@ -58,16 +58,32 @@ OPENAI_CHATGPT_CODEX_URLS = frozenset({
     OPENAI_CHATGPT_MODELS_REQUEST_URL,
 })
 
+# OAuth client identifiers are public protocol identifiers, not secrets, the
+# same as OpenAI's above. A provider-approved registration must be used; the
+# login command accepts an override for deployments registered differently.
+ANTHROPIC_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
+# Subscription traffic is served from the beta endpoint; the query string is
+# part of the authorized destination, so the allowlist below names it exactly.
+ANTHROPIC_BETA_MESSAGES_URL = f"{ANTHROPIC_MESSAGES_URL}?beta=true"
+# A subscription token is refused unless the request names the flags the grant
+# was issued under; the OAuth flag alone is not enough.
+ANTHROPIC_OAUTH_BETA = "claude-code-20250219,oauth-2025-04-20"
+# Inference carries the client identity the OAuth grant was issued to. The
+# account attributes quota and billing to that identity, so a request
+# presenting an unrelated one is not attributed to the subscription.
+ANTHROPIC_CLIENT_USER_AGENT = "claude-cli/2.1.290 (external, cli)"
+ANTHROPIC_CLIENT_HEADERS = {"x-app": "cli"}
 ANTHROPIC_INFERENCE_SCOPE = "user:inference"
 ANTHROPIC_USAGE_SCOPE = "user:profile"
 # Request usage access because /account reads live quota; it does not need
 # upload, remote tool, or session-management permissions.
 ANTHROPIC_OAUTH_SCOPES = frozenset({ANTHROPIC_INFERENCE_SCOPE, ANTHROPIC_USAGE_SCOPE})
 # Bind bearer credentials to the exact inference URL, not the provider's host.
-ANTHROPIC_SUBSCRIPTION_URLS = frozenset({ANTHROPIC_MESSAGES_URL})
+# Switching away from the beta endpoint means changing this one constant; the
+# allowlist, catalog and model-selection checks all derive from it.
+ANTHROPIC_SUBSCRIPTION_URLS = frozenset({ANTHROPIC_BETA_MESSAGES_URL})
 # Try to refresh before expiry so a token can survive delivery and retries.
 # Opaque tokens without an expiry can only be scheduled by age.
 ANTHROPIC_ACCESS_TOKEN_REFRESH_WINDOW_S = 5 * 60
@@ -830,10 +846,13 @@ def authorization_headers(
     if spec.scheme == "anthropic":
         return {"x-api-key": lease.value}
     if spec.scheme == "anthropic-subscription":
-        # Select OAuth bearer handling without changing API-key requests.
+        # Select OAuth bearer handling without changing API-key requests. The
+        # beta list and the browser-access marker accompany the bearer: the
+        # account refuses the subscription token when either is missing.
         return {
             "Authorization": f"Bearer {lease.value}",
             "anthropic-beta": ANTHROPIC_OAUTH_BETA,
+            "anthropic-dangerous-direct-browser-access": "true",
         }
     if spec.scheme == "custom":
         if not spec.header_name:

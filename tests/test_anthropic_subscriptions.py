@@ -426,7 +426,7 @@ class AnthropicBrokerTests(unittest.IsolatedAsyncioTestCase):
         spec = authentications.AuthSpec(
             ref, scheme="anthropic-subscription",
             authorized_urls=authentications.ANTHROPIC_SUBSCRIPTION_URLS)
-        url = authentications.ANTHROPIC_MESSAGES_URL
+        url = authentications.ANTHROPIC_BETA_MESSAGES_URL
 
         headers, lease = await authentications.authorized_request_headers(
             broker, spec, url)
@@ -434,8 +434,17 @@ class AnthropicBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             headers["Authorization"], "Bearer anthropic-access-secret")
         self.assertEqual(
-            headers["anthropic-beta"], "oauth-2025-04-20")
+            headers["anthropic-beta"], authentications.ANTHROPIC_OAUTH_BETA)
+        self.assertEqual(
+            headers["anthropic-dangerous-direct-browser-access"], "true")
         self.assertEqual(lease.account_id, "account-uuid")
+        # The non-beta path is a different destination and must be refused.
+        with self.assertRaises(authentications.CredentialUnavailable):
+            await authentications.authorized_request_headers(
+                broker, spec, authentications.ANTHROPIC_MESSAGES_URL)
+        with self.assertRaises(authentications.CredentialUnavailable):
+            await authentications.authorized_request_headers(
+                broker, spec, authentications.ANTHROPIC_MESSAGES_URL + "?beta=false")
         with self.assertRaises(authentications.CredentialUnavailable):
             await authentications.authorized_request_headers(
                 broker, spec, "https://api.anthropic.com/v1/complete")
@@ -687,10 +696,13 @@ class AnthropicConnectionTests(unittest.IsolatedAsyncioTestCase):
         restored = connections.config_from_connection_descriptor(connections.ConnectionDescriptor.from_dict(saved), inventory)
         for connection in [config, restored]:
             # Admission includes known account reads, not an unauthorized
-            # model-list route. Inference still owns only the Messages URL.
+            # model-list route. Inference owns only the beta Messages URL.
             self.assertEqual(connection.credential_destinations(), [
-                authentications.ANTHROPIC_MESSAGES_URL, anthropic_controls.ANTHROPIC_USAGE_URL,
+                authentications.ANTHROPIC_BETA_MESSAGES_URL,
+                anthropic_controls.ANTHROPIC_USAGE_URL,
             ])
+            self.assertEqual(connection.chat_provider.chat_url,
+                             authentications.ANTHROPIC_BETA_MESSAGES_URL)
             self.assertEqual(connection.auth_spec.authorized_urls, authentications.ANTHROPIC_SUBSCRIPTION_URLS)
             self.assertEqual(connection.auth_spec.credential, ref)
             self.assertEqual(connection.context_capacity.source, "models.dev")
@@ -700,7 +712,7 @@ class AnthropicConnectionTests(unittest.IsolatedAsyncioTestCase):
 
 class AnthropicInferenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_inference_401_replays_with_rotated_oauth_in_both_executors(self):
-        url = authentications.ANTHROPIC_MESSAGES_URL
+        url = authentications.ANTHROPIC_BETA_MESSAGES_URL
         ref = authentications.CredentialRef.anthropic_subscription()
         config = connections.make_runtime_config(
             url, protocols.ANTHROPIC_MESSAGES, model="claude-sonnet-4-6",
@@ -719,7 +731,7 @@ class AnthropicInferenceTests(unittest.IsolatedAsyncioTestCase):
                 async def request(method, endpoint, **kwargs):
                     self.assertEqual((method, endpoint), ("POST", url))
                     headers = {name.lower(): value for name, value in kwargs["headers_in"].items()}
-                    calls.append((headers, kwargs["body"]))
+                    calls.append((headers, kwargs["body"], kwargs.get("user_agent")))
                     return response(endpoint, 401 if len(calls) == 1 else 200, {"content": []})
 
                 @contextlib.asynccontextmanager
@@ -743,16 +755,60 @@ class AnthropicInferenceTests(unittest.IsolatedAsyncioTestCase):
                         await model_requests.async_provider_request("POST", url, payload, context=context)
 
                 rotate.assert_awaited_once()
-                self.assertEqual([headers["authorization"] for headers, _ in calls], [
+                self.assertEqual([headers["authorization"] for headers, _, _ in calls], [
                     "Bearer anthropic-access-secret", "Bearer rotated-access",
                 ])
-                first_headers, first_body = calls[0]
+                first_headers, first_body, first_agent = calls[0]
+                # A retry replays the exact prepared body, including the
+                # billing block added for the subscription scheme.
                 self.assertEqual(first_body, calls[1][1])
-                self.assertEqual(json.loads(first_body), payload)
+                sent = json.loads(first_body)
+                self.assertEqual(sent["messages"], payload["messages"])
+                self.assertTrue(
+                    sent["system"][0]["text"].startswith(
+                        "x-anthropic-billing-header: cc_version=2.1.325."))
+                self.assertEqual(
+                    sent["system"][1:], [{"type": "text", "text": "be helpful"}])
                 header = model_requests.LLM_IDEMPOTENCY_HEADER_ANTHROPIC
                 self.assertEqual(first_headers[header], calls[1][0][header])
                 self.assertEqual(first_headers["anthropic-beta"], authentications.ANTHROPIC_OAUTH_BETA)
+                self.assertEqual(first_headers["anthropic-dangerous-direct-browser-access"], "true")
+                self.assertEqual(first_headers["x-app"], "cli")
+                self.assertEqual(first_headers["x-claude-code-session-id"], "root")
+                # The transport owns User-Agent, so the identity is selected
+                # through its argument rather than injected as a header.
+                self.assertEqual(
+                    first_agent, authentications.ANTHROPIC_CLIENT_USER_AGENT)
+                self.assertNotIn("user-agent", first_headers)
                 self.assertNotIn("x-api-key", first_headers)
+
+    async def test_api_key_requests_keep_loki_identity_and_no_billing(self):
+        url = authentications.ANTHROPIC_MESSAGES_URL
+        ref = authentications.CredentialRef.environment("ANTHROPIC_API_KEY")
+        broker = authentications.CredentialBroker()
+        broker.install_static(ref, "ordinary-api-key")
+        broker.allow_startup_destinations(ref, [url])
+        config = connections.make_runtime_config(
+            url, protocols.ANTHROPIC_MESSAGES, credential_ref=ref)
+        context = model_requests.RequestContext(
+            config, broker, "conversation", "root",
+            mock.Mock(observer=mock.Mock(return_value=None)))
+        seen = {}
+
+        async def request(method, endpoint, **kwargs):
+            seen.update(kwargs)
+            return response(endpoint, 200, {"content": []})
+
+        payload = {"model": "claude", "system": "be helpful", "messages": []}
+        with mock.patch.object(http_client, "async_http_request", request):
+            await model_requests.async_provider_request(
+                "POST", url, payload, context=context)
+
+        self.assertEqual(json.loads(seen["body"]), payload)
+        self.assertNotIn("user_agent", seen)
+        lowered = {name.lower() for name in seen["headers_in"]}
+        self.assertNotIn("x-app", lowered)
+        self.assertNotIn("user-agent", lowered)
 
     async def test_api_key_still_uses_key_header_without_oauth_protocol(self):
         url = authentications.ANTHROPIC_MESSAGES_URL
@@ -834,13 +890,58 @@ class AnthropicLoginCommandTests(unittest.IsolatedAsyncioTestCase):
                        "authorization-secret"]:
             self.assertNotIn(secret, output.getvalue())
 
-    async def test_missing_client_registration_does_not_start_login(self):
+    async def test_login_without_options_uses_the_bundled_client(self):
         errors = io.StringIO()
-        with mock.patch.object(oauth_logins, "start_anthropic_browser_login") as start, contextlib.redirect_stderr(errors):
-            self.assertEqual(await authentication_commands.run(["login", "anthropic"], storage=self.storage), 2)
-        start.assert_not_called()
-        self.assertIn("--client-id", errors.getvalue())
-        self.assertIsNone(self.storage.load_anthropic_subscription())
+        start = mock.AsyncMock(side_effect=oauth_logins.OAuthLoginError("stop"))
+        with mock.patch.object(
+                oauth_logins, "start_anthropic_browser_login", new=start), \
+                contextlib.redirect_stderr(errors), \
+                self.assertRaises(oauth_logins.OAuthLoginError):
+            await authentication_commands.run(
+                ["login", "anthropic"], storage=self.storage)
+        start.assert_awaited_once_with(client_id=None)
+
+    async def test_client_id_override_is_stored_and_reused_for_refresh(self):
+        output, errors = io.StringIO(), io.StringIO()
+        requests = []
+
+        def browser(url, *, new):
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(url).query)
+            self.assertEqual(query["client_id"], ["other-registration"])
+            redirect = urllib.parse.urlsplit(query["redirect_uri"][0])
+            with contextlib.closing(http.client.HTTPConnection(
+                    redirect.hostname, redirect.port)) as connection:
+                connection.request("GET", redirect.path + "?" +
+                                   urllib.parse.urlencode({
+                                       "code": "code",
+                                       "state": query["state"][0]}))
+                with connection.getresponse() as answer:
+                    self.assertEqual(answer.status, 200)
+            return True
+
+        async def request(method, url, **kwargs):
+            requests.append(json.loads(kwargs["body"]))
+            return response(url, 200, token_response())
+
+        with mock.patch.object(http_client, "async_http_request", new=request), \
+                mock.patch.object(
+                    authentication_commands.webbrowser, "open",
+                    side_effect=browser), \
+                contextlib.redirect_stdout(output), \
+                contextlib.redirect_stderr(errors):
+            self.assertEqual(
+                await authentication_commands.run(
+                    ["login", "anthropic", "--client-id", "other-registration"],
+                    storage=self.storage), 0)
+            stored = self.storage.load_anthropic_subscription()
+            refreshed = await authentications.request_anthropic_token_refresh(
+                stored.tokens)
+
+        self.assertEqual(stored.tokens.client_id, "other-registration")
+        self.assertEqual(requests[0]["client_id"], "other-registration")
+        self.assertEqual(refreshed.access_token, "anthropic-access-secret")
+        self.assertEqual(requests[1]["client_id"], "other-registration")
 
     async def test_unqualified_status_succeeds_with_only_openai_logged_in(self):
         await self.storage.store_openai_login(authentications.OpenAITokenSet("a", "r"))

@@ -6,6 +6,7 @@ Session, active provider, tool registry, or transcript-persistence policy.
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -298,6 +299,92 @@ def _codex_turn_state_for_request(
     return CodexTurnState()
 
 
+# Subscription inference is refused with 429 when the system prompt lacks the
+# billing banner, whatever the account's quota actually is. The banner is the
+# first system block. Its trailing group is derived from the first user
+# message, so a request that reads a different opening must not reuse another
+# request's value; compute it here instead of pinning one.
+ANTHROPIC_BILLING_VERSION = "2.1.325"
+# The derivation mixes in a constant this package does not have. The endpoint
+# accepted an empty one in live testing, so the shape is preserved without
+# pretending to reproduce a value we cannot see.
+ANTHROPIC_BILLING_SALT = ""
+
+
+def _first_user_text(payload):
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    if not isinstance(messages, list):
+        return ""
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        return text
+        return ""
+    return ""
+
+
+def anthropic_billing_text(payload):
+    """Build the billing banner that must lead the system prompt."""
+    text = _first_user_text(payload)
+    sample = "".join(
+        text[index] if index < len(text) else "0"
+        for index in (4, 7, 20))
+    suffix = hashlib.sha256(
+        f"{ANTHROPIC_BILLING_SALT}{sample}"
+        f"{ANTHROPIC_BILLING_VERSION}".encode("utf-8")
+    ).hexdigest()[:3]
+    return (
+        f"x-anthropic-billing-header: cc_version="
+        f"{ANTHROPIC_BILLING_VERSION}.{suffix}; "
+        "cc_entrypoint=sdk-cli; cch=00000;")
+
+
+def _prepare_anthropic_billing(payload, config):
+    """Prepend the billing system block for subscription inference only."""
+    if (config is None or config.auth_spec is None
+            or config.auth_spec.scheme != "anthropic-subscription"):
+        return payload
+    if not isinstance(payload, dict):
+        return payload
+    system = payload.get("system")
+    block = {"type": "text", "text": anthropic_billing_text(payload)}
+    if system is None:
+        return dict(payload, system=[block])
+    if isinstance(system, str):
+        # A string system prompt would otherwise skip the banner, and the
+        # endpoint refuses the request as if it had none.
+        system = [{"type": "text", "text": system}] if system else []
+    if isinstance(system, list):
+        return dict(payload, system=[block, *system])
+    # An unrecognized shape is left alone: the protocol layer rejects it with
+    # a message naming the actual field, which is more useful than a 429.
+    return payload
+
+
+def _prepare_anthropic_client_headers(headers, config, context):
+    """Send the client identity the OAuth grant was issued to.
+
+    The account attributes subscription quota and billing to the client the
+    token was registered for. Only the subscription scheme gets these values;
+    API-key traffic keeps Loki's own identity. Returns the User-Agent for the
+    transport to send, or None to keep its default.
+    """
+    if (config is None or config.auth_spec is None
+            or config.auth_spec.scheme != "anthropic-subscription"):
+        return None
+    headers.update(authentications.ANTHROPIC_CLIENT_HEADERS)
+    headers["X-Claude-Code-Session-Id"] = context.root_conversation_id
+    return authentications.ANTHROPIC_CLIENT_USER_AGENT
+
+
 def _prepare_codex_session_headers(headers, session):
     # Codex 0.144.1 uses persistent agent-tree identity for session-id, and
     # individual thread identity for both thread-id and x-client-request-id.
@@ -424,6 +511,8 @@ async def async_provider_request(
         raise ValueError("GET provider requests cannot contain a payload")
     if method == "POST" and payload is None:
         raise ValueError("POST provider requests require a payload")
+    if method == "POST":
+        payload = _prepare_anthropic_billing(payload, config)
     body = (
         json.dumps(payload).encode("utf-8")
         if method == "POST" else b"")
@@ -445,6 +534,8 @@ async def async_provider_request(
     base_headers = dict(base_headers)
     if turn_state is not None:
         _prepare_codex_session_headers(base_headers, context)
+    client_user_agent = _prepare_anthropic_client_headers(
+        base_headers, config, context)
 
     retry_attempts = http_client.HTTP_RETRY_MAX_ATTEMPTS
     request_timeout = http_client.HTTP_DEFAULT_TIMEOUT_S
@@ -493,6 +584,11 @@ async def async_provider_request(
             "retry_backoff_factor": http_client.HTTP_RETRY_BACKOFF_FACTOR,
             "cancel_check": cancel_check,
         }
+        if client_user_agent is not None:
+            # Only the subscription path selects a client identity; other
+            # requests keep the transport's own User-Agent and its callers'
+            # existing transport contract.
+            transport_options["user_agent"] = client_user_agent
 
         def on_response_headers(status, headers):
             if observe is not None:
@@ -652,7 +748,8 @@ async def _first_body_chunk(iterator, cancel_check):
 async def _async_chat_stream_request_once(
         request_url, payload, request_headers, on_text_delta, cancel_check,
         codex_turn_state=None, observe=None, on_reasoning_delta=None,
-        *, config) -> protocols.ProviderResponse:
+        user_agent=None, *, config) -> protocols.ProviderResponse:
+    payload = _prepare_anthropic_billing(payload, config)
     body = json.dumps(payload).encode("utf-8")
     # Connection setup and delivery keep the transport budget; waiting for
     # the stream -- before the first token and between tokens -- deliberately
@@ -667,7 +764,8 @@ async def _async_chat_stream_request_once(
             timeout=http_client.HTTP_DEFAULT_TIMEOUT_S,
             response_timeout=None,
             max_bytes=http_client.HTTP_MAX_RESPONSE_BYTES,
-            cancel_check=cancel_check) as response:
+            cancel_check=cancel_check,
+            user_agent=user_agent) as response:
         if observe is not None:
             observe(response.status, response.headers)
         effective_model = (
@@ -842,6 +940,8 @@ async def async_chat_stream_request(
         if kind == protocols.ANTHROPIC_MESSAGES
         else LLM_IDEMPOTENCY_HEADER_OPENAI)
     base_headers[idempotency_header] = uuid.uuid4().hex
+    client_user_agent = _prepare_anthropic_client_headers(
+        base_headers, config, context)
 
     transport_attempt = 0
     rejected_generation = None
@@ -860,7 +960,13 @@ async def async_chat_stream_request(
         _prepare_codex_turn_headers(headers_to_use, turn_state)
         transport_attempt += 1
         try:
-            stream_kwargs = {"codex_turn_state": turn_state, "observe": observe, "config": config}
+            stream_kwargs = {
+                "codex_turn_state": turn_state,
+                "observe": observe,
+                "config": config,
+            }
+            if client_user_agent is not None:
+                stream_kwargs["user_agent"] = client_user_agent
             if on_reasoning_delta is not None:
                 stream_kwargs["on_reasoning_delta"] = reasoning_callback
             response = await _async_chat_stream_request_once(

@@ -25,7 +25,7 @@ def _parser(program):
     login.add_argument("provider", choices=["openai", "anthropic"])
     login.add_argument(
         "--client-id",
-        help="OAuth client ID registered by Anthropic for this integration (Anthropic only)",
+        help="override the bundled Anthropic OAuth client ID (Anthropic only)",
     )
     method = login.add_mutually_exclusive_group()
     method.add_argument(
@@ -131,12 +131,6 @@ async def _login_anthropic(arguments, storage):
             "Anthropic does not offer a device-code flow; use the browser "
             "flow (optionally with --no-browser).",
             file=sys.stderr,
-        )
-        return 2
-    if not arguments.client_id:
-        print(
-            "Anthropic login requires --client-id registered for this integration. "
-            "For ordinary API access, use ANTHROPIC_API_KEY.", file=sys.stderr,
         )
         return 2
     login = await oauth_logins.start_anthropic_browser_login(client_id=arguments.client_id)

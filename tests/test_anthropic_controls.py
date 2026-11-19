@@ -96,6 +96,7 @@ class UsageControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests, [("GET", controls.ANTHROPIC_USAGE_URL, {
             "Accept": "application/json", "Authorization": "Bearer anthropic-access",
             "anthropic-beta": auth.ANTHROPIC_OAUTH_BETA,
+            "anthropic-dangerous-direct-browser-access": "true",
         })])
         self.assertIn("50% used, 50% remaining", result.lines[1])
         self.assertEqual(result.document, {"endpoint": controls.ANTHROPIC_USAGE_URL, "usage": payload})
@@ -161,7 +162,7 @@ class UsageControlTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(relay.close)
         child = await capabilities.CredentialClient.from_fd(child_end)
         self.addAsyncCleanup(child.close)
-        lease = await child.lease(ref, auth.ANTHROPIC_MESSAGES_URL)
+        lease = await child.lease(ref, auth.ANTHROPIC_BETA_MESSAGES_URL)
         self.assertEqual(lease.value, "anthropic-access")
         self.assertNotIn("anthropic-refresh", json.dumps(lease.to_wire()))
         with self.assertRaises(capabilities.CapabilityError):

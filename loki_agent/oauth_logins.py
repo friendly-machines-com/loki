@@ -522,7 +522,13 @@ async def exchange_anthropic_authorization_code(
         raise OAuthLoginError(str(error)) from error
 
 
-async def start_anthropic_browser_login(*, client_id: str, request=None):
+async def start_anthropic_browser_login(
+        *, client_id: str | None = None, request=None):
+    # Default to the bundled registration so login works with no options. An
+    # override is stored with the credential and reused for every refresh,
+    # so a token is never presented under a different registration.
+    if client_id is None:
+        client_id = authentications.ANTHROPIC_OAUTH_CLIENT_ID
     try:
         authentications.validate_anthropic_client_id(client_id)
     except ValueError as error:

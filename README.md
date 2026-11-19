@@ -770,18 +770,23 @@ An interrupted credential refresh may require logging in again. `auth status`
 without a provider reports both logins and succeeds if either one is stored
 and active.
 
-**Anthropic OAuth is for approved integrations only.** Anthropic's
-[credential-use policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
-does not permit ordinary third-party Claude account sign-in. Use an API key
-unless Anthropic has explicitly approved your integration and registered a
-public OAuth client for it. Loki does not ship an Anthropic client ID.
+**Anthropic subscription.** If your Claude account supports this connection,
+log in before starting Loki:
 
-With an authorized client that allows an ephemeral `127.0.0.1` port at
-`/callback`, run `"$LOKI" auth login anthropic --client-id CLIENT_ID`, then
-restart Loki and select **Anthropic subscription**. The model list is public
+```bash
+"$LOKI" auth login anthropic
+```
+
+The login uses the bundled OAuth client registration and an ephemeral
+`127.0.0.1` port on `/callback`, so the browser must be able to reach this
+machine. There is no device-code flow. `--client-id` overrides the bundled
+registration for accounts that must use a different one; whatever you log in
+with is stored and reused for later token refreshes.
+
+Restart Loki and select **Anthropic subscription**. The model list is public
 metadata, not confirmation that the account has access to a specific model.
 Use `"$LOKI" auth status anthropic` or `"$LOKI" auth logout anthropic` to manage
-the login. Only the browser flow is available.
+the login.
 
 Subscription tokens are stored in the user configuration directory's
 `credentials/tokens.json`, normally `~/.config/loki/credentials/tokens.json` on

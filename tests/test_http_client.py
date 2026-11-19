@@ -381,6 +381,39 @@ class HttpClientRequestTests(unittest.TestCase):
         self.assertIn(b"Host: example.test", raw_headers.split(b"\r\n"))
         self.assertNotIn(b"Content-Length: 0", raw_headers.split(b"\r\n"))
 
+    def test_caller_selected_user_agent_replaces_transport_identity(self):
+        connector = FakeConnector([
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        ])
+
+        with PatchedOpenConnection(connector):
+            asyncio.run(http_client.async_http_request(
+                "GET",
+                "https://example.test/",
+                user_agent="claude-cli/2.1.112 (external, cli)",
+                timeout=5,
+                max_bytes=100,
+            ))
+
+        raw_headers = bytes(connector.writers[0].data).split(
+            b"\r\n\r\n", 1)[0]
+        self.assertIn(
+            b"User-Agent: claude-cli/2.1.112 (external, cli)", raw_headers)
+
+    def test_user_agent_override_rejects_header_injection(self):
+        connector = FakeConnector([])
+
+        with PatchedOpenConnection(connector):
+            with self.assertRaises(ValueError):
+                asyncio.run(http_client.async_http_request(
+                    "GET",
+                    "https://example.test/",
+                    user_agent="agent\r\nInjected: yes",
+                    timeout=5,
+                ))
+
+        self.assertEqual(connector.calls, [])
+
     def test_rejects_header_injection_before_connecting(self):
         connector = FakeConnector([])
 

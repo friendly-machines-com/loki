@@ -565,7 +565,9 @@ def add_anthropic_subscription_catalog(data):
         "id": ANTHROPIC_SUBSCRIPTION_PROVIDER_ID,
         "name": "Anthropic subscription",
         "npm": "@ai-sdk/anthropic",
-        "api": authentications.ANTHROPIC_MESSAGES_URL,
+        # Must be the exact URL the credential is allowed to use; the
+        # selection path rejects any destination outside its allowlist.
+        "api": authentications.ANTHROPIC_BETA_MESSAGES_URL,
         "env": [],
         "models": leaves,
         _LOKI_CREDENTIAL_REF_KEY: authentications.CredentialRef.anthropic_subscription().encode(),
