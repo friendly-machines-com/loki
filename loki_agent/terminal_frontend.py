@@ -740,15 +740,12 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
         if event.get("cwd") is not None:
             _print_repr_line("  Shell CWD: ", event["cwd"])
         terminal.reset_colors_and_flags()
-    elif kind in ["compaction_started", "compaction_completed", "compaction_failed", "compaction_cancelled"]:
+    elif kind == "compaction_started":
+        _terminal_activity.set_compaction_running(True)
+    elif kind in ["compaction_completed", "compaction_failed", "compaction_cancelled"]:
+        _terminal_activity.set_compaction_running(False)
         failed = kind == "compaction_failed"
-        _terminal_activity.set_compaction_running(kind == "compaction_started")
-        if kind == "compaction_started":
-            text = "Compacting context."
-        elif failed:
-            text = compactions.failure_text(event["error"])
-        else:
-            text = event["text"]
+        text = compactions.failure_text(event["error"]) if failed else event["text"]
         _emit_immediate_output("/compact", text, is_error=failed)
         _redraw_status()
     elif kind == "tool_result":

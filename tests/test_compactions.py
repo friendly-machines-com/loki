@@ -1026,7 +1026,7 @@ print(json.dumps(result))
                 contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
         self.assertIn("Compaction requested.", stdout.getvalue())
-        self.assertIn("Compacting context.", stdout.getvalue())
+        self.assertNotIn("Compacting context.", stdout.getvalue() + stderr.getvalue())
         self.assertNotIn("Context compaction failed:", stdout.getvalue())
         self.assertIn("/compact:\nContext compaction failed: TimeoutError", stderr.getvalue())
         self.assertNotIn("\x1b", stderr.getvalue())

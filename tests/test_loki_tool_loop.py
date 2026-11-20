@@ -3406,15 +3406,16 @@ class StatusTextTests(unittest.TestCase):
             for kind in ["compaction_completed", "compaction_failed", "compaction_cancelled"]:
                 terminal_frontend._terminal_agent_event({"type": "compaction_started"})
                 self.assertTrue(activity.compaction_running)
+                self.assertEqual(repaints[-1:], [True])
                 terminal_frontend._terminal_agent_event({"type": kind, "text": "finished", "error": ValueError("failure")})
                 self.assertFalse(activity.compaction_running)
+                self.assertEqual(repaints[-1:], [False])
             activity.set_compaction_running(True)
             count = len(repaints)
             activity.set_compaction_running(True)
             self.assertEqual(len(repaints), count)
             activity.reset()
-        self.assertEqual(outputs, [True, False] * 3)
-        self.assertIn(True, repaints)
+        self.assertEqual(outputs, [False] * 3)
         self.assertFalse(activity.compaction_running)
 
     def test_ps_bold_tracks_running_jobs_and_stops_at_the_command(self):
