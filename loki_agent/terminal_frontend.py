@@ -743,10 +743,12 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
     elif kind == "compaction_started":
         _terminal_activity.set_compaction_running(True)
     elif kind in ["compaction_completed", "compaction_failed", "compaction_cancelled"]:
-        _terminal_activity.set_compaction_running(False)
-        # A no-op completes before on_start(), so keep its notice.
-        if kind == "compaction_completed" and event.get("compaction_id") is not None:
-            return
+        if event.get("compaction_id") is not None:
+            # A queued request can be cancelled while an older attempt is
+            # still unwinding. Only the executor's outcome ends the bold state.
+            _terminal_activity.set_compaction_running(False)
+            if kind == "compaction_completed":
+                return
         failed = kind == "compaction_failed"
         text = compactions.failure_text(event["error"]) if failed else event["text"]
         _emit_immediate_output("/compact", text, is_error=failed)
@@ -819,11 +821,12 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
             ask_user=ask_user, on_response=on_response,
             compaction_requests=compaction_requests)
     finally:
-        # Seal this loop's intent before the outer turn_end hook can await.
-        # Later receipt is then the input owner's idle tail, not a dead loop.
-        if compaction_requests is not None:
-            compaction_requests.finish_pending(
-                cancelled=not current_session().active or bool(cancel_check and cancel_check()))
+        # Seal the turn before its end hook can await. Ctrl+C already settled
+        # the groups it covered; later receipts survive to the idle tail.
+        task = asyncio.current_task()
+        closing = not current_session().active or bool(task and task.cancelling())
+        if compaction_requests is not None and (closing or not (cancel_check and cancel_check())):
+            compaction_requests.finish_pending(cancelled=closing)
 
 
 def _status_fields(activity):
@@ -1481,10 +1484,9 @@ async def async_main(args, configuration: settings.Settings) -> int:
         discard_saved_connection = False
         if resolved_log_filename:
             try:
-                with savefiles.open_chat_log(resolved_log_filename) as (stream, _facts):
-                    loaded_chat = savefiles.read_chat_log(stream)
-                    _, _, saved_state, _ = loaded_chat
-                    _core.reasoning_effort_from_session_state(saved_state)
+                loaded_chat = savefiles.read_chat_log_snapshot(resolved_log_filename)
+                saved_state = loaded_chat.state
+                _core.reasoning_effort_from_session_state(saved_state)
             except (OSError, ValueError, json.JSONDecodeError,
                     formats.TranscriptFormatError) as e:
                 _print_text_line(
@@ -1492,6 +1494,7 @@ async def async_main(args, configuration: settings.Settings) -> int:
                     multiline=True)
                 return 1
 
+        resume_events = loaded_chat.events if loaded_chat is not None else []
         try:
             if explicit_api_base_configured(_core.CREDENTIALS):
                 config = build_config_from_env(credentials=_core.CREDENTIALS)
@@ -1510,14 +1513,13 @@ async def async_main(args, configuration: settings.Settings) -> int:
                                 diagnostic_writer=_report_model_list_errors,
                             ))
                     except ValueError:
-                        # A successful authenticated catalog which no longer
-                        # contains this exact slug is authoritative. Keeping
-                        # the stale descriptor would repeat the same failure
-                        # on every resume.
-                        discard_saved_connection = True
+                        # A retired model is no longer a candidate. Keep the
+                        # origin of a selected checkpoint for later recovery.
+                        discard_saved_connection = not formats.has_active_checkpoint(resume_events)
                         raise
                     config = config_from_connection_descriptor(
                         refreshed_descriptor, _core.CREDENTIALS)
+                    _core.validate_checkpoint_connection(config, resume_events)
                     confirmed = await confirm_saved_connection_async(
                         config, session,
                         working_directory=(
@@ -1526,6 +1528,7 @@ async def async_main(args, configuration: settings.Settings) -> int:
                     if not confirmed:
                         print("Resume cancelled.", file=sys.stderr)
                         return 0
+            apply_runtime_config(config, events=resume_events)
         except (ConnectionDescriptorError, protocols.ProtocolError,
                 authentications.CredentialError, ValueError) as e:
             _print_text_line(
@@ -1534,10 +1537,11 @@ async def async_main(args, configuration: settings.Settings) -> int:
             print("Starting without a provider; use /model or correct the "
                   "LOKI_* configuration.", file=sys.stderr)
             sys.stderr.flush()
+            current_session().runtime_config = None
+            refreshed_descriptor = None
             config = None
 
         if config is not None:
-            apply_runtime_config(config)
             if not current_model():
                 print("No model selected; use /model or set LOKI_MODEL.",
                       file=sys.stderr)
@@ -1580,8 +1584,14 @@ async def async_main(args, configuration: settings.Settings) -> int:
         # The staged-images list is shared with the immediate /queue command
         # (see _QueuedInputs); the loop keeps using this local name.
         pending_images = _queued_inputs.reset(session)
-        compact_requests = compactions.Requests()
+
+        def present_compaction(event):
+            _terminal_agent_event(event, ui_settings=ui_settings)
+
+        compact_requests = compactions.Requests(on_unstarted=present_compaction)
         status_cleanup.callback(compact_requests.finish_pending, cancelled=True)
+        session.reader.on_cancel = compact_requests.cancel_pending
+        status_cleanup.callback(setattr, session.reader, "on_cancel", None)
 
         def submit(text):
             argument = command_deliveries.compact_argument(text)
@@ -1609,7 +1619,7 @@ async def async_main(args, configuration: settings.Settings) -> int:
                         cancel_event=session.reader.cancel_event,
                         thinking=_core.capture_turn_settings(), allowed=_terminal_allowed_tools(),
                         allow_ask=terminal_ask_user(session) is not None, on_start=started),
-                    lambda event: _terminal_agent_event(event, ui_settings=ui_settings))
+                    present_compaction)
             finally:
                 _terminal_activity.set_turn_running(False)
 

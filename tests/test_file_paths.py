@@ -2,8 +2,10 @@
 
 import asyncio
 import base64
+import contextlib
 import errno
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -808,17 +810,22 @@ class FilePathTests(unittest.TestCase):
             'shell_cwd': str(self.project), 'reasoning_effort': 'high'})
         with open(filename, 'w', encoding='utf-8') as stream:
             stream.write(admitted)
-        with savefiles.open_chat_log(filename) as (stream, _facts):
-            loaded = savefiles.read_chat_log(stream)
+        loaded = savefiles.read_chat_log_snapshot(filename)
+        newer = savefiles.serialize_chat_log([], [], {'shell_cwd': str(self.project), 'reasoning_effort': 'low'})
         with open(filename, 'w', encoding='utf-8') as stream:
-            stream.write(savefiles.serialize_chat_log([], [], {
-                'shell_cwd': str(self.project), 'reasoning_effort': 'low'}))
+            stream.write(newer)
 
         loki.load_chat_log(filename, loaded)
 
         self.assertEqual(self.session.reasoning_effort_preference, 'high')
         self.assertEqual(self.session.session_state['reasoning_effort'], 'high')
         self.assertEqual(self.session.chat_log_path, filename)
+        loki.mark_chat_log_dirty()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertFalse(loki.save_chat_log())
+        self.assertIn('changed on disk', errors.getvalue())
+        with open(filename, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), newer)
 
     def test_malformed_saved_log_closes_reader_and_preserves_session(self):
         filename = os.path.join(str(self.project), 'malformed.json')
@@ -828,12 +835,21 @@ class FilePathTests(unittest.TestCase):
         self.session.chat_log_path = previous
         self.session.reasoning_effort_preference = 'high'
         self.session.session_state = {'reasoning_effort': 'high'}
-        with mock.patch.object(savefiles, 'read_chat_log', wraps=savefiles.read_chat_log) as parse, \
+        opener = savefiles.open_chat_log
+        readers = []
+
+        @contextlib.contextmanager
+        def opening(path):
+            with opener(path) as opened:
+                readers.append(opened[0])
+                yield opened
+
+        with mock.patch.object(savefiles, 'open_chat_log', side_effect=opening), \
                 self.assertRaises(json.JSONDecodeError):
             loki.load_chat_log(filename)
 
-        parse.assert_called_once()
-        self.assertTrue(parse.call_args.args[0].closed)
+        self.assertEqual(len(readers), 1)
+        self.assertTrue(readers[0].closed)
         self.assertEqual(self.session.chat_log_path, previous)
         self.assertEqual(self.session.reasoning_effort_preference, 'high')
         self.assertEqual(self.session.session_state, {'reasoning_effort': 'high'})

@@ -39,7 +39,7 @@ request tests. Merely receiving a field from the catalog is not a reason to
 retain it.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 class OpenAIModelProfileError(ValueError):
@@ -186,6 +186,10 @@ class CodexModelRequestProfile:
                 "default when reasoning summaries are supported")
         return profile
 
+    @property
+    def parallel_tool_calls(self):
+        return self.supports_parallel_tool_calls and not self.use_responses_lite
+
     def to_dict(self):
         return {
             "use_responses_lite": self.use_responses_lite,
@@ -199,3 +203,22 @@ class CodexModelRequestProfile:
             "supports_verbosity": self.supports_verbosity,
             "default_verbosity": self.default_verbosity,
         }
+
+
+def checkpoint_profiles_match(saved, selected):
+    """Compare replay framing, not catalog metadata masked by the wire contract.
+
+    Checkpoint projection and frontend admission use the same check. Exact
+    equality rejected Responses-Lite when the catalog changed a flag the wire
+    always masks. Reuse the request builder's effective value. Do not assume
+    other catalog differences are harmless or adopt any saved request fields.
+    """
+    if saved == selected:
+        return True
+    try:
+        origin = CodexModelRequestProfile.from_dict(saved)
+        target = CodexModelRequestProfile.from_dict(selected)
+    except OpenAIModelProfileError:
+        return False
+    return (replace(origin, supports_parallel_tool_calls=origin.parallel_tool_calls)
+            == replace(target, supports_parallel_tool_calls=target.parallel_tool_calls))

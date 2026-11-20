@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 
 from .diagnostics import debug_json
-from . import process_outputs
+from . import openai_models, process_outputs
 
 
 logger = logging.getLogger(__name__)
@@ -520,6 +520,25 @@ def projection_target(protocol, *, provider_id=None, provider_name=None,
     return target
 
 
+def _has_checkpoint(event):
+    return event.get("type") == "model_response" and any(
+        item.get("type") == "compaction" for item in event.get("items", []))
+
+
+def has_active_checkpoint(events):
+    # Resume may ordinarily drop a retired saved model. With selected opaque
+    # state the descriptor still matters, even when no connection is usable.
+    return any(_has_checkpoint(event) for event in active_events(events))
+
+
+def validate_checkpoint_replay(events, target):
+    # Connection admission uses the projector's check without building a
+    # request or borrowing credentials. The request repeats it when projecting
+    # actual history: a successful admission is not a replay authorization.
+    for event in active_events(events):
+        _require_checkpoint_replay(event, target["protocol"], target)
+
+
 def _require_checkpoint_replay(event, protocol, target):
     """Reject loss of selected opaque state instead of the native-output fallback.
 
@@ -532,7 +551,7 @@ def _require_checkpoint_replay(event, protocol, target):
     archived context. Selected-model identity is requested_model when available;
     a backend's reported model alias is an observation, not a new selection.
     """
-    if not any(item.get("type") == "compaction" for item in event.get("items", [])):
+    if not _has_checkpoint(event):
         return
     if event.get("protocol") != protocol or protocol not in [OPENAI_RESPONSES, ANTHROPIC_MESSAGES]:
         raise ProjectionError("the selected connection cannot replay this compaction checkpoint")
@@ -543,8 +562,9 @@ def _require_checkpoint_replay(event, protocol, target):
             or not origin_model or origin_model != target.get("model")
             or event.get("provider") != (target.get("provider_id") or target.get("provider_name"))
             or target.get("protocol") != protocol
-            or _protocol_fields(event, "loki").get("openai_request_profile")
-            != target.get("openai_request_profile")):
+            or not openai_models.checkpoint_profiles_match(
+                _protocol_fields(event, "loki").get("openai_request_profile"),
+                target.get("openai_request_profile"))):
         raise ProjectionError("the selected connection or model cannot replay this compaction checkpoint")
 
 

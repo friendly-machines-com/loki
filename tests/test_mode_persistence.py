@@ -8,7 +8,7 @@ from unittest import mock
 from config_fixtures import setUpModule as set_up_config
 from response_header_fixtures import setUpModule as set_up_response_headers
 
-from loki_agent import formats, loki
+from loki_agent import formats, loki, savefiles
 from loki_agent.sessions import Session
 from loki_agent import files as file_operations
 
@@ -44,6 +44,8 @@ class ModePersistenceTests(unittest.TestCase):
     def test_each_mode_round_trips_and_same_mode_is_not_repeated(self):
         for mode in loki.MODE_CYCLE_ORDER:
             with self.subTest(mode=mode):
+                with tempfile.NamedTemporaryFile(dir=self.directory) as fresh:
+                    self.path = fresh.name
                 loki.new_chat_log(self.path)
                 self.save_announcement(mode)
                 with open(self.path, encoding='utf-8') as stream:
@@ -74,14 +76,15 @@ class ModePersistenceTests(unittest.TestCase):
     def test_missing_or_invalid_marker_is_unknown_without_text_inference(self):
         states = [{}, *({"last_instructed_agent_mode": value}
                         for value in [None, 1, [], {}, "bogus", "Normal"])]
+        self.save_announcement("normal")
+        transcript = list(self.session.transcript_items)
         for state in states:
             with self.subTest(state=state):
-                self.save_announcement("normal")
-                transcript = list(self.session.transcript_items)
+                with open(self.path, 'w', encoding='utf-8') as stream:
+                    stream.write(savefiles.serialize_chat_log(transcript, [], state))
                 errors = io.StringIO()
                 with contextlib.redirect_stderr(errors):
-                    loki.load_chat_log(self.path, loaded=(
-                        transcript, [], state, []))
+                    loki.load_chat_log(self.path)
                 self.assertIsNone(self.session.last_instructed_agent_mode)
                 self.assertEqual(bool(errors.getvalue()), bool(state))
                 before = len(self.session.transcript_items)

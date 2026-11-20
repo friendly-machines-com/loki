@@ -886,9 +886,7 @@ class Provider:
                 payload.pop("max_output_tokens")
                 payload.update({
                     "tool_choice": "auto",
-                    "parallel_tool_calls": (
-                        profile.supports_parallel_tool_calls
-                        and not profile.use_responses_lite),
+                    "parallel_tool_calls": profile.parallel_tool_calls,
                     "store": False,
                 })
                 reasoning = _codex_reasoning_parameter(

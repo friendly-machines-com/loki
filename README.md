@@ -484,6 +484,11 @@ by the editor. The picker lists chats for that workspace even after `/cd`.
 Logs retain the selected model, connection settings and other session state,
 **not credential values**. They can still contain sensitive project data.
 
+If another Loki session saves a newer version of the same chat, an older
+session cannot overwrite it. Its unsaved work stays in memory: copy it before
+reopening the chat. Loki writers coordinate through `.loki-chat-save.lock`
+in the destination directory; this does not lock out external editors.
+
 Start Loki with `--resume` to open the picker. If you used `--shell-cwd`, pass
 the same workspace again. To open a particular chat, pass its saved ID with
 `-r ID`, or an explicit log file path with `-r PATH`. The equivalent long forms
@@ -500,7 +505,9 @@ filename:
 Supply the connection's credentials again when necessary. Loki asks before
 using saved endpoints; missing credentials do not erase the saved connection.
 Changing the model preserves the conversation, though provider-specific
-reasoning data may not transfer between models.
+reasoning data may not transfer between models. If the active context contains
+an opaque compaction checkpoint, Loki refuses a connection or model that cannot
+replay it. An incompatible catalog refresh does not replace the saved choice.
 
 `LOKI_*` connection settings initialize new sessions. On resume they temporarily
 override the saved connection; choosing a different model updates the saved
@@ -826,9 +833,11 @@ until an ordinary response reports another measurement.
 ### Cancellation, failures, and editors
 
 Cancel ongoing work with Ctrl+C in the terminal or the editor's cancellation
-control. A rejected policy, failed request or cancellation before publication
-leaves the old context selected. Once the new checkpoint is published, a later
-cleanup error is reported without undoing that checkpoint.
+control. A `/compact` request received after cancellation starts a separate
+attempt once the old one finishes. A rejected policy, failed request or
+cancellation before the save leaves the old context selected. Once the new
+checkpoint is saved, a cleanup error is a warning: the new context remains
+selected and the turn can continue.
 
 During an active turn, actual compaction-request failures use that turn's
 configured [retry hook](#retrying-model-requests). Local admission/policy/save

@@ -91,6 +91,10 @@ class Session:
     session_state: dict = field(default_factory=dict)
     chat_log_path: str | None = None
     chat_log_dirty: bool = False
+    # Dirty describes RAM, not whether another process has saved. A session
+    # expects the bytes it loaded or published (None for a new, absent log).
+    # Only loading, allocating, or successfully replacing its log changes this.
+    chat_log_revision: bytes | None = None
     # One opaque identity belongs to one conversation. It is derived again
     # from persistent chat identity on resume rather than trusting an
     # arbitrary value in the chat log. A nonpersistent runtime keeps this
@@ -192,7 +196,7 @@ class Session:
         return self.context_usage.snapshot(
             self.transcript_items, identity, capacity, live=live)
 
-    def replace_transcript(self, transcript, todos, toolsets, state, path):
+    def replace_transcript(self, transcript, todos, toolsets, state, path, *, revision=None):
         self.file_observations.clear()
         self.transcript_items = transcript
         self.session_todos = todos
@@ -202,6 +206,7 @@ class Session:
         # The path as given: Loki never normalises or resolves a filesystem
         # operand -- never, for any purpose.
         self.chat_log_path = path if path else None
+        self.chat_log_revision = revision
         self.chat_log_dirty = False
         self.last_instructed_agent_mode = None
 

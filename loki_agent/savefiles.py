@@ -8,6 +8,7 @@ as typed text segments for a front-end to render.
 from contextlib import aclosing, contextmanager
 import asyncio
 import codecs
+import hashlib
 import json
 import os
 import re
@@ -15,11 +16,14 @@ import stat
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pprint import pformat
 from typing import TypeGuard
 
+from . import file_locks
 from . import formats
 from . import json_streams
+from . import private_files
 from . import process_outputs
 from . import texts
 
@@ -450,8 +454,12 @@ async def run_session_picker_async(
 
 
 def read_chat_log(file_obj) -> tuple[list, list, dict, list]:
+    return _decode_chat_log(file_obj.read())
+
+
+def _decode_chat_log(text):
     try:
-        blob = json.load(file_obj)
+        blob = json.loads(text)
     except RecursionError as error:
         # Frontends handle invalid saved data as ValueError. The decoder's own
         # nesting limit must not turn such a file into an uncaught startup error.
@@ -466,6 +474,78 @@ def read_chat_log(file_obj) -> tuple[list, list, dict, list]:
         state,
         formats.log_toolsets(blob),
     )
+
+
+@dataclass(frozen=True)
+class ChatLogSnapshot:
+    # The terminal keeps this across provider discovery/approval; ACP loads
+    # the same snapshot before prepare_open can yield. A parsed transcript
+    # alone cannot identify what bytes the session intends to replace. Keep
+    # the revision from the same read, never reread the name to initialize it.
+    events: list
+    todos: list
+    state: dict
+    toolsets: list
+    revision: bytes
+
+
+def read_chat_log_snapshot(path):
+    with open_chat_log(path) as (stream, _facts):
+        data = stream.buffer.read()
+    revision = hashlib.sha256(data).digest()
+    text = data.decode('utf-8')
+    del data
+    events, todos, state, toolsets = _decode_chat_log(text)
+    return ChatLogSnapshot(events, todos, state, toolsets, revision)
+
+
+class ChatLogConflict(OSError):
+    """The session may keep its in-memory work but must not replace the log."""
+
+
+@contextmanager
+def guard_chat_log_revision(expected, directory, name):
+    """Serialize Loki chat publishers through the editor writer's native parent.
+
+    Atomic replace alone allows stale full snapshots to win. Lock one fixed
+    entry per acquired directory, so aliases of that directory share a lock
+    without rewriting path keys. Do not remove the lock entry on release;
+    closing the handle releases ownership. An already-open regular file
+    supplies the exact bytes matched before replace; None expects no file.
+    This coordinates participating writers, not external programs that ignore
+    the lock. No lock is held across prompts, hooks or model requests.
+    """
+    lock = private_files.open_lock_file_at(directory, '.loki-chat-save.lock', 0o600)
+    try:
+        facts = private_files.information(lock)
+        if not facts.regular or facts.reparse_point:
+            raise OSError('conversation save lock is not a regular file')
+        try:
+            file_locks.try_lock_exclusive(lock)
+        except BlockingIOError as error:
+            raise ChatLogConflict('another session is saving a conversation in this directory') from error
+        try:
+            target = private_files.open_read_at(directory, name)
+        except FileNotFoundError:
+            current = None
+        else:
+            try:
+                facts = private_files.information(target)
+                if not facts.regular or facts.reparse_point:
+                    raise OSError('saved conversation is not a regular file')
+            except BaseException:
+                private_files.close(target)
+                raise
+            digest = hashlib.sha256()
+            with private_files.binary_file(target, 'rb') as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+            current = digest.digest()
+        if current != expected:
+            raise ChatLogConflict('the saved conversation changed on disk; copy unsaved work before reopening it')
+        yield
+    finally:
+        private_files.close(lock)
 
 
 def chat_log_blob(events: list, todos: list,
@@ -483,13 +563,6 @@ def serialize_chat_log(events: list, todos: list,
             events, todos, session_state, toolsets=toolsets),
         indent=4,
     )
-
-
-def report_chat_log_saved(path: str) -> None:
-    # sys.stdout.flush()
-    # print('Note: Saved chat log in {!r}'.format(path), file=sys.stderr)
-    # sys.stderr.flush()
-    pass
 
 
 class ResumeTranscriptRenderer:

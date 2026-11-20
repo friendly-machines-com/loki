@@ -10,7 +10,7 @@ from unittest import mock
 
 import test_acps as fixtures
 from loki_entrypoints import child_environment, configure_container
-from loki_agent import acp, acp_events, acp_worker, acps
+from loki_agent import acp, acp_events, acp_worker, acps, formats, savefiles
 from loki_agent.credentials import CredentialStore
 from loki_agent.sessions import Session
 from process_lifecycle_fixtures import observe_fixture
@@ -234,6 +234,60 @@ class ChannelInsertionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WireV2Tests(fixtures._ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_fresh_acp_process_sends_the_selected_checkpoint_not_the_archive(self):
+        workspace = self.enterContext(tempfile.TemporaryDirectory())
+        config = self.enterContext(tempfile.TemporaryDirectory())
+        state = self.enterContext(tempfile.TemporaryDirectory())
+
+        async def respond(_request):
+            return [{"type": "message", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "archived assistant text"}]}]
+
+        endpoint, requests, _ = await self._provider(respond, protocol=formats.OPENAI_RESPONSES)
+        env = child_environment(HOME=workspace, PATH=os.environ.get("PATH", ""), TERM="dumb",
+                                XDG_CONFIG_HOME=config, XDG_STATE_HOME=state,
+                                LOKI_PROVIDER=formats.OPENAI_RESPONSES, LOKI_API_BASE=endpoint, LOKI_MODEL="workflow-model")
+        configure_container(env, workspace)
+        front, diagnostics = await self._front(env, workspace, cleanup=self.addAsyncCleanup)
+        await self._request(front, 1, "initialize", {"protocolVersion": 1})
+        opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
+        session_id = opened["sessionId"]
+        first, _ = await self._request(front, 3, "session/prompt", {
+            "sessionId": session_id, "prompt": [{"type": "text", "text": "retained user prompt"}]})
+        self.assertEqual(first["stopReason"], "end_turn")
+        await self._finish(front, diagnostics, session_id)
+
+        # Use the exact entries the real writer created. The native service is
+        # not called in this fixture: seed its result between worker lifetimes.
+        with os.scandir(workspace) as entries:
+            storage = next(entry.path for entry in entries if entry.name == ".loki")
+        with os.scandir(storage) as entries:
+            chats = next(entry.path for entry in entries if entry.name == "chats")
+        path = savefiles.saved_chat_log_path(chats, session_id)
+        saved = savefiles.read_chat_log_snapshot(path)
+        original = next(event for event in saved.events if event["type"] == "model_response")
+        encrypted = {"type": "compaction", "encrypted_content": "synthetic-opaque-checkpoint"}
+        checkpoint = formats.model_response_event(formats.OPENAI_RESPONSES, [encrypted],
+                                                  provider=original.get("provider"), endpoint=endpoint, model=original["model"])
+        window = [event for event in saved.events if event["type"] == "message"] + [checkpoint]
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(savefiles.serialize_chat_log(saved.events + [formats.context_replace_event(window)],
+                                                      saved.todos, saved.state, toolsets=saved.toolsets))
+
+        resumed, diagnostics = await self._front(env, workspace, cleanup=self.addAsyncCleanup)
+        await self._request(resumed, 1, "initialize", {"protocolVersion": 1})
+        await self._request(resumed, 2, "session/load", {"cwd": workspace, "sessionId": session_id})
+        result, _ = await self._request(resumed, 3, "session/prompt", {
+            "sessionId": session_id, "prompt": [{"type": "text", "text": "continue the chat"}]})
+        self.assertEqual(result["stopReason"], "end_turn")
+        await self._finish(resumed, diagnostics, session_id)
+        self.assertEqual(len(requests), 2)
+        replay = requests[-1]["input"]
+        self.assertEqual([item for item in replay if item["type"] == "compaction"], [encrypted])
+        self.assertIn("retained user prompt", json.dumps(replay))
+        self.assertNotIn("archived assistant text", json.dumps(replay))
+        self.assertEqual(savefiles.read_chat_log_snapshot(path).events[:len(saved.events)], saved.events)
+
     async def test_real_entrypoint_ack_lifecycle_error_replay_and_v1_selection(self):
         workspace = self.enterContext(tempfile.TemporaryDirectory())
         config = self.enterContext(tempfile.TemporaryDirectory())

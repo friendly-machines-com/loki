@@ -1283,6 +1283,8 @@ class _ACPFrontFixture:
                         reply = {'type': 'message', 'role': 'assistant', 'model': request['model'],
                                  'content': message, 'stop_reason':
                                  'tool_use' if any(block['type'] == 'tool_use' for block in message) else 'end_turn'}
+                    elif protocol == protocols.OPENAI_RESPONSES:
+                        reply = {'object': 'response', 'status': 'completed', 'model': request['model'], 'output': message}
                     else:
                         reply = {'choices': [{'message': message, 'finish_reason':
                                               'tool_calls' if message.get('tool_calls') else 'stop'}]}
@@ -1334,7 +1336,7 @@ class _ACPFrontFixture:
             finally:
                 writer.close()
                 await writer.wait_closed()
-        route = 'messages' if protocol == protocols.ANTHROPIC_MESSAGES else 'chat/completions'
+        route = {protocols.ANTHROPIC_MESSAGES: 'messages', protocols.OPENAI_RESPONSES: 'responses'}.get(protocol, 'chat/completions')
         return f'http://{host}:{port}/v1/{route}', requests, authorizations
 
     def _controlled_search(self, root, workspace, label, *, cwd=None):

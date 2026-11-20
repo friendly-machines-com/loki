@@ -184,7 +184,7 @@ class CompactionFormatTests(unittest.TestCase):
 class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         directory = self.enterContext(tempfile.TemporaryDirectory())
-        with tempfile.NamedTemporaryFile(dir=directory, delete=False) as log:
+        with tempfile.NamedTemporaryFile(dir=directory) as log:
             log_path = log.name
         with tempfile.NamedTemporaryFile(dir=directory, delete=False, mode="w", encoding="utf-8") as observed:
             observation_path = observed.name
@@ -388,6 +388,69 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         # Preservation is not a claim this private server accepts that role.
         # Provider output was not hoisted into the local developer prefix.
 
+    async def test_resume_accepts_irrelevant_catalog_changes_and_rejects_framing_changes(self):
+        from test_loki_tool_loop import ScriptedInputSession
+        path = self.session.chat_log_path
+        original = loki.active_connection_descriptor()
+        loki.set_session_connection(original)
+        await loki.compact_context_async(cancel_event=self.event)
+        with open(path, "rb") as stream:
+            before_resume = stream.read()
+        credentials = loki.CredentialInventory({}, self.broker.available())
+
+        for lite in [False, True]:
+            with self.subTest(responses_lite=lite):
+                resume = Session(shell_cwd=self.session.shell_cwd, credential_authority=self.broker,
+                                 response_headers=self.session.response_headers)
+                catalog = {"models": [{"slug": original.model, "visibility": "list", "use_responses_lite": lite,
+                                       "supports_parallel_tool_calls": False, "supports_reasoning_summaries": True,
+                                       "default_reasoning_level": "low", "default_reasoning_summary": "none"}]}
+                inputs = ScriptedInputSession(["next prompt", "/quit"] if lite else ["/quit"])
+                sent_before = len(self.sent)
+                with mock.patch.object(loki, "_DEFAULT_SESSION", resume), \
+                        mock.patch.object(loki, "CREDENTIALS", credentials), \
+                        mock.patch.object(loki.modelsdev, "fetch_openai_subscription_models", new=mock.AsyncMock(return_value=catalog)), \
+                        mock.patch.object(terminal_frontend, "confirm_saved_connection_async", new=mock.AsyncMock(return_value=True)) as confirm, \
+                        mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
+                        mock.patch.object(terminal_frontend.terminals, "open_terminal_stdin"), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(await terminal_frontend.async_main(["-r", path], settings.Settings()), 0)
+                if lite:
+                    confirm.assert_awaited_once()
+                    self.assertEqual(len(self.sent), sent_before + 1)
+                    self.assertEqual(sum(item.get("type") == "compaction" for item in self.sent[-1]["input"]), 1)
+                    self.assertNotIn("uncommented-tool-fact", json.dumps(self.sent[-1]))
+                else:
+                    confirm.assert_not_awaited()
+                    self.assertEqual(len(self.sent), sent_before)
+                    self.assertIn("cannot replay this compaction checkpoint", errors.getvalue())
+                    with open(path, "rb") as stream:
+                        self.assertEqual(stream.read(), before_resume)
+
+    async def test_acp_model_switch_rejects_incompatible_checkpoint_before_change(self):
+        path = self.session.chat_log_path
+        original = loki.active_connection_descriptor()
+        loki.set_session_connection(original)
+        await loki.compact_context_async(cancel_event=self.event)
+        worker = acp_worker.Worker(self.session, lambda message: None)
+        self.addAsyncCleanup(worker.close)
+        new_profile = replace(original.openai_request_profile, use_responses_lite=False)
+        incompatible = replace(original, openai_request_profile=new_profile)
+        worker._set_choices([
+            worker._saved_choice(original),
+            [{"value": "alternate", "name": "Alternate framing"}, incompatible],
+        ], "loki-saved")
+        credentials = loki.CredentialInventory({}, self.broker.available())
+        with mock.patch.object(loki, "CREDENTIALS", credentials):
+            for method in ["session/describe_config_selection", "session/set_config_option"]:
+                with self.subTest(method=method), self.assertRaisesRegex(acps.TransportError, "cannot replay this compaction checkpoint"):
+                    await worker.dispatch(method, {"configId": "model", "value": "alternate"})
+        self.assertEqual(worker.config_options()[0]["currentValue"], "loki-saved")
+        self.assertEqual(loki.active_connection_descriptor(), original)
+        with open(path, encoding="utf-8") as stream:
+            _, _, state, _ = savefiles.read_chat_log(stream)
+        self.assertEqual(state["connection"], original.to_dict())
+
     async def test_display_stream_setting_does_not_disable_compaction_stream(self):
         self.session.runtime_config.stream = False
         await loki.compact_context_async(cancel_event=self.event)
@@ -445,17 +508,74 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             await loki.compact_context_async(cancel_event=self.event)
         self.assertEqual(self.sent, [])
 
+    async def test_compaction_and_autosave_cannot_overwrite_a_newer_conversation(self):
+        path = self.session.chat_log_path
+        newer = formats.message_item("user", "saved from another session")
+        other = Session(shell_cwd=self.session.shell_cwd, response_headers=self.session.response_headers)
+
+        def concurrent_save():
+            with mock.patch.object(loki, "_DEFAULT_SESSION", other):
+                loki.load_chat_log(path)
+                other.transcript_items.append(newer)
+                loki.mark_chat_log_dirty()
+                self.assertTrue(loki.save_chat_log())
+
+        self.mutate = concurrent_save
+        with self.assertRaisesRegex(OSError, "changed on disk"):
+            await loki.compact_context_async(cancel_event=self.event)
+        self.assertEqual(self.session.transcript_items, self.before)
+        self.session.transcript_items.append(formats.message_item("user", "unsaved local work"))
+        loki.mark_chat_log_dirty()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertFalse(loki.save_chat_log())
+        self.assertIn("changed on disk", errors.getvalue())
+        self.assertTrue(self.session.chat_log_dirty)
+        with open(path, encoding="utf-8") as stream:
+            saved, _todos, _state, _tools = savefiles.read_chat_log(stream)
+        self.assertEqual(saved, self.before + [newer])
+
+    async def test_ordinary_saves_cannot_interleave_the_revision_check_and_replace(self):
+        path = self.session.chat_log_path
+        loki.mark_chat_log_dirty()
+        self.assertTrue(loki.save_chat_log())
+        other = Session(shell_cwd=self.session.shell_cwd, response_headers=self.session.response_headers)
+        with mock.patch.object(loki, "_DEFAULT_SESSION", other):
+            loki.load_chat_log(path)
+            other.transcript_items.append(formats.message_item("user", "second writer"))
+            loki.mark_chat_log_dirty()
+        self.session.transcript_items.append(formats.message_item("user", "first writer"))
+        loki.mark_chat_log_dirty()
+        replace_at = loki.files.private_files.replace_at
+        competing = []
+
+        def publish(directory, temporary, name, **kwargs):
+            if not competing:
+                competing.append(True)
+                with mock.patch.object(loki, "_DEFAULT_SESSION", other):
+                    competing.append(loki.save_chat_log())
+            replace_at(directory, temporary, name, **kwargs)
+
+        with mock.patch.object(loki.files.private_files, "replace_at", side_effect=publish), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertTrue(loki.save_chat_log())
+        self.assertEqual(competing, [True, False])
+        self.assertIn("another session is saving", errors.getvalue())
+        self.assertTrue(other.chat_log_dirty)
+        with open(path, encoding="utf-8") as stream:
+            saved, _todos, _state, _tools = savefiles.read_chat_log(stream)
+        self.assertEqual(saved, self.session.transcript_items)
+
     async def test_failed_save_and_post_publication_cancel_boundary(self):
         writer = loki.files.atomic_write_text
         calls = []
 
-        def save(path, content, *, on_published=None):
+        def save(path, content, **kwargs):
             document = json.loads(content)
             self.assertIs(self.session.transcript_items, self.before_archive)
             calls.append(document)
             if document["events"][-1].get("type") == "context_replace":
                 raise OSError("candidate save failed")
-            return writer(path, content, on_published=on_published)
+            return writer(path, content, **kwargs)
         with mock.patch.object(loki.files, "atomic_write_text", side_effect=save):
             with self.assertRaisesRegex(OSError, "candidate save"):
                 await loki.compact_context_async(cancel_event=self.event)
@@ -463,8 +583,8 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session.transcript_items, self.before)
         calls.clear()
 
-        def committed(path, content, *, on_published=None):
-            save_result = writer(path, content, on_published=on_published)
+        def committed(path, content, **kwargs):
+            save_result = writer(path, content, **kwargs)
             calls.append(content)
             if json.loads(content)["events"][-1].get("type") == "context_replace":
                 self.event.set()
@@ -970,8 +1090,8 @@ print(json.dumps(result))
         self.assertEqual(self.sent, [])
         writer = loki.files.atomic_write_text
 
-        def commit(path, content, *, on_published=None):
-            writer(path, content, on_published=on_published)
+        def commit(path, content, **kwargs):
+            writer(path, content, **kwargs)
             if json.loads(content)["events"][-1].get("type") == "context_replace":
                 self.event.set()
         with mock.patch.object(loki.files, "atomic_write_text", side_effect=commit):
@@ -1030,6 +1150,55 @@ print(json.dumps(result))
         self.assertNotIn("Context compaction failed:", stdout.getvalue())
         self.assertIn("/compact:\nContext compaction failed: TimeoutError", stderr.getvalue())
         self.assertNotIn("\x1b", stderr.getvalue())
+
+    async def test_tui_compaction_after_ctrl_c_runs_separately(self):
+        from test_loki_tool_loop import ScriptedInputSession
+        inputs = ScriptedInputSession(["/compact", "/quit"])
+        inputs.reader.pending = []
+        attempts = []
+
+        async def compact(*, cancel_event, on_start, **kwargs):
+            on_start()
+            attempts.append(len(attempts) + 1)
+            if len(attempts) == 1:
+                terminals.AsyncKeyReader._queue_event(inputs.reader, terminals.KeyEvent("CTRL_C"))
+                self.assertTrue(inputs.on_submit("/compact"))
+                self.assertTrue(cancel_event.is_set())
+                raise recoveries.Cancelled()
+            self.assertFalse(cancel_event.is_set())
+            return "Context compacted."
+
+        with mock.patch.object(loki, "CREDENTIALS", self.tui_inventory()), \
+                mock.patch.object(loki, "compact_context_async", new=compact), \
+                mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
+                mock.patch.object(terminal_frontend.terminals, "open_terminal_stdin"), \
+                mock.patch.object(terminal_frontend, "new_chat_log_path", return_value=self.session.chat_log_path), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
+        self.assertEqual(attempts, [1, 2])
+        self.assertEqual(output.getvalue().count("Compaction requested."), 2)
+        self.assertEqual(output.getvalue().count("Context compaction cancelled."), 1)
+        self.assertNotIn("Context compacted.", output.getvalue())
+
+    async def test_tui_reports_a_pending_compaction_when_the_turn_aborts(self):
+        from test_loki_tool_loop import ScriptedInputSession
+        inputs = ScriptedInputSession(["work", "/quit"])
+
+        @contextlib.asynccontextmanager
+        async def fail(method, url, **kwargs):
+            self.assertTrue(inputs.on_submit("/compact"))
+            raise model_requests.StreamingApiError(url, 400, "Bad Request", "synthetic sampling rejection")
+            yield
+
+        with mock.patch.object(loki, "CREDENTIALS", self.tui_inventory()), \
+                mock.patch.object(http_client, "async_http_stream", new=fail), \
+                mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
+                mock.patch.object(terminal_frontend.terminals, "open_terminal_stdin"), \
+                mock.patch.object(terminal_frontend, "new_chat_log_path", return_value=self.session.chat_log_path), \
+                contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
+        self.assertIn("Compaction requested.", output.getvalue())
+        self.assertIn("The turn ended before context compaction could run.", errors.getvalue())
 
     async def _tui_running_control(self, failure=False, *, compaction_retries=0):
         from test_loki_tool_loop import ScriptedInputSession
@@ -1131,10 +1300,10 @@ print(json.dumps(result))
         replace_at = loki.files.private_files.replace_at
         state = {"candidate": False, "published": False, "raised": False}
 
-        def writing(path, content, *, on_published=None):
+        def writing(path, content, **kwargs):
             state["candidate"] = json.loads(content)["events"][-1].get("type") == "context_replace"
             state["published"] = False
-            return writer(path, content, on_published=on_published)
+            return writer(path, content, **kwargs)
 
         def replacing(*args, on_published=None):
             def published():
@@ -1150,9 +1319,10 @@ print(json.dumps(result))
 
         with mock.patch.object(loki.files, "atomic_write_text", side_effect=writing), \
                 mock.patch.object(loki.files.private_files, "replace_at", side_effect=replacing), \
-                mock.patch.object(loki.files.private_files, "close", side_effect=closing):
-            with self.assertRaisesRegex(OSError, "after replacement"):
-                await loki.compact_context_async(cancel_event=self.event)
+                mock.patch.object(loki.files.private_files, "close", side_effect=closing), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertIn("Context compacted", await loki.compact_context_async(cancel_event=self.event))
+        self.assertIn("close failed after replacement", errors.getvalue())
         self.assertTrue(state["raised"])
         self.assertIs(self.session.transcript_items, self.before_archive)
         self.assertEqual(self.session.transcript_items[-1]["type"], "context_replace")
@@ -1162,15 +1332,30 @@ print(json.dumps(result))
             saved, _todos, _state, _tools = savefiles.read_chat_log(stream)
         self.assertEqual(saved, self.session.transcript_items)
 
-    async def test_publication_inside_replace_primitive_precedes_its_cleanup_failure(self):
+    async def test_same_turn_continues_when_rename_cleanup_fails_after_commit(self):
+        self.idle_routing = False
+        self.ordinary_outputs = [self.tool_batch()]
+        requests = compactions.Requests()
+        events = []
         writer = loki.files.atomic_write_text
         replace_at = loki.files.private_files.replace_at
         candidate = False
 
-        def writing(path, content, *, on_published=None):
+        def request_during_sampling():
+            if len(self.sent) == 1:
+                requests.request()
+
+        def on_event(event):
+            events.append(event)
+            if event["type"] == "tool_result":
+                self.before = copy.deepcopy(self.session.transcript_items)
+
+        self.mutate = request_during_sampling
+
+        def writing(path, content, **kwargs):
             nonlocal candidate
             candidate = json.loads(content)["events"][-1].get("type") == "context_replace"
-            return writer(path, content, on_published=on_published)
+            return writer(path, content, **kwargs)
 
         def rename_then_fail(directory, temporary, name, *, on_published=None):
             replace_at(directory, temporary, name, on_published=on_published)
@@ -1178,11 +1363,21 @@ print(json.dumps(result))
                 raise OSError("rename primitive cleanup failed")
 
         with mock.patch.object(loki.files, "atomic_write_text", side_effect=writing), \
-                mock.patch.object(loki.files.private_files, "replace_at", side_effect=rename_then_fail):
-            with self.assertRaisesRegex(OSError, "primitive cleanup"):
-                await loki.compact_context_async(cancel_event=self.event)
+                mock.patch.object(loki.files.private_files, "replace_at", side_effect=rename_then_fail), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            text = await loki.run_tool_loop_async(
+                self.session.transcript_items, cancel_event=self.event, stream_chat=True,
+                on_event=on_event, compaction_requests=requests)
+        self.assertEqual(text, "ordinary answer")
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(sum(item.get("type") == "compaction" for item in self.sent[-1]["input"]), 1)
+        self.assertIn("rename primitive cleanup failed", errors.getvalue())
+        self.assertNotIn("compaction_failed", [event["type"] for event in events])
         self.assertIs(self.session.transcript_items, self.before_archive)
-        self.assertEqual(self.session.transcript_items[-1]["type"], "context_replace")
+        self.assertEqual(sum(event["type"] == "context_replace" for event in self.session.transcript_items), 1)
+        # A second save must recognize the new revision despite the cleanup error.
+        loki.mark_chat_log_dirty()
+        self.assertTrue(loki.save_chat_log())
         with open(self.session.chat_log_path, encoding="utf-8") as stream:
             saved, _todos, _state, _tools = savefiles.read_chat_log(stream)
         self.assertEqual(saved, self.session.transcript_items)
@@ -1446,7 +1641,7 @@ print(json.dumps(result))
         self.assertEqual(sorted(message["id"] for message in messages if "result" in message), [1, 2, 3])
         self.assertEqual(len([event for event in self.session.transcript_items if event["type"] == "context_replace"]), 1)
         self.assertEqual(worker._reverse_requests, {})
-        self.assertEqual(worker._compaction_replies, [])
+        self.assertFalse(worker._compaction_replies)
 
     async def _finalization_control(self, failure):
         self.idle_routing = False
@@ -1495,7 +1690,7 @@ print(json.dumps(result))
         self.assertEqual(len(controls), 2)
         self.assertTrue(all(("error" in message) == failure for message in controls))
         self.assertIsNone(worker.compaction_requests.pending)
-        self.assertEqual(worker._compaction_replies, [])
+        self.assertFalse(worker._compaction_replies)
 
     async def test_control_during_turn_end_is_a_single_idle_tail_after_original_reply(self):
         await self._finalization_control(False)
@@ -1560,7 +1755,7 @@ print(json.dumps(result))
                     task.cancel()
                 await asyncio.gather(original, *controls, return_exceptions=True)
         self.assertEqual(channel._pending, {})
-        self.assertEqual(process.worker._compaction_replies, [])
+        self.assertFalse(process.worker._compaction_replies)
         self.assertEqual(len(self.sent), 3)
         self.assertTrue(any(packet["params"]["update"]["sessionUpdate"] == "compaction_update"
                             for packet in notifications if packet.get("method") == "session/update"))
@@ -1573,14 +1768,14 @@ print(json.dumps(result))
         worker = acp_worker.Worker(self.session, messages.append)
         self.addAsyncCleanup(worker.close)
         accepted = worker.compaction_requests.request()
-        worker._compaction_replies.extend([2, 3])
+        worker._compaction_replies[accepted] = [2, 3]
         with mock.patch.object(loki, "capture_turn_settings", side_effect=protocols.ProtocolError("invalid admitted settings")):
             await worker._perform_idle_compaction()
         self.assertEqual(accepted.result()["type"], "compaction_failed")
         self.assertEqual(sorted(message["id"] for message in messages if "error" in message), [2, 3])
         self.assertEqual(self.sent, [])
         self.assertIsNone(worker.compaction_requests.pending)
-        self.assertEqual(worker._compaction_replies, [])
+        self.assertFalse(worker._compaction_replies)
 
     async def test_acp_v1_controls_join_running_turn_without_early_original_reply(self):
         await self._acp_control_journey()
@@ -1689,6 +1884,63 @@ print(json.dumps(result))
 
     async def test_v2_cancel_during_compaction_waits_for_the_executor_outcome(self):
         await self._v2_control_journey(cancel=True)
+
+    async def _acp_compaction_cutoff(self, version, *, prestart=False):
+        messages = []
+        worker = acp_worker.Worker(self.session, messages.append)
+        worker.protocol_version = version
+        worker.can_report_compaction = True
+        self.addAsyncCleanup(worker.close)
+        ready, release = asyncio.Event(), asyncio.Event()
+
+        @contextlib.asynccontextmanager
+        async def controlled(method, url, **kwargs):
+            async with self.streaming(method, url, **kwargs) as response:
+                if len(self.sent) == 1 and not prestart:
+                    ready.set()
+                    await release.wait()
+                yield response
+
+        with mock.patch.object(http_client, "async_http_stream", new=controlled):
+            await worker.handle(acps.request(1, "session/prompt", self.params("/compact")), concurrent=True)
+            owner = worker._prompt_task
+            try:
+                if not prestart:
+                    await observe_fixture(ready.wait(), owner)
+                await worker.dispatch("session/cancel", {})
+                await worker.handle(acps.request(2, "session/prompt", self.params("/compact")), concurrent=True)
+                release.set()
+                await owner
+            finally:
+                release.set()
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+
+        self.assertEqual(len(self.sent), 1 if prestart else 2)
+        self.assertEqual(sum(event["type"] == "context_replace" for event in self.session.transcript_items), 1)
+        replies = [message for message in messages if message.get("id") in [1, 2]]
+        self.assertEqual([reply["id"] for reply in replies], [1, 2])
+        if version == 1:
+            self.assertEqual([reply["result"]["stopReason"] for reply in replies], ["cancelled", "end_turn"])
+        else:
+            self.assertTrue(all("messageId" in reply["result"] for reply in replies))
+        updates = [message["params"]["update"] for message in messages if message.get("method") == "session/update"]
+        progress = [update for update in updates if update["sessionUpdate"] == "compaction_update"]
+        expected = ["in_progress", "completed"] if prestart else ["in_progress", "cancelled", "in_progress", "completed"]
+        self.assertEqual([update["status"] for update in progress], expected)
+        self.assertEqual(progress[-2]["compactionId"], progress[-1]["compactionId"])
+        if not prestart:
+            self.assertNotEqual(progress[0]["compactionId"], progress[-1]["compactionId"])
+        self.assertIsNone(worker.compaction_requests.pending)
+
+    async def test_v1_compaction_admitted_after_cancel_runs_separately(self):
+        await self._acp_compaction_cutoff(1)
+
+    async def test_v1_pending_primary_compaction_cannot_consume_post_cancel_control(self):
+        await self._acp_compaction_cutoff(1, prestart=True)
+
+    async def test_v2_compaction_admitted_after_cancel_runs_separately(self):
+        await self._acp_compaction_cutoff(2)
 
     async def test_v2_busy_ordinary_prompts_insert_then_execute_fifo_and_cancel_has_a_cutoff(self):
         messages = []

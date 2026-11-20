@@ -1602,6 +1602,9 @@ class AsyncKeyReader:
         # A second boolean could disagree with those async consumers, so it is
         # deliberately absent. Setter and waiters run on the same asyncio loop.
         self.cancel_event = asyncio.Event()
+        # The frontend may close compaction intake at the same key event.
+        # Waiting on cancel_event in another task would race the next submit.
+        self.on_cancel = None
         # Shift-Tab requests a mode change for the NEXT turn. This separate
         # preference flag must not cancel any operation in the current turn.
         self.mode_cycle_requested = False
@@ -1705,6 +1708,8 @@ class AsyncKeyReader:
             self.mode_cycle_requested = True
         elif event.kind == "CTRL_C":
             self.cancel_event.set()
+            if self.on_cancel is not None:
+                self.on_cancel()
         self.pending.append(event)
 
     def _feed_plain_byte(self, byte):

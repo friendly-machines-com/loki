@@ -661,9 +661,9 @@ connection.close()
                 resources.assert_released(self)
                 for secret in [late_tokens.access_token, late_tokens.refresh_token, late_tokens.id_token]:
                     self.assertNotIn(secret.encode(), stdout + stderr)
-                logs = os.path.join(workspace, '.loki', 'chats')
-                self.assertEqual(len(os.listdir(logs)), 1)
-                with open(os.path.join(logs, os.listdir(logs)[0]), encoding='utf-8') as stream:
+                logs = savefiles.chat_log_entries(os.path.join(workspace, '.loki', 'chats'))
+                self.assertEqual(len(logs), 1)
+                with open(logs[0].path, encoding='utf-8') as stream:
                     transcript, _todos, _state, _toolsets = savefiles.read_chat_log(stream)
                 results = [item for item in transcript if item.get('type') == 'tool_result']
                 self.assertEqual(len(results), 1)

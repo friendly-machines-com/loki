@@ -161,15 +161,15 @@ def _write_destination(file_path: str) -> str:
     return existing_target(file_path, observed)
 
 
-def atomic_write_text(file_path: str, content: str, *, on_published=None):
+def atomic_write_text(file_path: str, content: str, *, on_published=None, write_guard=None):
     """Publish through the existing editor writer, then notify its synchronous owner.
 
-    Chat compaction must install exactly the selection visible on disk even when
-    retained-directory cleanup subsequently fails. A successful return is too late
-    to identify that boundary. The optional callback reports successful replacement
-    before cleanup, without another writer, pathname reopen or rollback policy.
-    Callers prepare their state beforehand; the callback cannot await. Ordinary
-    editor saves keep their existing permissions, link and cleanup contracts.
+    Chat saves guard a revision through replacement. The unchecked editor
+    policy has no conversation revision; give the guard the same acquired
+    directory and entry the writer uses instead of resolving a second name.
+    The guard covers validation and rename, not temporary-file preparation.
+    Notify the caller at replacement, before cleanup can raise. Neither
+    callback can await. Editor callers keep their existing write policy.
     """
     file_path = _follow_final_link(file_path)
     # A final symlink is followed so its target is replaced and the link stays,
@@ -237,7 +237,8 @@ def atomic_write_text(file_path: str, content: str, *, on_published=None):
             if on_published is not None:
                 on_published()
 
-        private_files.replace_at(directory_fd, candidate, name, on_published=published)
+        with write_guard(directory_fd, name) if write_guard is not None else contextlib.nullcontext():
+            private_files.replace_at(directory_fd, candidate, name, on_published=published)
     finally:
         try:
             if temporary is not None:

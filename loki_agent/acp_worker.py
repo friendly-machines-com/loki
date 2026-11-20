@@ -69,7 +69,6 @@ class Worker:
         self.protocol_version = 1
         self._v2_pending = collections.deque()
         self._foreground_state = "idle"
-        self._v2_cancelled_compaction = None
         # The session reuses one event, cleared only when admitting a new
         # prompt. session/cancel and close set it; requests query is_set, and
         # tools/recovery wait on the same state. Replays must never clear it.
@@ -86,11 +85,13 @@ class Worker:
         # the Ask tool at all.
         self.can_ask_user = False
         self.can_report_compaction = False
-        # Controls retain their own wire IDs, not another prompt task. Receipt
-        # must return immediately so this same input loop can receive cancellation
-        # and reverse-question answers while the existing owner does the work.
-        self._compaction_replies: list = []
-        self.compaction_requests = compactions.Requests(self._settle_compaction_replies)
+        # Joined v1 controls retain their wire IDs under their request Future.
+        # A cancelled executor can finish after the next group has joined; one
+        # flat list would send that old outcome to the new requests. V2 ACKs
+        # insertion already and has no deferred RPC replies here.
+        self._compaction_replies: dict[asyncio.Future, list] = {}
+        self.compaction_requests = compactions.Requests(
+            self._settle_compaction_replies, on_unstarted=self._publish_compaction_event)
         self._model_options: list[dict] = []
         self._option_leaves: dict[str, object] = {}
         self._current_option_value: str | None = None
@@ -192,11 +193,12 @@ class Worker:
                     self._state("idle", stop_reason=result["stopReason"])
         finally:
             self._cancel_v2_pending()
-            self._v2_cancelled_compaction = None
-            if not self.session.active or task.cancelling():
-                self.compaction_requests.finish_pending(cancelled=True)
-            if self._foreground_state != "idle":
-                self._state("idle", stop_reason="cancelled" if self.cancel_event.is_set() else "error")
+            closing = not self.session.active or bool(task.cancelling())
+            try:
+                self.compaction_requests.finish_pending(cancelled=closing)
+            finally:
+                if self._foreground_state != "idle":
+                    self._state("idle", stop_reason="cancelled" if closing or self.cancel_event.is_set() else "error")
 
     def _handle_v2_prompt(self, message):
         admitted = {}
@@ -235,12 +237,10 @@ class Worker:
             raise TurnFailure(compactions.failure_text(outcome["error"]))
         return {"stopReason": "cancelled" if outcome["type"] == "compaction_cancelled" else "end_turn"}
 
-    def _settle_compaction_replies(self, outcome):
-        # _answer owns one ordinary reply; coalesced controls retain independent
-        # wire identities. Take the whole batch before writes, attempt every ID
-        # even on failure, then expose errors to the existing channel/close owner.
-        replies = self._compaction_replies
-        self._compaction_replies = []
+    def _settle_compaction_replies(self, future, outcome):
+        # _answer owns the primary reply. Drain only this group's joined IDs,
+        # attempting every write even if one delivery fails.
+        replies = self._compaction_replies.pop(future, [])
         errors = []
         for request_id in replies:
             try:
@@ -262,29 +262,43 @@ class Worker:
                                     compaction=self.protocol_version == 2 or self.can_report_compaction,
                                     protocol_version=self.protocol_version)
 
-    async def _perform_idle_compaction(self, thinking=None):
-        # The admitting owner captures settings and resets cancellation once. A joining control
-        # or a scheduled-before-start cancellation must not reset that event.
-        def on_event(event):
-            for update in self._event_updates(event, {}):
-                self.write(acps.notification("session/update", update))
+    def _publish_compaction_event(self, event):
+        for update in self._event_updates(event, {}):
+            self.write(acps.notification("session/update", update))
 
+    async def _perform_idle_compaction(self, thinking=None):
+        # The admitting owner captures settings and resets cancellation once.
+        # Joining controls cannot reset that event.
         async def operation(started):
             admitted = thinking if thinking is not None else loki.capture_turn_settings()
             return await loki.compact_context_async(
                 cancel_event=self.cancel_event, thinking=admitted,
                 allow_ask=self.can_ask_user, on_start=started)
 
-        return await self.compaction_requests.run(operation, on_event)
+        return await self.compaction_requests.run(operation, self._publish_compaction_event)
 
     async def _compaction_tail(self):
         # _prompt_task also spans final hooks/reply writing. Requests received
         # after loop exit belong to this idle tail, not an already-finalized turn.
-        while self.compaction_requests.pending is not None and self.session.active:
-            self.cancel_event.clear()
-            await self._perform_idle_compaction()
-        if not self.session.active:
-            self.compaction_requests.finish_pending(cancelled=True)
+        try:
+            while self.compaction_requests.pending is not None and self.session.active:
+                self.cancel_event.clear()
+                await self._perform_idle_compaction()
+        finally:
+            task = asyncio.current_task()
+            closing = not self.session.active or bool(task and task.cancelling())
+            self.compaction_requests.finish_pending(cancelled=closing)
+
+    async def _primary_compaction(self, params, future, thinking):
+        # V1 admits its primary group before the scheduled task can receive
+        # cancellation. If already settled, never run a later group's request.
+        self.session_id = params.get("sessionId") or self.session_id
+        if not future.done():
+            if self.session.active:
+                await self._perform_idle_compaction(thinking)
+            else:
+                self.compaction_requests.finish_pending(cancelled=True)
+        return self._compaction_result(future.result())
 
     async def handle(self, message: dict, concurrent: bool = False):
         method = message.get("method")
@@ -297,24 +311,25 @@ class Worker:
         if method == "session/prompt":
             try:
                 params = message.get("params") or {}
-                if (self._prompt_task is not None and not self._prompt_task.done()
-                        and self._is_compact_control(params)):
-                    self.compaction_requests.request()
-                    self._compaction_replies.append(request_id)
+                compact = self._is_compact_control(params)
+                if compact and self._prompt_task is not None and not self._prompt_task.done():
+                    future = self.compaction_requests.request()
+                    self._compaction_replies.setdefault(future, []).append(request_id)
                     return
                 thinking = self._prepare_prompt(params)
+                primary = self.compaction_requests.request() if compact else None
             except acps.TransportError as error:
                 self.write(acps.error_response(
                     request_id, {"code": error.code, "message": str(error)}))
                 return
             if concurrent:
                 self._prompt_task = asyncio.create_task(
-                    self._answer(message, thinking=thinking),
+                    self._answer(message, thinking=thinking, primary=primary),
                     name=f"acp-worker-prompt-{request_id}")
             else:
                 self._prompt_task = asyncio.current_task()
                 try:
-                    await self._answer(message, thinking=thinking)
+                    await self._answer(message, thinking=thinking, primary=primary)
                 finally:
                     self._prompt_task = None
             return
@@ -357,14 +372,14 @@ class Worker:
 
     async def _answer(
             self, message: dict,
-            thinking: model_requests.TurnThinkingSettings | None = None):
+            thinking: model_requests.TurnThinkingSettings | None = None, *, primary=None):
         request_id = message.get("id")
+        params = message.get("params") or {}
         try:
-            result = await self.dispatch(
-                message.get("method"),
-                message.get("params") or {},
-                thinking=thinking,
-            )
+            if primary is not None:
+                result = await self._primary_compaction(params, primary, thinking)
+            else:
+                result = await self.dispatch(message.get("method"), params, thinking=thinking)
         except acps.TransportError as error:
             self.write(acps.error_response(
                 request_id, {"code": error.code, "message": str(error)}))
@@ -393,11 +408,10 @@ class Worker:
                 thinking=thinking,
             )
         if method == "session/cancel":
-            if self.protocol_version == 2:
-                self._v2_cancelled_compaction = self.compaction_requests.pending
-                self.compaction_requests.finish_pending(cancelled=True, expected=self._v2_cancelled_compaction)
-                self._cancel_v2_pending()
             self.cancel_event.set()
+            if self.protocol_version == 2:
+                self._cancel_v2_pending()
+            self.compaction_requests.cancel_pending()
             return {}
         if method == "session/prepare_open":
             return await self.prepare_open(params)
@@ -429,15 +443,15 @@ class Worker:
             code=acps.METHOD_NOT_FOUND,
         )
 
-    def describe_config_selection(self, params: dict) -> dict:
-        """Describe effective request destinations; only the front owns consent."""
-        if params.get("configId") != "model":
-            return {}
-        leaf = self._option_leaves.get(params.get("value"))
+    def _config_for_model_choice(self, value):
+        # The worker knows the active checkpoint; the front alone can approve
+        # sending a credential. Check before describing destinations and again
+        # when applying the selection after that potentially suspended request.
+        leaf = self._option_leaves.get(value)
         if leaf is None:
             raise acps.TransportError("unknown model value", code=acps.INVALID_PARAMS)
         if leaf is _DISCONNECTED:
-            return {}
+            return None
         if isinstance(leaf, modelsdev.ExplicitConnectionOption):
             config = connections.build_config_from_env(credentials=loki.CREDENTIALS)
         elif isinstance(leaf, ConnectionDescriptor):
@@ -446,7 +460,18 @@ class Worker:
             provider_id, provider_entry, model_entry = leaf
             config = connections.config_from_modelsdev_selection(
                 provider_id, provider_entry, model_entry, loki.CREDENTIALS)
-        if config.auth_spec is None:
+        try:
+            loki.validate_checkpoint_connection(config, self.session.transcript_items)
+        except formats.ProjectionError as error:
+            raise acps.TransportError(str(error), code=acps.INVALID_PARAMS) from error
+        return config
+
+    def describe_config_selection(self, params: dict) -> dict:
+        """Describe effective request destinations; only the front owns consent."""
+        if params.get("configId") != "model":
+            return {}
+        config = self._config_for_model_choice(params.get("value"))
+        if config is None or config.auth_spec is None:
             return {}
         return {"credential": config.auth_spec.credential.encode(),
                 "destinations": config.credential_destinations()}
@@ -599,8 +624,15 @@ class Worker:
 
         if explicit is not None and connections.explicit_api_base_configured(
                 loki.CREDENTIALS):
-            choices.append(explicit)
-            self._set_choices(choices, "loki-explicit")
+            try:
+                if self.session.runtime_config is not None:
+                    loki.validate_checkpoint_connection(self.session.runtime_config, self.session.transcript_items)
+            except formats.ProjectionError as error:
+                self.session.runtime_config = None
+                self._configuration_error = str(error)
+                self._set_choices([self._disconnected_choice(), explicit], "loki-disconnected")
+            else:
+                self._set_choices([explicit], "loki-explicit")
             return
 
         if saved_descriptor is not None:
@@ -758,6 +790,10 @@ class Worker:
                     connection_update = saved_descriptor
 
         self._install_initial_choices(saved_descriptor)
+        if self._current_option_value != "loki-saved" and formats.has_active_checkpoint(self.session.transcript_items):
+            # Do not persist retirement or a rejected refresh over the saved
+            # origin, even if the chat can still open for viewing.
+            connection_update = _UNCHANGED
         if discovered:
             self._install_catalog_choices(discovered)
         runtime_config = self.session.runtime_config
@@ -873,30 +909,14 @@ class Worker:
                 code=acps.INVALID_PARAMS,
             )
         value = params.get("value")
-        leaf = self._option_leaves.get(value)
-        if leaf is None:
-            raise acps.TransportError(
-                f"unknown model value {value!r}",
-                code=acps.INVALID_PARAMS,
-            )
-
-        if leaf is _DISCONNECTED:
+        config = self._config_for_model_choice(value)
+        if config is None:
             self.session.runtime_config = None
-            self.session.session_state.pop("connection", None)
-            loki.mark_chat_log_dirty()
-        elif isinstance(leaf, modelsdev.ExplicitConnectionOption):
-            loki.apply_runtime_config(connections.build_config_from_env(
-                credentials=loki.CREDENTIALS))
-        elif isinstance(leaf, ConnectionDescriptor):
-            loki.apply_runtime_config(
-                connections.config_from_connection_descriptor(
-                    leaf, loki.CREDENTIALS))
+            if not formats.has_active_checkpoint(self.session.transcript_items):
+                self.session.session_state.pop("connection", None)
+                loki.mark_chat_log_dirty()
         else:
-            provider_id, provider_entry, model_entry = leaf
-            loki.apply_runtime_config(
-                connections.config_from_modelsdev_selection(
-                    provider_id, provider_entry, model_entry,
-                    loki.CREDENTIALS))
+            loki.apply_runtime_config(config)
 
         self._current_option_value = value
         descriptor = loki.active_connection_descriptor()
@@ -1123,14 +1143,16 @@ class Worker:
             thinking: model_requests.TurnThinkingSettings | None = None) -> dict:
         task = asyncio.current_task()
         scheduled = self._prompt_task is task
-        if (not scheduled and self._prompt_task is not None and not self._prompt_task.done()
-                and self._is_compact_control(params)):
+        compact = self._is_compact_control(params)
+        if compact and not scheduled and self._prompt_task is not None and not self._prompt_task.done():
             future = self.compaction_requests.request()
             return self._compaction_result(await asyncio.shield(future))
         if not scheduled:
             thinking = self._prepare_prompt(params, thinking)
             self._prompt_task = task
         try:
+            if compact:
+                return await self._primary_compaction(params, self.compaction_requests.request(), thinking)
             return await self._prompt(params, thinking)
         finally:
             # Inline callers own the task only for this prompt. Scheduled
@@ -1152,17 +1174,9 @@ class Worker:
         outcome = None
         command = acp_commands.parse(user_text)
         if command is not None and command[0] == "compact":
-            if command[1]:
-                self.write(acps.notification("session/update", acp_events.agent_message_chunk(self.session_id, "Usage: /compact")))
-                return {"stopReason": "end_turn"}
-            future = self.compaction_requests.request()
-            # Admission already captured thinking and reset cancellation once.
-            # A pre-start cancel must not be cleared by the idle execution path.
-            if self.cancel_event.is_set():
-                self.compaction_requests.finish_pending(cancelled=True)
-            else:
-                await self._perform_idle_compaction(thinking)
-            return self._compaction_result(future.result())
+            # Argument-free requests were claimed at admission.
+            self.write(acps.notification("session/update", acp_events.agent_message_chunk(self.session_id, "Usage: /compact")))
+            return {"stopReason": "end_turn"}
         cancelled_bang = (command is not None and command[0] == "!"
                           and self.cancel_event.is_set())
         if not cancelled_bang and user_text.lstrip().startswith(("/", "!")):
@@ -1251,16 +1265,6 @@ class Worker:
             self.write(acps.notification("session/update", update))
 
     async def _run_turn(self, on_event, thinking):
-        if not loki.current_model():
-            detail = self._configuration_error or (
-                "No model selected; configure LOKI_* or select a model.")
-            on_event({
-                "type": "assistant_message",
-                "content": detail,
-            })
-            return
-        recovery = loki.make_turn_recovery(self.cancel_event)
-
         def on_response(turn, event):
             loki.mark_chat_log_dirty()
             self._publish_context_usage(live=True)
@@ -1269,6 +1273,12 @@ class Worker:
         # cleanup through this await. _prompt then saves/notifies once and
         # _answer writes the sole reply; recovery adds no separate lifecycle.
         try:
+            if not loki.current_model():
+                detail = self._configuration_error or (
+                    "No model selected; configure LOKI_* or select a model.")
+                on_event({"type": "assistant_message", "content": detail})
+                return
+            recovery = loki.make_turn_recovery(self.cancel_event)
             return await loki.run_tool_loop_async(
                 self.session.transcript_items, on_event=on_event,
                 cancel_event=self.cancel_event, recovery=recovery,
@@ -1276,16 +1286,12 @@ class Worker:
                 ask_user=self._ask_user if self.can_ask_user else None,
                 compaction_requests=self.compaction_requests)
         finally:
-            # No await before sealing this loop. Later controls are serviced
-            # after the original save/hook/reply by _answer's idle tail.
-            if self.protocol_version == 2 and self.cancel_event.is_set() and self.session.active:
-                # A command inserted AFTER session/cancel is a later operation,
-                # not covered by that notification's admission cutoff.
-                if self._v2_cancelled_compaction is not None:
-                    self.compaction_requests.finish_pending(cancelled=True, expected=self._v2_cancelled_compaction)
-            else:
-                self.compaction_requests.finish_pending(
-                    cancelled=self.cancel_event.is_set() or not self.session.active)
+            # Cancel already closed intake for the old attempt. A later
+            # request survives the old turn's finalization unless closing.
+            task = asyncio.current_task()
+            closing = not self.session.active or bool(task and task.cancelling())
+            if closing or not self.cancel_event.is_set():
+                self.compaction_requests.finish_pending(cancelled=closing)
 
     @staticmethod
     def _turn_failure(events: list) -> str | None:

@@ -14,7 +14,9 @@ import sys
 import os
 import asyncio
 import collections
+import contextlib
 import copy
+import hashlib
 import json
 import time
 import urllib.parse
@@ -42,6 +44,7 @@ from . import process_outputs
 from . import authentications
 from . import savefiles
 from . import skills
+from . import texts
 from . import tool_runtime
 from .connections import ConnectionDescriptor
 from .credentials import (
@@ -563,10 +566,18 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
     return connections.connection_descriptor_from_config(config)
 
 
-def apply_runtime_config(config: connections.RuntimeConfig):
-    # model is derived from runtime_config (Session.model property); nothing
-    # else to publish.
-    current_session().runtime_config = config
+def validate_checkpoint_connection(config: connections.RuntimeConfig, events):
+    # Before endpoint approval or publication, check the same checkpoint rule
+    # as inference. A saved log may veto a selection; it never supplies approval,
+    # chooses a credential, or changes what the provider sends.
+    provider = config.chat_provider
+    formats.validate_checkpoint_replay(events, provider.projection_target(config.model))
+
+
+def apply_runtime_config(config: connections.RuntimeConfig, *, events=None):
+    session = current_session()
+    validate_checkpoint_connection(config, session.transcript_items if events is None else events)
+    session.runtime_config = config
 
 
 _UNSET = object()
@@ -2740,6 +2751,7 @@ def new_chat_log(filename):
     session.reasoning_retention = "default"
     session.reasoning_traces = "off"
     session.chat_log_path = filename
+    session.chat_log_revision = None
     session.session_state = {"shell_cwd": session.shell_cwd}
     descriptor = active_connection_descriptor()
     if descriptor is not None:
@@ -2752,12 +2764,13 @@ def new_chat_log(filename):
 def save_chat_log(*, events=None, on_published=None):
     """Publish ordinary history or a candidate without temporary installation.
 
-    An explicit candidate bypasses the clean shortcut. The existing writer's
-    synchronous publication callback reconciles CURRENT saved preferences/dirty
-    state and installs a prepared selection before post-rename cleanup can fail.
-    A raised cleanup error therefore cannot leave disk and RAM selecting different
-    contexts. No await splits publication and installation; no rollback, reset,
-    second writer or power-loss durability guarantee is introduced.
+    Ordinary autosaves and explicit candidates both use the session's last
+    loaded/published revision. Atomic rename alone could let either overwrite
+    another session's newer save. A conflict preserves the current disk file
+    and unsaved RAM state; explicit callers get the error as their outcome.
+    At rename, install the revision and prepared selection synchronously. A
+    subsequent I/O cleanup error is a warning, not a failed save or rollback.
+    This does not add a power-loss durability guarantee.
     """
     session = current_session()
 
@@ -2799,14 +2812,31 @@ def save_chat_log(*, events=None, on_published=None):
         toolsets=session.session_toolsets,
     )
 
+    revision = hashlib.sha256(content.encode('utf-8')).digest()
+    committed = False
+
     def published():
+        nonlocal committed
         session.session_state = state
+        session.chat_log_revision = revision
         session.chat_log_dirty = False
         if on_published is not None:
             on_published()
+        committed = True
 
-    files.atomic_write_text(session.chat_log_path, content, on_published=published)
-    savefiles.report_chat_log_saved(session.chat_log_path)
+    try:
+        files.atomic_write_text(session.chat_log_path, content, on_published=published,
+                                write_guard=partial(savefiles.guard_chat_log_revision, session.chat_log_revision))
+    except OSError as error:
+        if committed:
+            with contextlib.suppress(OSError):
+                print('Conversation saved, but cleanup failed: '
+                      + texts.escape_terminal_text(diagnostics.exception_text(error), multiline=False), file=sys.stderr, flush=True)
+        elif events is None and isinstance(error, savefiles.ChatLogConflict):
+            print(f'Conversation not saved: {error}.', file=sys.stderr, flush=True)
+            return False
+        else:
+            raise
     return True
 
 
@@ -2923,12 +2953,10 @@ def mark_chat_log_dirty():
 def load_chat_log(filename, loaded=None, *, apply_shell_cwd=True):
     """Load a saved conversation's state; rendering is the caller's job."""
     if loaded is None:
-        with savefiles.open_chat_log(filename) as (stream, _facts):
-            loaded = savefiles.read_chat_log(stream)
-    transcript, todos, state, toolsets = loaded
+        loaded = savefiles.read_chat_log_snapshot(filename)
     current_session().replace_transcript(
-        transcript, todos, toolsets, state, filename)
-    load_session_state(state, apply_shell_cwd=apply_shell_cwd)
+        loaded.events, loaded.todos, loaded.toolsets, loaded.state, filename, revision=loaded.revision)
+    load_session_state(loaded.state, apply_shell_cwd=apply_shell_cwd)
 
 
 def load_session_state(state: dict, *, apply_shell_cwd=True):

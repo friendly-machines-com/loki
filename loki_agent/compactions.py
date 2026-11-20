@@ -22,54 +22,62 @@ class CompactionError(ValueError):
 
 
 class Requests:
-    """One frontend-owned explicit request, shared through pending and execution.
+    """Coalesce controls at intake without a second execution owner.
 
-    TUI receipt and ACP control replies need to coalesce before FIFO delivery;
-    ordinary prompt admission cannot do that while a turn is running. The existing
-    turn/idle task executes run(), never this intake object or a second Task.
-    One Future carries a terminal DATA outcome, so abandoned observers cannot leave
-    unobserved exception Futures. ACP's on_result flushes its existing request IDs
-    synchronously; neither callback nor duplicate creates another model turn.
-    Owners finish unserviced intent before their turn-finalization awaits. Later
-    receipt then belongs to their next-idle tail, not a loop which has returned.
+    A Future identifies one group and carries one outcome, even to abandoned
+    observers. The existing turn/idle task borrows that group in run().
+    Cancellation detaches the running group from intake immediately, but only
+    its executor can report what happened at publication. A request after that
+    cutoff joins a new pending group that the same owner services later.
+    ACP attaches v1 reply IDs to each group; a completed group cannot reply to
+    the next one's waiters. Unstarted outcomes are presented out of band, not
+    as failures of the original turn. Neither callback can run another attempt.
     """
 
-    def __init__(self, on_result=None):
+    def __init__(self, on_result=None, *, on_unstarted=None):
         self.pending = None
-        # V2 cancellation can settle unstarted intent immediately, but an
-        # executing attempt owns its cleanup and final publication outcome.
-        # This borrowed Future identifies that executor, not another busy Task.
         self.running = None
         self.on_result = on_result
+        self.on_unstarted = on_unstarted
 
     def request(self):
         if self.pending is None:
             self.pending = asyncio.get_running_loop().create_future()
         return self.pending
 
-    def _finish(self, future, outcome):
+    def _finish(self, future, outcome, emit):
         if self.pending is future:
             self.pending = None
         if not future.done():
             future.set_result(outcome)
-        if self.on_result is not None:
-            self.on_result(outcome)
-        return outcome
+        try:
+            if emit is not None:
+                emit(outcome)
+        finally:
+            if self.on_result is not None:
+                self.on_result(future, outcome)
 
-    def finish_pending(self, *, cancelled=False, expected=None):
-        if (self.pending is None or self.running is self.pending
-                or (expected is not None and self.pending is not expected)):
+    def cancel_pending(self):
+        if self.pending is self.running:
+            self.pending = None
+        else:
+            self.finish_pending(cancelled=True)
+
+    def finish_pending(self, *, cancelled=False):
+        if self.pending is None or self.running is self.pending:
             return
         if cancelled:
             outcome = {"type": "compaction_cancelled", "text": "Context compaction cancelled."}
         else:
             outcome = {"type": "compaction_failed", "error": CompactionError(
                 "The turn ended before context compaction could run.")}
-        self._finish(self.pending, outcome)
+        self._finish(self.pending, outcome, self.on_unstarted)
 
     async def run(self, operation, on_event=None):
         if self.pending is None:
             return None
+        if self.running is not None:
+            raise RuntimeError("A compaction attempt still owns execution")
         future = self.pending
         self.running = future
         emit = on_event if on_event is not None else lambda event: None
@@ -101,10 +109,7 @@ class Requests:
                 if outcome is not None:
                     if compaction_id is not None:
                         outcome["compaction_id"] = compaction_id
-                    try:
-                        emit(outcome)
-                    finally:
-                        self._finish(future, outcome)
+                    self._finish(future, outcome, emit)
             finally:
                 self.running = None
         return outcome
