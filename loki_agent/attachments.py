@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import base64
 import os
-import shlex
 import stat
 from dataclasses import dataclass
 
@@ -80,22 +79,21 @@ def image_attachment_from_bytes(path: str, data: bytes, *,
     )
 
 
-def image_argument_path(argument: str) -> str:
-    """Parse the single path argument of an image command."""
-    try:
-        parts = shlex.split(argument.strip())
-    except ValueError as error:
-        raise ImageAttachmentError(f"invalid path quoting: {error}") from error
-    if len(parts) != 1:
-        raise ImageAttachmentError(
-            "usage: /image PATH (quote a path containing spaces)")
-    return parts[0]
+def image_argument_path(command: str) -> str:
+    """Extract one filename from an already recognized ``/image`` command.
+
+    Both frontends allow whitespace before the command. After one separator,
+    the rest is the filename: spaces, quotes and backslashes are not shell syntax.
+    """
+    return command.lstrip()[len("/image "):]
 
 
 def load_image_attachment(path_text: str, *,
                           base_dir: str | None = None,
                           max_bytes: int | None = None) -> StagedImage:
     """Read one local image snapshot for a later prompt."""
+    if not path_text:
+        raise ImageAttachmentError("path is required")
     limit = IMAGE_ATTACHMENT_MAX_BYTES if max_bytes is None else max_bytes
     if limit < 1:
         raise ValueError("image attachment limit must be positive")

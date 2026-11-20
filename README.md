@@ -405,7 +405,8 @@ command.
 ### Images
 
 Use `/image PATH` to stage a PNG, JPEG, GIF, or WebP image for the next prompt.
-Relative paths use `/pwd`; quote paths containing spaces. Repeat the command to
+Relative paths use the directory shown by `/pwd`. Everything after `/image ` is
+one filename: use `/image screen shot.png` without quotes. Repeat the command to
 stage several images, or send an empty prompt to submit the images alone.
 
 Each image is limited to **20 MiB** and is snapshotted when staged, so later

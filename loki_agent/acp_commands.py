@@ -78,6 +78,8 @@ def parse(text: str):
     name = head[1:]
     if name not in _LOCAL_NAMES:
         return None
+    if name == "image":
+        return name, attachments.image_argument_path(text)
     return name, argument.strip()
 
 
@@ -184,8 +186,7 @@ async def _cd(argument: str, session) -> Outcome:
 
 async def _image(argument: str, session) -> Outcome:
     try:
-        path = attachments.image_argument_path(argument)
-        image = attachments.load_image_attachment(path, base_dir=session.shell_cwd)
+        image = attachments.load_image_attachment(argument, base_dir=session.shell_cwd)
     except attachments.ImageAttachmentError as error:
         return Outcome(text=f"image: {error}")
     return Outcome(

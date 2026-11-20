@@ -347,23 +347,10 @@ class TerminalImageCommandTests(unittest.TestCase):
                 terminal_frontend.load_image_attachment(
                     str(large_path), base_dir=tmpdir, max_bytes=8)
 
-    def test_command_path_supports_shell_quoting_and_requires_one_path(self):
-        self.assertEqual(
-            terminal_frontend._image_command_path(
-                r'/image "screen shot.png"'),
-            "screen shot.png",
-        )
-        self.assertEqual(
-            terminal_frontend._image_command_path(
-                r"/image screen\ shot.png"),
-            "screen shot.png",
-        )
-        with self.assertRaisesRegex(
-                terminal_frontend.ImageAttachmentError, "usage"):
-            terminal_frontend._image_command_path("/image")
-        with self.assertRaisesRegex(
-                terminal_frontend.ImageAttachmentError, "quot"):
-            terminal_frontend._image_command_path('/image "unterminated')
+    def test_image_path_is_the_literal_rest_of_the_command(self):
+        for path in ["foo bar", r"C:\work\screen shot.png", ' "screen shot.png" ', "'quote", " "]:
+            with self.subTest(path=path):
+                self.assertEqual(attachments.image_argument_path(f"/image {path}"), path)
 
     def _run_terminal(self, messages, tmpdir, turn_runner=None):
         loki.CREDENTIALS = CredentialStore({
@@ -451,7 +438,9 @@ class TerminalImageCommandTests(unittest.TestCase):
     def test_image_command_attaches_snapshot_to_next_text_prompt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data = b"\x89PNG\r\n\x1a\npicture"
-            pathlib.Path(tmpdir, "screen shot.png").write_bytes(data)
+            filename = " screen shot's.png "
+            pathlib.Path(tmpdir, filename).write_bytes(data)
+            command = f"/image {filename}"
 
             status_updates = []
             with mock.patch(
@@ -461,7 +450,8 @@ class TerminalImageCommandTests(unittest.TestCase):
                         terminal_frontend.status_text())):
                 status, captured, _stdout, stderr = self._run_terminal(
                     [
-                        '/image "screen shot.png"',
+                        "/image",
+                        command,
                         "What is wrong here?",
                         "Continue without the image.",
                         "/quit",
@@ -470,6 +460,8 @@ class TerminalImageCommandTests(unittest.TestCase):
                 )
 
         self.assertEqual(status, 0)
+        self.assertIn(f"{filename} (image/png,", stderr)
+        self.assertIn("image: path is required", stderr)
         self.assertEqual(len(captured), 2)
         user = captured[0][-1]
         self.assertEqual(user["type"], "message")
@@ -485,10 +477,7 @@ class TerminalImageCommandTests(unittest.TestCase):
                 user["content"][1]["source"]["data"], validate=True),
             data,
         )
-        self.assertNotIn(
-            '/image "screen shot.png"',
-            [formats.item_text(item) for item in captured[0]],
-        )
+        self.assertNotIn(command, [formats.item_text(item) for item in captured[0]])
         self.assertEqual(captured[1][-1], {
             "type": "message",
             "role": "user",

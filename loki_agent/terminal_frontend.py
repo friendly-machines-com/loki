@@ -468,10 +468,6 @@ def _submit_immediate(text: str) -> bool:
     return True
 
 
-def _image_command_path(command_text: str) -> str:
-    return attachments.image_argument_path(command_text[len("/image"):])
-
-
 @dataclass
 class TerminalActivityStatus:
     turn_running: bool = False
@@ -1821,7 +1817,7 @@ async def async_main(args, configuration: settings.Settings) -> int:
                                and command_text.startswith('/image')
                                and command_text[len('/image')].isspace())):
                     try:
-                        image_path = _image_command_path(command_text)
+                        image_path = attachments.image_argument_path(user_in)
                         image = load_image_attachment(image_path, base_dir=current_shell_cwd())
                     except ImageAttachmentError as error:
                         sys.stdout.flush()

@@ -3672,7 +3672,7 @@ def _command_fixture(root):
     png = base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
         "/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
-    with open(os.path.join(destination, "shot.png"), "wb") as stream:
+    with open(os.path.join(destination, " screen shot.png "), "wb") as stream:
         stream.write(png)
     command = "cat payload.txt >> executed.txt && cat executed.txt"
     output = "status: completed\nexit_code: 0\n[stdout]\n" + payload.decode()
@@ -3816,14 +3816,14 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
                 (3, "/pwd", f"cwd: {workspace}"),
                 (4, f"/cd {destination}", f"cwd: {destination}"),
                 (5, "/pwd", f"cwd: {destination}"),
-                (6, "/image shot.png", f"Attached image for next prompt: {os.path.join(destination, 'shot.png')} (image/png, {len(png)} bytes)")):
+                (6, "/image  screen shot.png ", f"Attached image for next prompt: {os.path.join(destination, ' screen shot.png ')} (image/png, {len(png)} bytes)")):
             messages = await prompt(request_id, text)
             self.assertEqual(_tool_updates(messages, session_id), _assistant_chunks(expected))
         self._status(await prompt(7, "/status all --json"), session_id, status_bytes)
         self.assertFalse(os.path.exists(path), "local commands must not save a model turn")
         with open(status_path, "rb") as stream:
             self.assertEqual(stream.read(), status_bytes)
-        with open(os.path.join(destination, "shot.png"), "wb") as stream:
+        with open(os.path.join(destination, " screen shot.png "), "wb") as stream:
             stream.write(b"\xff\xd8\xffreplacement source")
         messages = await prompt(8, "!" + command)
         acknowledgement = f"{socket.gethostname()}: [Running local command: {command}]\n{output}"
@@ -3905,7 +3905,7 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
                         ("/pwd", f"cwd: {workspace}"),
                         (f"/cd {destination}", f"cwd: {destination}"),
                         ("/pwd", f"cwd: {destination}"),
-                        ("/image shot.png", f"Attached image for next prompt: {os.path.join(destination, 'shot.png')} (image/png, {len(png)} bytes)")):
+                        ("/image  screen shot.png ", f"Attached image for next prompt: {os.path.join(destination, ' screen shot.png ')} (image/png, {len(png)} bytes)")):
                     self.assertEqual(_tool_updates(await prompt(text), session_id), _assistant_chunks(expected))
                     self.assertEqual(requests, [])
                     if text.startswith("/cd "):
@@ -3924,7 +3924,7 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
                 self.assertEqual(session.transcript_items, initial)
                 with open(status_path, "rb") as stream:
                     self.assertEqual(stream.read(), status_bytes)
-                with open(os.path.join(destination, "shot.png"), "wb") as stream:
+                with open(os.path.join(destination, " screen shot.png "), "wb") as stream:
                     stream.write(b"\xff\xd8\xffreplacement source")
                 acknowledgement = f"{socket.gethostname()}: [Running local command: {command}]\n{output}"
                 self.assertEqual(_tool_updates(await prompt("!" + command), session_id),
