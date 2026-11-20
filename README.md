@@ -28,10 +28,8 @@ isolation, and follow the steps inside it. Do not give that VM writable access t
 your host's home directory or unrelated projects. Loki does not create the VM for
 you. A suitably configured container is another option, but not as secure as a VM.
 
-On Windows, Loki uses an AppContainer instead. Read
-[Windows installation](#windows-installation), including its
-[controlled process-directory rules](#windows-process-directory-and-history),
-before continuing with the terminal walkthrough.
+On Windows, follow [Windows installation](#windows-installation) before
+continuing to step 2. The Windows setup uses AppContainer isolation.
 
 ### 1. Get Loki
 
@@ -71,10 +69,9 @@ would be a terrible idea.  Make it read-only.
 
 ### 2. Connect an AI account
 
-Choose **one** of these paths. A ChatGPT subscription and an OpenAI API account
-are different ways to pay for model use; having one does not imply API credit
-for the other. Other providers and custom endpoints are covered in
-[Connections and models](#connections-and-models).
+Choose **one** way to connect. ChatGPT and Claude subscriptions are separate
+from API billing. See [Connections and models](#connections-and-models) for
+other providers and custom endpoints.
 
 #### Option A: ChatGPT subscription
 
@@ -96,7 +93,26 @@ Follow the URL and browser instructions printed by the command. On a headless
 or remote machine, use the same command with `--device-code`; your ChatGPT
 account or workspace must allow device-code login.
 
-#### Option B: Provider API key
+#### Option B: Claude subscription
+
+If your Claude account supports this connection, log in before starting Loki.
+
+**In Bash:**
+
+```bash
+"$LOKI" auth login anthropic
+```
+
+**In PowerShell, after Windows installation:**
+
+```powershell
+& $LOKI auth login anthropic
+```
+
+Follow the browser instructions. The browser must be able to reach the
+machine running Loki; this login has no device-code option.
+
+#### Option C: Provider API key
 
 Obtain an API key from your provider and arrange any required billing. For
 example, OpenAI API keys are managed at
@@ -128,10 +144,8 @@ does not grant Loki API access.
 
 ### 3. Open a project and select a model
 
-Create a demo directory **outside the Loki checkout**. The POSIX example starts
-Loki there. On Windows, keep Loki's process cwd in the protected installation
-and pass the project separately as `--shell-cwd`. Later, substitute your real
-project for the demo directory.
+Create a demo directory **outside the Loki checkout**. Later, substitute your
+real project for the demo directory.
 
 **In Bash:**
 
@@ -143,6 +157,11 @@ cd "$HOME/projects/loki-demo"
 
 **In PowerShell:**
 
+Configure each Windows project with `loki-setup` before opening it. Start Loki
+from its installation folder (`dist\loki` below) and pass the project with
+`--shell-cwd`. Keep the installation outside directories you allow Loki to
+modify.
+
 ```powershell
 New-Item -ItemType Directory -Force "$HOME\projects\loki-demo" | Out-Null
 & "$HOME\src\loki\dist\loki-setup\loki-setup.exe" --configure "$HOME\projects\loki-demo"
@@ -150,23 +169,20 @@ Set-Location "$HOME\src\loki\dist\loki"
 & $LOKI --shell-cwd "$HOME\projects\loki-demo"
 ```
 
-The PowerShell setup command configures **this project**, not the Loki
-installation. Configure each new Windows workspace before opening it. The launch
-must retain the protected process cwd; do not replace it with the project path.
-The initial project selection owns history under that project's `.loki/chats`;
-changing `/cd` later does not move it.
-
 You are now typing **inside Loki**, not in your shell. Enter:
 
 ```text
 /model
 ```
 
-Choose your provider and then a model, following the prompts. For option A,
-choose **OpenAI ChatGPT subscription**. For option B, choose the API provider
-whose key you supplied, not the subscription connection. Loki may ask you to
-confirm the service addresses to which it will send the credential; approve
-only the service you intend to use.
+Choose your connection, then a model:
+
+- **ChatGPT subscription:** choose **OpenAI ChatGPT subscription**.
+- **Claude subscription:** choose **Anthropic subscription**.
+- **API key:** choose the API provider whose key you supplied.
+
+If Loki asks where it may send your credentials, approve only the service you
+intend to use.
 
 Starting disconnected is normal until you make this selection. Check the
 status area's model and working directory before asking it to work.
@@ -199,8 +215,7 @@ enter `/quit` to return to your shell. You can then check the result yourself:
 bash hello.sh
 ```
 
-In PowerShell, your shell remains in the protected launch directory, so use the
-script's project pathname instead:
+In PowerShell, use the script's project pathname:
 
 ```powershell
 bash "$HOME\projects\loki-demo\hello.sh"
@@ -215,14 +230,13 @@ those files too. The empty demo folder need not be a Git repository.
 
 ### 5. Return to the conversation
 
-On POSIX, reopen the saved-chat picker from the **same project directory**.
-On Windows, retain the controlled process cwd instead; pass the tool directory
-as a parameter, as below.
+Start Loki as in [step 3](#3-open-a-project-and-select-a-model), using the same
+project and adding `--resume` to open the saved-chat picker.
 
 **In Bash:**
 
 ```bash
-"$LOKI" resume
+"$LOKI" --resume
 ```
 
 **In PowerShell:**
@@ -232,14 +246,12 @@ Set-Location "$HOME\src\loki\dist\loki"
 & $LOKI --shell-cwd "$HOME\projects\loki-demo" --resume
 ```
 
-The Windows command uses `--resume`, not the POSIX positional `resume` form.
-Its picker reads the selected workspace's `.loki/chats`, independently of
-Loki's process cwd. For an existing log elsewhere, use `-r` with its full
-pathname; see [saved conversations](#saved-conversations).
+Choose the conversation by number. To open a specific chat without the picker,
+see [Saved conversations](#saved-conversations).
 
-Choose the conversation by number. Supply API-key variables again when starting
-from a new shell; subscription login is stored separately. A saved connection
-may require confirmation before use.
+Supply API-key variables again when starting from a new shell. Subscription
+login is stored separately. A saved connection may require confirmation before
+use.
 
 You now have the basic loop: **describe a task, watch it work, inspect the
 changes, verify the result, and give feedback**. The remaining sections explain
@@ -281,27 +293,11 @@ any build error before continuing. Keep the complete `dist\loki`,
 files; copying just the `.exe` files is insufficient. If you already have these
 built bundles, use their actual locations instead of rebuilding.
 
-### Windows process directory and history
+### Windows workspace setup
 
-Loki's Windows process cwd is a fixed, trusted launch location, not a project
-selector. Keep it in the protected deployment directory, outside locations the
-agent can modify. This includes the terminal runtime, ACP front/worker and helper
-processes. Windows relative-file, DLL and executable lookup must not acquire a
-model-writable search location through a user or model project request.
-
-The terminal's initial `--shell-cwd` selects the **workspace** and initial tool
-directory. ACP selects its workspace at session admission. History belongs to
-that workspace's `.loki/chats`, not to the deployment or process cwd. A later
-`/cd` changes only the logical directory for tools; neither it nor a restored
-chat's saved tool cwd relocates the workspace's history.
-
-Ordinary tool subprocesses may run in the requested project directory without
-moving Loki's agent process. The PowerShell examples keep `dist\loki` as the
-controlled launch directory and pass the project with `--shell-cwd`. Do not make
-the bundle writable or change the process cwd to select another project.
-
-Return to [step 2: connect an AI account](#2-connect-an-ai-account), then configure
-the workspace as shown in step 3.
+Continue with [step 2: connect an AI account](#2-connect-an-ai-account), then
+follow the PowerShell instructions in [step 3](#3-open-a-project-and-select-a-model)
+to configure and open a project.
 
 To check an existing workspace or edit its grants, use its actual directory:
 
@@ -375,7 +371,7 @@ are running; `/compact` is bold while compaction is executing.
 ### Working directory and commands
 
 Slash commands are entered **inside Loki**. Command-line options such as
-`resume` are passed when starting it **from your shell**. For startup options,
+`--resume` are passed when starting it **from your shell**. For startup options,
 run `"$LOKI" --help` in Bash or `& $LOKI --help` in PowerShell.
 
 - `/pwd` shows the directory used for relative file paths and Bash commands.
@@ -395,9 +391,8 @@ working directory for later calls.
 
 `--shell-cwd DIR` sets the working directory at startup.
 
-On Windows, the selected directory must be permitted by the configured
-container; see
-[Windows process directory and history](#windows-process-directory-and-history).
+On Windows, choose a directory permitted by your
+[workspace setup](#windows-workspace-setup).
 
 Most successful Bash stdout, Read file bodies, and loaded Skill instructions
 are hidden from automatic terminal display by default, but the model still
@@ -411,7 +406,8 @@ command.
 Use `/image PATH` to stage a PNG, JPEG, GIF, or WebP image for the next prompt.
 Relative paths use the directory shown by `/pwd`. Everything after `/image ` is
 one filename: use `/image screen shot.png` without quotes. Repeat the command to
-stage several images, or send an empty prompt to submit the images alone.
+stage several images. In the terminal, you can send an empty prompt to submit
+just the images. In an editor, include text in the prompt.
 
 Each image is limited to **20 MiB** and is snapshotted when staged, so later
 changes to the file do not change what is sent. The selected model must support
@@ -480,39 +476,34 @@ editor input queueing also depends on the client.
 
 ### Saved conversations
 
-Both frontends save and list chats under the selected workspace's `.loki/chats`.
-The terminal captures that workspace from its initial `--shell-cwd` argument, or
-its initial directory when the option is absent. ACP uses the workspace supplied
-when opening the session. Later `/cd` changes and restored tool directories do
-not relocate history. On Windows, select the project with `--shell-cwd` while
-retaining the [controlled process cwd](#windows-process-directory-and-history).
+Loki saves and lists chats in `.loki/chats` under the workspace you opened. In
+the terminal, that is the directory selected by `--shell-cwd`, or the directory
+you started from if you omitted it. In an editor, it is the workspace selected
+by the editor. The picker lists chats for that workspace even after `/cd`.
 
 Logs retain the selected model, connection settings and other session state,
 **not credential values**. They can still contain sensitive project data.
 
-On POSIX, use `"$LOKI" resume` from the original startup directory for the picker,
-or `resume LOG` for a particular chat. On Windows, retain the protected launch
-directory and use `--resume` for the picker, as in the walkthrough; positional
-`resume` is rejected by its launch gate.
+Start Loki with `--resume` to open the picker. If you used `--shell-cwd`, pass
+the same workspace again. To open a particular chat, pass its saved ID with
+`-r ID`, or an explicit log file path with `-r PATH`. The equivalent long forms
+are `--resume=ID` and `--resume=PATH`.
 
-If you selected a workspace with `--shell-cwd`, supply it again for the picker
-or saved-ID lookup. For a known existing log, use `-r LOG` (or `--resume=LOG`).
-Here `LOG` must be replaced with the actual pathname, not typed literally. For example, in
-PowerShell, substitute the actual log filename for `chat-ID.json`:
+For example, follow the [PowerShell launch steps](#3-open-a-project-and-select-a-model)
+and use this as the final command, replacing `chat-ID.json` with your log's
+filename:
 
 ```powershell
 & $LOKI --shell-cwd "$HOME\projects\loki-demo" -r "$HOME\projects\loki-demo\.loki\chats\chat-ID.json"
 ```
 
-This does not change the process cwd. Quote pathnames containing spaces.
-
 Supply the connection's credentials again when necessary. Loki asks before
 using saved endpoints; missing credentials do not erase the saved connection.
-Changing `/model` preserves the conversation, though provider-specific
+Changing the model preserves the conversation, though provider-specific
 reasoning data may not transfer between models.
 
 `LOKI_*` connection settings initialize new sessions. On resume they temporarily
-override the saved connection; choosing a model with `/model` updates the saved
+override the saved connection; choosing a different model updates the saved
 choice. Older savefile formats are not automatically migrated. Current Loki
 loads schema v4 and compacted schema v5 logs; [compaction](#context-compaction)
 does not delete the archived history.
@@ -530,18 +521,15 @@ already-running editor. Supply API-key environment variables before starting
 the editor/agent, or log in with the same user configuration directory for a
 subscription connection. Restart the ACP agent after changing startup settings.
 
-On Windows, the client must launch `loki-acp.exe` from a fixed, protected process
-directory, not from the project's writable directory. Pass the project as ACP
-session data instead. An absolute executable pathname alone does not fix its
-process cwd. A client configuration must preserve this distinction; do not infer
-a safe Windows setup by replacing the executable in a POSIX example.
+On Windows, configure your editor to start `loki-acp.exe` from its protected
+installation folder, not from the writable project folder. Select the project
+separately in the editor.
 
 ### Emacs with agent-shell
 
 Install [agent-shell](https://github.com/xenodium/agent-shell#installation) and
-its dependencies, then add a custom agent configuration. This POSIX example
-uses the agent-shell/acp.el APIs present in this checkout and assumes the default
-list-valued `agent-shell-agent-configs`:
+its dependencies. This POSIX example adds Loki to the default list-valued
+`agent-shell-agent-configs`:
 
 ```elisp
 (require 'agent-shell)
@@ -563,15 +551,13 @@ list-valued `agent-shell-agent-configs`:
      (agent-shell-make-environment-variables :inherit-env t)))))
 ```
 
-Replace the command with the **absolute path** to your POSIX checkout's
-`loki-acp`. Do not leave `YOU` or use an unexpanded `~`. This snippet does not
-establish the separately controlled server process cwd required on Windows.
+Replace the example command with the **absolute path** to your `loki-acp`.
 If you customize agent-shell's configuration through a function, return this
 configuration from that function rather than applying `add-to-list` to it.
 
 Open a file in the project and run **`M-x agent-shell`**, then select Loki. Use
-**`C-u M-x agent-shell`** to force a new shell. Select a model through the
-client's controls or `/model`, then give it an ordinary task.
+**`C-u M-x agent-shell`** to force a new shell. Select a model using the editor's
+model controls, then give Loki a task.
 
 This is a direct local-client example; it does not apply agent-shell command
 wrappers for SSH, containers, or other remote execution. Configure those through
@@ -579,17 +565,13 @@ the client's documented facilities rather than assuming this example provides
 isolation. Other ACP editors similarly need the executable path, project
 workspace, and startup environment; follow that client's configuration format.
 
-The agent-shell version in this checkout requests ACP **v1**. Loki supporting
-v2 does not automatically upgrade a client that requests v1. Wire differences
-are described in [ACP protocol notes](#acp-protocol-notes), not needed to send
-your first editor task.
-
 ## Connections and models
 
 A **provider** is the service running the AI model; a **model** is the particular
-AI you choose there. The `/model` picker uses models.dev and offers providers
-for credentials captured at startup, such as `OPENROUTER_API_KEY`. Deprecated
-models remain selectable but are labelled.
+AI you choose there. Use `/model` in the terminal or your editor's model
+controls. Loki uses the models.dev catalog and offers providers for credentials
+available at startup, such as `OPENROUTER_API_KEY`. Deprecated models remain
+selectable but are labelled.
 
 Before sending a catalog credential, Loki asks whether it may be sent to the
 specific request URLs, including model-list alternatives and applicable
@@ -626,10 +608,9 @@ Obtain the key from the service whose URL you configure. Its model availability
 can change. The older base
 `https://opencode.ai/zen/go/v1/chat/completions` remains supported.
 
-Without an explicit `LOKI_API_BASE` or a resumed connection, Loki starts
-unconnected; choose one with `/model`. It does not silently choose a provider
-or the first model returned by a server. An explicit endpoint needs `LOKI_MODEL`
-or a model choice before the first chat request.
+Without an explicit `LOKI_API_BASE` or a resumed connection, choose a
+connection and model before sending your first prompt. For an explicit
+endpoint, set `LOKI_MODEL` or choose a model after starting Loki.
 
 The explicit endpoint uses `LOKI_API_KEY` if supplied; otherwise it sends no
 authentication header. Loki does not borrow another provider's credential merely
@@ -777,23 +758,12 @@ An interrupted credential refresh may require logging in again. `auth status`
 without a provider reports both logins and succeeds if either one is stored
 and active, even if the other saved login is invalid.
 
-**Anthropic subscription.** If your Claude account supports this connection,
-log in before starting Loki:
-
-```bash
-"$LOKI" auth login anthropic
-```
-
-The login uses the bundled OAuth client registration and an ephemeral
-`127.0.0.1` port on `/callback`, so the browser must be able to reach this
-machine. There is no device-code flow. `--client-id` overrides the bundled
-registration for accounts that must use a different one; whatever you log in
-with is stored and reused for later token refreshes.
-
-Restart Loki and select **Anthropic subscription**. The model list is public
-metadata, not confirmation that the account has access to a specific model.
-Use `"$LOKI" auth status anthropic` or `"$LOKI" auth logout anthropic` to manage
-the login.
+For [Claude subscription login](#option-b-claude-subscription), the browser
+callback uses a temporary port on `127.0.0.1`. Add `--client-id` to the login
+command only if your account requires a different OAuth registration. Loki
+reuses that client ID for later refreshes. Use `"$LOKI" auth status anthropic`
+or `"$LOKI" auth logout anthropic` to manage the login. A model appearing in the
+picker does not guarantee that your account can use it.
 
 Subscription tokens are stored in the user configuration directory's
 `credentials/tokens.json`, normally `~/.config/loki/credentials/tokens.json` on
@@ -1210,12 +1180,12 @@ Observations save on normal exit; `/status save` saves sooner. Other sessions'
 unsaved observations are not visible, and crashes can lose them. Changing to
 another account can leave old status visible; use `/account` for a live query.
 
-The saved file is `$XDG_STATE_HOME/loki/response-headers.json`, normally
-`~/.local/state/loki/response-headers.json` on POSIX or
-`%LOCALAPPDATA%\loki\response-headers.json` on Windows. Known secret headers are
-redacted, but other sensitive data can remain: review before sharing. Invalid
-files are reported and can be removed manually to start over. This is diagnostic
-data, not a billing record.
+By default, the saved file is `~/.local/state/loki/response-headers.json` on
+POSIX and `%LOCALAPPDATA%\loki-state\response-headers.json` on Windows. With a
+nonempty `XDG_STATE_HOME`, it is `$XDG_STATE_HOME/loki/response-headers.json`.
+Known secret headers are redacted, but other sensitive data can remain: review
+before sharing. Invalid files are reported and can be removed manually to
+start over. This is diagnostic data, not a billing record.
 
 ### Live account actions
 
@@ -1230,17 +1200,20 @@ provider request:
 - **OpenRouter:** `balance` reports the key's spend limit and prepaid credit.
 - **DeepSeek:** `balance` reports prepaid balance.
 
-Redeeming a reset is irreversible and never automatic. These results are not
-saved into the response-header observations file. Read the available action and
-confirmation before approving it.
+The terminal asks for confirmation before running an account action. In an
+editor, submitting `/account CONTROL ACTION` is the confirmation; there is no
+second prompt. Check the available actions before choosing one: redeeming a
+reset is irreversible. Live results are not saved with `/status` observations.
 
 ## Troubleshooting and diagnostics
 
-Start with the actual error message and the status area's model, cwd and mode.
+Start with the error message and check the model, working directory, and mode
+shown in the status area.
 
-- **No provider/model selected:** enter `/model`. Check that the intended key
-  was available before startup or that subscription login succeeded. Old
-  explicit endpoint/model settings can override the account-picker flow.
+- **No provider/model selected:** use `/model` in the terminal or your editor's
+  model controls. Check that the API key was available at startup or that
+  subscription login succeeded. Startup endpoint and model settings can override
+  the picker defaults.
 - **Asked for a change but nothing changed:** check the mode and whether the
   message ended in `?`. Questions, Explore and Plan restrict action tools.
 - **Tool output seems missing:** it may be hidden by default; inspect the result
@@ -1261,30 +1234,30 @@ Start with the actual error message and the status area's model, cwd and mode.
 
 ### Diagnostic logs
 
-Developer traces -- unknown provider fields, timing, raw error payloads and
-tracebacks -- are hidden by default. User-facing errors and hook stderr remain
-visible. To enable debug logging to stderr in Bash:
+Set `LOKI_TRACE=1` before starting Loki to see session diagnostics on stderr:
 
 ```bash
 LOKI_TRACE=1 "$LOKI"
-# For the editor server, use the actual checkout's loki-acp launcher:
-LOKI_TRACE=1 "$HOME/src/loki/loki-acp"
 ```
 
-Alternatively set `LOKI_LOG_CONFIG` to an absolute path to a standard Python
-logging INI file accessible to Loki and its helpers. It overrides `LOKI_TRACE`;
-invalid/unreadable configuration prevents startup. Loki does not expand `~` in
-that setting.
+For an editor, set `LOKI_TRACE=1` in its Loki agent's startup environment and
+check the agent's stderr. In agent-shell, look in Notices. If you save a log,
+use a private location and review it before sharing: it may contain conversation
+data or provider secrets.
 
-This POSIX example sends warnings to stderr and only provider-format debug
-messages to a per-process file. Choose your own **private, writable** log path;
-on Windows use a permitted location and Windows paths. Change
-`loki_agent.formats` to `loki_agent` for all diagnostics or name another module,
-such as `loki_agent.terminal_frontend`, for a narrower scope.
+`LOKI_LOG_CONFIG` configures the launcher, not the running chat session. The
+session and its helpers still log to stderr. For launcher diagnostics, set
+`LOKI_LOG_CONFIG` to the absolute path of a trusted Python logging INI file.
+It overrides `LOKI_TRACE` for the launcher only. An invalid or unreadable file
+prevents startup. Logging configuration can execute code; use a file you trust.
+
+This POSIX example keeps launcher warnings on stderr and writes launcher
+logs to a file. Replace the filename with an absolute path in a private
+directory you can write to. Use a separate log file for each launcher.
 
 ```ini
 [loggers]
-keys=root,loki,formats
+keys=root,loki
 
 [handlers]
 keys=console,trace
@@ -1298,15 +1271,9 @@ handlers=console
 
 [logger_loki]
 qualname=loki_agent
-level=WARNING
+level=DEBUG
 handlers=console,trace
 propagate=0
-
-[logger_formats]
-qualname=loki_agent.formats
-level=DEBUG
-handlers=
-propagate=1
 
 [handler_console]
 class=StreamHandler
@@ -1318,23 +1285,14 @@ args=(sys.stderr,)
 class=FileHandler
 level=DEBUG
 formatter=diagnostic
-args=('/tmp/loki-trace-' + str(__import__('os').getpid()) + '.log', 'a', 'utf-8')
+args=('/home/me/private-logs/loki-launcher.log', 'a', 'utf-8')
 
 [formatter_diagnostic]
 format=%(asctime)s %(levelname)s %(name)s[%(process)d]: %(message)s
 ```
 
-Logging configuration can execute code: trust the file, not a configuration
-supplied by a model or remote client. Relative log paths use the process's
-working directory, not the INI file. Traces may contain conversation content and
-provider secrets; review before sharing. Give each process its own file rather
-than sharing a rotating log. Logger levels do not hide ordinary UI messages,
-hook output or user-facing errors.
-
-In agent-shell, server stderr appears in Notices even with its ACP logging
-toggle off. A file destination avoids verbose notices. Never send ACP logs to
-stdout, which carries editor communication. Helper-agent stderr can be inspected
-through its job output.
+Keep editor diagnostics on stderr; stdout is used for the editor connection.
+For helper-agent stderr, inspect the helper's job output.
 
 ## Developer reference
 
@@ -1342,7 +1300,7 @@ through its job output.
 
 Loki supports negotiated ACP versions **1 and 2**. The editor and server must
 agree on a version; changing the server does not automatically change the
-client's requested version. The agent-shell checkout here initializes v1.
+client's requested version.
 
 For compaction, v1 keeps the original prompt pending and separately replies to
 each joined control when the shared operation settles; ordinary overlapping
