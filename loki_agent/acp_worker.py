@@ -16,10 +16,10 @@ from . import (
     acp_commands,
     acps,
     acp_events,
+    diagnostics,
     formats,
     loki,
     models as modelsdev,
-    recoveries,
     replays,
 )
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
@@ -120,7 +120,7 @@ class Worker:
         if error is not None:
             code = getattr(error, "code", None)
             update["error"] = {"code": code if isinstance(code, int) and not isinstance(code, bool) else acps.INTERNAL_ERROR,
-                               "message": str(error)}
+                               "message": diagnostics.exception_text(error)}
             if getattr(error, "data", None) is not None:
                 update["error"]["data"] = error.data
         self.write(acps.notification("session/update", {"sessionId": self.session_id, "update": update}))
@@ -232,7 +232,7 @@ class Worker:
     @staticmethod
     def _compaction_result(outcome):
         if outcome["type"] == "compaction_failed":
-            raise TurnFailure("Context compaction failed: " + compactions.format_error(outcome["error"]))
+            raise TurnFailure(compactions.failure_text(outcome["error"]))
         return {"stopReason": "cancelled" if outcome["type"] == "compaction_cancelled" else "end_turn"}
 
     def _settle_compaction_replies(self, outcome):
@@ -257,7 +257,7 @@ class Worker:
 
     def _event_updates(self, event, state):
         if event.get("type") == "compaction_failed":
-            event = {**event, "text": "Context compaction failed: " + compactions.format_error(event["error"])}
+            event = {**event, "text": compactions.failure_text(event["error"])}
         return acp_events.map_event(self.session_id, event, state,
                                     compaction=self.protocol_version == 2 or self.can_report_compaction,
                                     protocol_version=self.protocol_version)
@@ -1292,17 +1292,11 @@ class Worker:
         for event in events:
             kind = event.get("type")
             if kind == "compaction_failed":
-                return "Context compaction failed: " + compactions.format_error(event["error"])
+                return compactions.failure_text(event["error"])
             if kind == "api_error":
-                error = event.get("error")
-                return (
-                    error.formatted()
-                    if hasattr(error, "formatted") else str(error))
-            if kind == "network_error":
-                detail = recoveries.failure_fields(event)["error_message"]
-                return f"network error: {detail}"
-            if kind in ["stream_error", "transcript_error", "provider_error"]:
-                return f"{kind.replace('_', ' ')}: {event.get('error')}"
+                return model_requests.format_error(event["error"])
+            if kind in ["network_error", "stream_error", "transcript_error", "provider_error"]:
+                return f"{kind.replace('_', ' ')}: {model_requests.format_error(event['error'])}"
             if kind == "response_failed":
                 return (
                     "provider returned a failed response: "

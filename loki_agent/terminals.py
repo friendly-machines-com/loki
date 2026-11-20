@@ -160,16 +160,16 @@ else:
         def set_foreground_color(self, index):
             print('\033[{}m'.format(30 + index), end='')
 
-        def set_background_color(self, index):
-            print('\033[{}m'.format(40 + index), end='')
+        def set_background_color(self, index, *, file=None):
+            print('\033[{}m'.format(40 + index), end='', file=file)
 
         def set_reverse_video(self, enabled: bool):
             # 7 = reverse video (SGR); 27 = reverse off. Don't use 0 (full reset)
             # because that would clobber the input-area background color mid-caret.
             print('\033[7m' if enabled else '\033[27m', end='')
 
-        def reset_colors_and_flags(self):
-            print('\033[m', end='')
+        def reset_colors_and_flags(self, *, file=None):
+            print('\033[m', end='', file=file)
 
         # -- synchronized output (DECSET 2026) --------------------------
         # Double buffering.

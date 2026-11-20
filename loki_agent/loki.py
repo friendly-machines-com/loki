@@ -25,6 +25,7 @@ from functools import partial
 
 from . import connections
 from . import compactions
+from . import diagnostics
 from . import model_requests
 from . import recoveries
 from . import files
@@ -1123,13 +1124,13 @@ async def with_exception_to_tool_result_async(context: str, thunk) -> dict:
     except TimeoutError as e:
         return tool_runtime.tool_result(False, f"Error while {context}: timed out: {e}")
     except OSError as e:
-        return tool_runtime.tool_result(False, f'Error: {e}')
+        return tool_runtime.tool_result(False, f'Error: {diagnostics.exception_text(e)}')
     except model_requests.ApiError as e:
-        return tool_runtime.tool_result(False, e.formatted())
+        return tool_runtime.tool_result(False, model_requests.format_error(e))
     except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
         # A nested processing request can fail independently of tool input.
         # Preserve its provider/protocol diagnostic, not an invalid-value label.
-        return tool_runtime.tool_result(False, str(e))
+        return tool_runtime.tool_result(False, model_requests.format_error(e))
     except ValueError as e:
         return tool_runtime.tool_result(False, f"Error while {context}: invalid value: {e}")
     except Exception as e:
@@ -2433,7 +2434,7 @@ async def run_turn_end_hooks_async(events, text="", *, error=None):
     }
     if error is not None:
         payload["error_type"] = type(error).__name__
-        payload["error_message"] = str(error)
+        payload["error_message"] = diagnostics.exception_text(error)
     elif failure is not None:
         payload.update(recoveries.failure_fields(failure))
     await pipeline.finish_turn(payload)
@@ -2567,10 +2568,10 @@ async def load_models_async(diagnostic_writer=None):
                 report_errors=True,
             )
         except model_requests.ApiError as e:
-            errors.append(e.formatted())
+            errors.append(model_requests.format_error(e))
             continue
         except OSError as e:
-            errors.append(f"API Error for <{models_url}>: {e}")
+            errors.append(f"API Error for <{models_url}>: {diagnostics.exception_text(e)}")
             continue
         except (json.JSONDecodeError, protocols.ProtocolError) as e:
             # Some providers (e.g. Z.AI's /paas/v4 base) don't expose a /models

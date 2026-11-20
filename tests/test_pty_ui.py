@@ -601,6 +601,11 @@ class PtyUiTests(unittest.TestCase):
         self.assertIn(b"COMPACT_END", output)
         self.assertEqual(output.count(b"Context compaction failed:"), 1)
         self.assertIn(b"not supported by the selected connection", output)
+        if sys.platform != "win32":
+            # The POSIX PTY preserves the actual style bytes. Reset before
+            # the final newline so neither scroll-fill nor the prompt is red.
+            self.assertRegex(
+                output, rb"\x1b\[41m/compact:\r+\nContext compaction failed: [^\x1b\r\n]+\x1b\[m\r+\n")
 
     def test_status_bar_tracks_messages_queued_behind_active_turn(self):
         output, before_release = run_loki_pty_reply(

@@ -3402,7 +3402,7 @@ class StatusTextTests(unittest.TestCase):
         repaints, outputs = [], []
         with mock.patch.object(terminal_frontend, "_terminal_activity", activity), \
                 mock.patch.object(terminal_frontend, "_redraw_status", side_effect=lambda: repaints.append(activity.compaction_running)), \
-                mock.patch.object(terminal_frontend, "_emit_immediate_output", side_effect=lambda *args: outputs.append(activity.compaction_running)):
+                mock.patch.object(terminal_frontend, "_emit_immediate_output", side_effect=lambda *args, **kwargs: outputs.append(activity.compaction_running)):
             for kind in ["compaction_completed", "compaction_failed", "compaction_cancelled"]:
                 terminal_frontend._terminal_agent_event({"type": "compaction_started"})
                 self.assertTrue(activity.compaction_running)

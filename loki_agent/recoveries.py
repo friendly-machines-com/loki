@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import math
 import sys
 
-from . import formats, texts
+from . import diagnostics, formats, texts
 
 
 # model_requests.failure_event classifies request exceptions and the decoded
@@ -96,8 +96,8 @@ def failure_fields(failure):
     """
     cause = failure.get("error")
     detail = getattr(cause, "error_message", cause)
-    if isinstance(cause, OSError) and not str(cause):
-        detail = f"{type(cause).__name__} (errno={cause.errno!r}, no OS message)"
+    if isinstance(cause, BaseException) and (not isinstance(detail, str) or not detail.strip()):
+        detail = diagnostics.exception_text(cause)
     protocol_data = failure.get("protocol_data")
     native = (protocol_data.get(formats.OPENAI_RESPONSES)
               if isinstance(protocol_data, dict) else None)

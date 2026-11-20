@@ -88,10 +88,11 @@ class CompactionFormatTests(unittest.TestCase):
         error = model_requests.StreamingApiError(
             authentications.OPENAI_CHATGPT_RESPONSES_URL, 400, "Bad Request",
             '{"error":{"code":"context_length_exceeded","message":"Input too large"}}')
-        text = compactions.format_error(error)
+        text = compactions.failure_text(error)
         self.assertIn("HTTP 400", text)
         self.assertIn("Input too large", text)
         self.assertNotIn("LOKI_STREAM", text)
+        self.assertIn("LOKI_STREAM=0", model_requests.format_error(error))
         self.assertEqual(error.code, "context_length_exceeded")
 
     def test_native_checkpoints_round_trip_fields_and_order(self):
@@ -901,6 +902,34 @@ print(json.dumps(result))
         self.assertEqual(await worker.prompt(self.params("ordinary after compact")), {"stopReason": "end_turn"})
         self.assertEqual(len(self.sent), 2)
 
+    async def test_idle_acp_compaction_timeout_reports_reason_in_updates_and_results(self):
+        async def timed_out(*, on_start, **kwargs):
+            on_start()
+            raise TimeoutError()
+
+        for version in [1, 2]:
+            with self.subTest(version=version):
+                messages = []
+                worker = acp_worker.Worker(self.session, messages.append)
+                worker.protocol_version = version
+                worker.can_report_compaction = True
+                self.addAsyncCleanup(worker.close)
+                with mock.patch.object(loki, "compact_context_async", new=timed_out):
+                    await worker.handle(acps.request(1, "session/prompt", self.params("/compact")))
+                    if version == 2:
+                        await worker._prompt_task
+                reply = next(packet for packet in messages if packet.get("id") == 1)
+                updates = [packet["params"]["update"] for packet in messages
+                           if packet.get("method") == "session/update"]
+                failure = next(update for update in updates if update.get("status") == "failed")
+                self.assertIn("Context compaction failed: TimeoutError", failure["error"])
+                if version == 1:
+                    self.assertEqual(reply["error"]["message"], failure["error"])
+                else:
+                    self.assertIn("messageId", reply["result"])
+                    self.assertEqual(updates[-1]["stopReason"], "error")
+                    self.assertIn("TimeoutError", updates[-1]["error"]["message"])
+
     async def test_acp_busy_rejection_request_cancel_and_next_command_remain_usable(self):
         worker = acp_worker.Worker(self.session, lambda message: None)
         self.addAsyncCleanup(worker.close)
@@ -981,6 +1010,27 @@ print(json.dumps(result))
         self.assertNotIn('"text": "/compact"', json.dumps(self.session.transcript_items))
         self.assertIn("/compact", terminal_frontend.status_text())
 
+    async def test_idle_tui_compaction_timeout_reports_reason_only_on_stderr(self):
+        from test_loki_tool_loop import ScriptedInputSession
+        inputs = ScriptedInputSession(["/compact", "/quit"])
+
+        async def timed_out(*, on_start, **kwargs):
+            on_start()
+            raise TimeoutError()
+
+        with mock.patch.object(loki, "CREDENTIALS", self.tui_inventory()), \
+                mock.patch.object(loki, "compact_context_async", new=timed_out), \
+                mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
+                mock.patch.object(terminal_frontend.terminals, "open_terminal_stdin"), \
+                mock.patch.object(terminal_frontend, "new_chat_log_path", return_value=self.session.chat_log_path), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
+        self.assertIn("Compaction requested.", stdout.getvalue())
+        self.assertIn("Compacting context.", stdout.getvalue())
+        self.assertNotIn("Context compaction failed:", stdout.getvalue())
+        self.assertIn("/compact:\nContext compaction failed: TimeoutError", stderr.getvalue())
+        self.assertNotIn("\x1b", stderr.getvalue())
+
     async def _tui_running_control(self, failure=False, *, compaction_retries=0):
         from test_loki_tool_loop import ScriptedInputSession
         inputs = ScriptedInputSession(["perform work", "/quit"])
@@ -991,6 +1041,7 @@ print(json.dumps(result))
         self.pipeline.finish_turn = mock.AsyncMock()
         inventory = self.tui_inventory()
         output = io.StringIO()
+        errors = io.StringIO()
 
         def receive():
             if len(self.sent) == 1:
@@ -1016,7 +1067,7 @@ print(json.dumps(result))
                 mock.patch.object(terminal_frontend, "new_chat_log_path", return_value=self.session.chat_log_path), \
                 mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
                 mock.patch.object(http_client, "async_http_stream", new=inspect), \
-                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
         self.assertEqual(len(self.sent), (2 if failure else 3) + compaction_retries)
         self.assertEqual(self.pipeline.finish_turn.await_count, 1)
@@ -1028,10 +1079,14 @@ print(json.dumps(result))
         self.assertFalse(terminal_frontend._terminal_activity.compaction_running)
         with open(self.session.chat_log_path, encoding="utf-8") as stream:
             saved, _todos, _state, _tools = savefiles.read_chat_log(stream)
+        self.assertNotIn("Context compaction failed:", output.getvalue())
         if failure:
             self.assertFalse(any(event["type"] == "context_replace" for event in saved))
-            self.assertIn("Context compaction failed", output.getvalue())
+            self.assertEqual(errors.getvalue().count("Context compaction failed: "), 1)
+            self.assertIn("did not return exactly one checkpoint", errors.getvalue())
         else:
+            self.assertIn("Context compacted.", output.getvalue())
+            self.assertNotIn("Context compacted.", errors.getvalue())
             self.assertEqual(formats.item_text(formats.active_events(saved)[-1]), "ordinary answer")
 
     async def test_tui_compaction_recovery_keeps_status_active_and_finalizes_once(self):

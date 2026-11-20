@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 from . import attachments
 from .arguments import USAGE, parse_cli_args, preflight as argument_preflight
-from .diagnostics import debug_json
+from .diagnostics import debug_json, exception_text
 from . import command_deliveries
 from . import compactions
 from . import formats
@@ -27,6 +27,7 @@ from .attachments import ImageAttachmentError, load_image_attachment
 from . import authentications
 from . import credential_capabilities
 from . import credential_runtimes
+from . import model_requests
 from . import models as modelsdev
 from . import protocols
 from . import recoveries
@@ -195,7 +196,7 @@ def _immediate_status(argument: str):
     # interleave with this monitor operation or its dirty-state reset.
     from . import response_headers
     command = f"/status {argument}".rstrip()
-    file = None
+    is_error = False
     try:
         config = current_config()
         store = current_session().response_headers
@@ -207,14 +208,14 @@ def _immediate_status(argument: str):
             text = response_headers.status_text(config, store, argument)
     except (OSError, ValueError, OverflowError) as error:
         action = "save" if argument == "save" else "read"
-        text = f"Could not {action} response status: {error}"
+        text = f"Could not {action} response status: {exception_text(error)}"
     except Exception as error:  # noqa: BLE001 - reported, not fatal
-        text = f"Command failed: {error}"
-        file = sys.stderr
+        text = f"Command failed: {exception_text(error)}"
+        is_error = True
     # There is no task completion callback to contain display failures here;
     # a failed diagnostic must not terminate the input owner or the live turn.
     try:
-        _emit_immediate_output(command, text, file=file)
+        _emit_immediate_output(command, text, is_error=is_error)
     except Exception as error:  # noqa: BLE001 - reported, not fatal
         logger.error("Could not display %s output: %s", command, error)
 
@@ -367,23 +368,30 @@ def _immediate_queue(argument: str):
         _print_staged_images()
 
 
-def _emit_immediate_output(command, text, *, file=None):
+def _emit_immediate_output(command, text, *, is_error=False):
     """Display a monitor answer now, isolated from either adjacent delta.
 
     No awaits or turn-running check: even a delayed read answers during a
-    running turn. The leading newline separates its result from the live
-    streaming cursor; the label identifies which command completed. Do not
-    feed or finish assistant_markdown here -- it belongs to the assistant
-    stream, including Markdown spans split across chunks.
+    running turn. Do not feed or finish assistant_markdown here. A failed
+    command uses stderr for both text and style; stdout's color controls
+    would otherwise be written even when stderr was redirected. Reset
+    before the final newline so the following prompt/scroll-fill is neutral.
     """
     if not text:
         return
-    file = sys.stdout if file is None else file
+    file = sys.stderr if is_error else sys.stdout
+    styled = is_error and file.isatty()
     restore_output_area_after_input()
     print(file=file)
-    terminal.write_text(command.strip(), file=file)
-    print(":", file=file)
-    terminal.write_text(text, multiline=True, file=file)
+    try:
+        if styled:
+            terminal.set_background_color(ERROR_COLOR, file=file)
+        terminal.write_text(command.strip(), file=file)
+        print(":", file=file)
+        terminal.write_text(text, multiline=True, file=file)
+    finally:
+        if styled:
+            terminal.reset_colors_and_flags(file=file)
     print(file=file)
     file.flush()
 
@@ -395,7 +403,7 @@ async def _run_immediate(command, outcome):
         text = await outcome
     except Exception as error:  # noqa: BLE001 - reported, not fatal
         _emit_immediate_output(
-            command, f"Command failed: {error}", file=sys.stderr)
+            command, f"Command failed: {exception_text(error)}", is_error=True)
         return
     _emit_immediate_output(command, text)
 
@@ -590,7 +598,7 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
     elif kind == "api_error":
         terminal.set_background_color(ERROR_COLOR)
         terminal.write_text(
-            event["error"].formatted(), multiline=True)
+            model_requests.format_error(event["error"]), multiline=True)
         terminal.reset_colors_and_flags()
         print()
     elif kind == "network_error":
@@ -601,14 +609,14 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
         terminal.set_background_color(ERROR_COLOR)
         print(f"{computer}: NETWORK ERROR: ", end="")
         terminal.write_text(
-            recoveries.failure_fields(event)["error_message"], multiline=True)
+            model_requests.format_error(event["error"]), multiline=True)
         terminal.reset_colors_and_flags()
         print()
     elif kind == "transcript_error":
         terminal.set_background_color(ERROR_COLOR)
         error = event["error"]
         print("Transcript render error: ", end="")
-        terminal.write_text(str(error), multiline=True)
+        terminal.write_text(model_requests.format_error(error), multiline=True)
         terminal.reset_colors_and_flags()
         print()
         sys.stdout.flush()
@@ -619,7 +627,7 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
         terminal.set_background_color(ERROR_COLOR)
         error = event["error"]
         print("Provider protocol error: ", end="")
-        terminal.write_text(str(error), multiline=True)
+        terminal.write_text(model_requests.format_error(error), multiline=True)
         terminal.reset_colors_and_flags()
         print()
         sys.stdout.flush()
@@ -691,7 +699,7 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
         error = event["error"]
         terminal.set_background_color(ERROR_COLOR)
         print("Streaming response error: ", end="")
-        terminal.write_text(str(error), multiline=True)
+        terminal.write_text(model_requests.format_error(error), multiline=True)
         print(
             "\nSet LOKI_STREAM=0 to disable streaming for this connection.",
             end="")
@@ -733,14 +741,15 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
             _print_repr_line("  Shell CWD: ", event["cwd"])
         terminal.reset_colors_and_flags()
     elif kind in ["compaction_started", "compaction_completed", "compaction_failed", "compaction_cancelled"]:
+        failed = kind == "compaction_failed"
         _terminal_activity.set_compaction_running(kind == "compaction_started")
         if kind == "compaction_started":
             text = "Compacting context."
-        elif kind == "compaction_failed":
-            text = "Context compaction failed: " + compactions.format_error(event["error"])
+        elif failed:
+            text = compactions.failure_text(event["error"])
         else:
             text = event["text"]
-        _emit_immediate_output("/compact", text)
+        _emit_immediate_output("/compact", text, is_error=failed)
         _redraw_status()
     elif kind == "tool_result":
         # The canonical result event.  ``tool_error`` carries only the failure
@@ -1579,7 +1588,7 @@ async def async_main(args, configuration: settings.Settings) -> int:
             if argument is None:
                 return _submit_immediate(text)
             if argument:
-                _emit_immediate_output(text, "Usage: /compact", file=sys.stderr)
+                _emit_immediate_output(text, "Usage: /compact", is_error=True)
                 return True
             first = compact_requests.pending is None
             compact_requests.request()

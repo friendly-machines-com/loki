@@ -1,10 +1,26 @@
-"""Executable-owned logging configuration and safe diagnostic payloads."""
+"""Shared exception text and executable-owned logging configuration."""
 
 import json
 import logging
 import logging.config
 import os
 import sys
+
+
+def exception_text(error: BaseException) -> str:
+    """Describe an exception even when it has no printable message.
+
+    Request display and hook diagnostics used separate str(error) fallbacks.
+    Keep the type visible in both (e.g. a bare TimeoutError) without formatting
+    exception arguments or a traceback. Output sinks still own escaping.
+    """
+    message = str(error)
+    if message.strip():
+        return message
+    name = type(error).__name__
+    if isinstance(error, OSError):
+        return f"{name} (errno={error.errno!r}, no OS message)"
+    return name
 
 
 def configure_logging(contained: bool = False) -> bool:

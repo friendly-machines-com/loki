@@ -21,7 +21,7 @@ from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pprint import pformat
 
-from . import authentications, connections, formats, http_client, protocols, recoveries, sse
+from . import authentications, connections, diagnostics, formats, http_client, protocols, recoveries, sse
 from . import response_headers as header_observations
 
 
@@ -185,7 +185,7 @@ class ApiError(Exception):
             return pformat(self.body, width=width)
         return self.body_text
 
-    def formatted(self) -> str:
+    def formatted(self, *, include_streaming_hint: bool = True) -> str:
         body = self.formatted_body()
         if not body:
             return self.summary()
@@ -193,7 +193,7 @@ class ApiError(Exception):
 
 
 class StreamingApiError(ApiError):
-    def formatted(self) -> str:
+    def formatted(self, *, include_streaming_hint: bool = True) -> str:
         # Rationale: retain the conditional opt-out hint on streaming HTTP failures:
         # API compatibility does not establish streaming capability. A backend
         # may reject streaming while remaining usable without it, so the error
@@ -237,10 +237,26 @@ class StreamingApiError(ApiError):
         # <https://developers.openai.com/api/reference/resources/responses/methods/create>
         # <https://developers.openai.com/api/docs/guides/streaming-responses>
         # <https://developers.openai.com/api/docs/guides/error-codes>
-        return (
-            super().formatted()
-            + "\nStreaming was requested. If this server does not support "
-              "streaming, set LOKI_STREAM=0.")
+        detail = super().formatted()
+        if include_streaming_hint:
+            detail += ("\nStreaming was requested. If this server does not support "
+                       "streaming, set LOKI_STREAM=0.")
+        return detail
+
+
+def format_error(error: BaseException, *, include_streaming_hint: bool = True) -> str:
+    """Render a request failure without changing its type or retry facts.
+
+    Hook fields are for policy, not presentation: their error_message can be
+    only the provider's explanation, without status or HTTP body. Ordinary
+    inference and always-streamed compaction need the same details; only the
+    former can offer the HTTP streaming opt-out. Frontends own the output sink.
+    """
+    if isinstance(error, ApiError):
+        return error.formatted(include_streaming_hint=include_streaming_hint)
+    if isinstance(error, protocols.ResponseApiError):
+        return error.formatted()
+    return diagnostics.exception_text(error)
 
 
 def failure_event(error) -> dict | None:

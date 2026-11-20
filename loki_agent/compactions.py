@@ -121,17 +121,10 @@ def retained_messages(active_events):
             and event.get("role") in ["system", "developer", "user"]]
 
 
-def format_error(error):
-    """Command fronts need HTTP details, not ordinary display-streaming advice.
-
-    StreamingApiError's normal formatter suggests LOKI_STREAM=0 for incompatible
-    servers. That cannot change this dedicated always-streamed checkpoint request;
-    retain its HTTP status/body without inviting an ineffective retry or profile
-    switch. Keep the original typed exception intact for its owning caller.
-    """
-    if isinstance(error, model_requests.ApiError):
-        return model_requests.ApiError.formatted(error)
-    return str(error)
+def failure_text(error):
+    # Both frontends label the same failure. This request always streams, so
+    # select the shared diagnostic without the inapplicable opt-out advice.
+    return "Context compaction failed: " + model_requests.format_error(error, include_streaming_hint=False)
 
 
 def require_v2(context):

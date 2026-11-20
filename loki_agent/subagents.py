@@ -202,8 +202,7 @@ async def run_cli_async(
     # requests, not invalid CLI configuration, so classify them first.
     except (OSError, protocols.ProtocolError, formats.TranscriptFormatError,
             model_requests.ApiError) as error:
-        diagnostic = error.formatted() if isinstance(error, model_requests.ApiError) else error
-        _print_text_line('Request failed: ', diagnostic, file=sys.stderr)
+        _print_text_line('Request failed: ', model_requests.format_error(error), file=sys.stderr)
         return 1
     except ValueError as error:
         _print_text_line('Configuration error: ', error, file=sys.stderr)
