@@ -1085,8 +1085,8 @@ print(json.dumps(result))
             self.assertEqual(errors.getvalue().count("Context compaction failed: "), 1)
             self.assertIn("did not return exactly one checkpoint", errors.getvalue())
         else:
-            self.assertIn("Context compacted.", output.getvalue())
-            self.assertNotIn("Context compacted.", errors.getvalue())
+            self.assertNotIn("Context compacted.", output.getvalue() + errors.getvalue())
+            self.assertEqual(sum(event["type"] == "context_replace" for event in saved), 1)
             self.assertEqual(formats.item_text(formats.active_events(saved)[-1]), "ordinary answer")
 
     async def test_tui_compaction_recovery_keeps_status_active_and_finalizes_once(self):

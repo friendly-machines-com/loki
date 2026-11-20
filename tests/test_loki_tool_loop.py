@@ -3404,10 +3404,11 @@ class StatusTextTests(unittest.TestCase):
                 mock.patch.object(terminal_frontend, "_redraw_status", side_effect=lambda: repaints.append(activity.compaction_running)), \
                 mock.patch.object(terminal_frontend, "_emit_immediate_output", side_effect=lambda *args, **kwargs: outputs.append(activity.compaction_running)):
             for kind in ["compaction_completed", "compaction_failed", "compaction_cancelled"]:
-                terminal_frontend._terminal_agent_event({"type": "compaction_started"})
+                terminal_frontend._terminal_agent_event({"type": "compaction_started", "compaction_id": "test-compaction"})
                 self.assertTrue(activity.compaction_running)
                 self.assertEqual(repaints[-1:], [True])
-                terminal_frontend._terminal_agent_event({"type": kind, "text": "finished", "error": ValueError("failure")})
+                terminal_frontend._terminal_agent_event({
+                    "type": kind, "compaction_id": "test-compaction", "text": "finished", "error": ValueError("failure")})
                 self.assertFalse(activity.compaction_running)
                 self.assertEqual(repaints[-1:], [False])
             activity.set_compaction_running(True)
@@ -3415,7 +3416,7 @@ class StatusTextTests(unittest.TestCase):
             activity.set_compaction_running(True)
             self.assertEqual(len(repaints), count)
             activity.reset()
-        self.assertEqual(outputs, [False] * 3)
+        self.assertEqual(outputs, [False] * 2)
         self.assertFalse(activity.compaction_running)
 
     def test_ps_bold_tracks_running_jobs_and_stops_at_the_command(self):

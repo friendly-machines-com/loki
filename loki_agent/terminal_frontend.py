@@ -744,6 +744,9 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
         _terminal_activity.set_compaction_running(True)
     elif kind in ["compaction_completed", "compaction_failed", "compaction_cancelled"]:
         _terminal_activity.set_compaction_running(False)
+        # A no-op completes before on_start(), so keep its notice.
+        if kind == "compaction_completed" and event.get("compaction_id") is not None:
+            return
         failed = kind == "compaction_failed"
         text = compactions.failure_text(event["error"]) if failed else event["text"]
         _emit_immediate_output("/compact", text, is_error=failed)
