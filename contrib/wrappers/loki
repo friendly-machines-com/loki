@@ -1,0 +1,22 @@
+#!/bin/sh
+
+exec bwrap \
+  --unshare-pid \
+  --unshare-ipc \
+  --proc /proc \
+  --dev /dev \
+  --ro-bind $HOME/src/loki $HOME/src/loki \
+  --ro-bind /usr /usr \
+  --ro-bind /bin /bin \
+  --ro-bind /lib /lib \
+  --ro-bind /lib64 /lib64 \
+  --bind $HOME/.config/loki $HOME/.config/loki \
+  --ro-bind /etc/passwd /etc/passwd \
+  --ro-bind /etc/group /etc/group \
+  --ro-bind /etc/resolv.conf /etc/resolv.conf \
+  --ro-bind /var/lib/ca-certificates/ca-bundle.pem /var/lib/ca-certificates/ca-bundle.pem \
+  --perms 01777 --tmpfs /tmp \
+  --bind "$PWD" "$PWD" \
+  -- \
+  /usr/bin/python3 ~/src/loki/loki.py "$@"
+
