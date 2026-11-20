@@ -437,8 +437,9 @@ class Front:
                   f"{error!r}", file=sys.stderr)
         else:
             detail = {"code": getattr(error, "code", acps.INTERNAL_ERROR), "message": str(error)}
-            if getattr(error, "data", None) is not None:
-                detail["data"] = error.data
+            data = getattr(error, "data", None)
+            if data is not None:
+                detail["data"] = data
             self.write(acps.error_response(message["id"], detail))
 
     def _reserve_session(self, session_id: object):

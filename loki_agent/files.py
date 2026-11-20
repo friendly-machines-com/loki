@@ -237,7 +237,7 @@ def atomic_write_text(file_path: str, content: str, *, on_published=None):
             if on_published is not None:
                 on_published()
 
-        private_files.replace_at(directory_fd, temporary, name, on_published=published)
+        private_files.replace_at(directory_fd, candidate, name, on_published=published)
     finally:
         try:
             if temporary is not None:

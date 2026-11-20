@@ -162,6 +162,9 @@ class Worker:
         or later input. Settings freeze at actual runtime-turn admission.
         This is neither another inference engine nor a task per control.
         """
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("ACP foreground work requires an owning task.")
         try:
             while self.session.active:
                 if self.compaction_requests.pending is not None:
@@ -190,7 +193,7 @@ class Worker:
         finally:
             self._cancel_v2_pending()
             self._v2_cancelled_compaction = None
-            if not self.session.active or asyncio.current_task().cancelling():
+            if not self.session.active or task.cancelling():
                 self.compaction_requests.finish_pending(cancelled=True)
             if self._foreground_state != "idle":
                 self._state("idle", stop_reason="cancelled" if self.cancel_event.is_set() else "error")
@@ -267,13 +270,10 @@ class Worker:
                 self.write(acps.notification("session/update", update))
 
         async def operation(started):
-            # Reuse the registered idle-command adapter inside the actual owner,
-            # never from busy receipt or as a second independent execution path.
             admitted = thinking if thinking is not None else loki.capture_turn_settings()
-            result = await acp_commands.run(
-                "/compact", self.session, cancel_event=self.cancel_event,
-                thinking=admitted, allow_ask=self.can_ask_user, on_start=started)
-            return result.text
+            return await loki.compact_context_async(
+                cancel_event=self.cancel_event, thinking=admitted,
+                allow_ask=self.can_ask_user, on_start=started)
 
         return await self.compaction_requests.run(operation, on_event)
 

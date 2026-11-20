@@ -695,6 +695,22 @@ class FrontSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error["data"]["requested"], 0)
         self.assertEqual(front.protocol_version, 1)
 
+    async def test_failed_initialize_omits_missing_error_data_but_keeps_false(self):
+        messages = []
+        front = acp.Front(lambda: None, messages.append, CredentialStore({}))
+        self.addAsyncCleanup(front.shutdown)
+        request = acps.request(1, "initialize", {"protocolVersion": 1})
+        with mock.patch.object(front, "initialize", side_effect=RuntimeError("failed")):
+            front.handle(request)
+        self.assertEqual(messages.pop()["error"], {"code": acps.INTERNAL_ERROR, "message": "failed"})
+
+        failure = acps.TransportError("denied", code=acps.INVALID_PARAMS, data=False)
+        with mock.patch.object(front, "initialize", side_effect=failure):
+            front.handle(request)
+        error = messages.pop()["error"]
+        self.assertEqual(error["code"], acps.INVALID_PARAMS)
+        self.assertIs(error["data"], False)
+
     async def test_compaction_reporting_uses_v1_client_capability_object_not_elicitation(self):
         front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
         self.addAsyncCleanup(front.shutdown)

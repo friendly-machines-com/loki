@@ -81,22 +81,14 @@ def parse(text: str):
     return name, argument.strip()
 
 
-async def run(text: str, session, *, cancel_event=None, thinking=None, allow_ask=False, on_start=None):
-    """Execute TEXT if it is a local command, else return None."""
+async def run(text: str, session, *, cancel_event=None):
+    """Run ordinary local commands; the worker owns /compact admission and execution."""
     parsed = parse(text)
-    if parsed is None:
+    if parsed is None or parsed[0] == "compact":
         return None
     name, argument = parsed
     if name == "!":
         return await _bang(argument, cancel_event)
-    if name == "compact":
-        # Unlike preference/status handlers, the worker must admit this as a
-        # cancellable network operation. This adapter owns neither busy state
-        # nor cancellation reset; the shared operation owns persistence.
-        if argument:
-            return Outcome(text="Usage: /compact")
-        return Outcome(text=await loki.compact_context_async(
-            cancel_event=cancel_event, thinking=thinking, allow_ask=allow_ask, on_start=on_start))
     if name == "status" and argument == "save":
         return await _status_save(argument, session)
     handler = _HANDLERS[name]

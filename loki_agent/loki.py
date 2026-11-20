@@ -2865,6 +2865,8 @@ async def compact_context_async(*, cancel_event, thinking=None, allowed=None, al
     if codex_turn_state is None:
         codex_turn_state = model_requests.CodexTurnState()
     task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("Context compaction requires an owning task.")
 
     def cancelled():
         return cancel_event.is_set() or not session.active or bool(task.cancelling())

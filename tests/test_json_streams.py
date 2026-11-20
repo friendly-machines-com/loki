@@ -42,6 +42,17 @@ class Fragments:
 
 
 class JSONStreamTests(unittest.IsolatedAsyncioTestCase):
+    def test_byte_range_stops_at_its_end_and_leaves_the_source_open(self):
+        with io.BytesIO(b'[body]') as stream:
+            with json_streams.ByteRange(stream, range(1, 5)) as view:
+                self.assertEqual(view.read(16), b'body')
+                self.assertEqual(view.read(1), b'')
+                with self.assertRaises(io.UnsupportedOperation):
+                    view.seek(0)
+            with self.assertRaises(ValueError):
+                view.read(1)
+            self.assertEqual(stream.read(), b']')
+
     async def test_strings_match_stdlib_at_every_split(self):
         values = ['plain', 'quote " and slash \\ /', '\b\f\n\r\t', 'snow \u96ea and emoji \U0001f600',
                   '\ud800 alone', '\udc00', '\ud800\udc00', '']

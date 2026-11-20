@@ -866,13 +866,17 @@ print(json.dumps(result))
     async def test_compact_is_advertised_and_arguments_cannot_become_model_input(self):
         with mock.patch.object(acp_commands.skills, "available", return_value=[]):
             self.assertIn("compact", [command["name"] for command in acp_commands.advertised_commands()])
+        messages = []
+        worker = acp_worker.Worker(self.session, messages.append)
+        self.addAsyncCleanup(worker.close)
         for command in ["/compact extra", "/compact\textra"]:
             self.assertEqual(acp_commands.parse(command), ("compact", "extra"))
-            with mock.patch.object(loki, "compact_context_async") as compact:
-                outcome = await acp_commands.run(command, self.session, cancel_event=self.event)
-                self.assertEqual(outcome.text, "Usage: /compact")
-                compact.assert_not_called()
+            messages.clear()
+            await worker.handle(acps.request(1, "session/prompt", self.params(command)))
+            self.assertEqual(messages[0]["params"]["update"]["content"]["text"], "Usage: /compact")
+            self.assertEqual(messages[-1]["result"], {"stopReason": "end_turn"})
         self.assertIsNone(acp_commands.parse("/compactness"))
+        self.assertEqual(self.sent, [])
         self.assertEqual(self.session.transcript_items, self.before)
 
     async def test_acp_admission_resets_cancel_saves_command_and_keeps_staged_input(self):

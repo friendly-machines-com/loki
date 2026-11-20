@@ -23,7 +23,7 @@ CHUNK_SIZE = 16 * 1024
 FIELD_CHARS = 64
 
 _STRING_EDGE = re.compile(r'["\\\x00-\x1f]')
-_SPACE = re.compile(r'[ \t\r\n]*')
+_NON_SPACE = re.compile(r'[^ \t\r\n]')
 _DIGITS = re.compile(r'[0-9]+')
 _SCALAR = re.compile(r'[^ \t\r\n,\]}]+')
 _HEX = frozenset('0123456789abcdefABCDEF')
@@ -34,12 +34,12 @@ class Error(ValueError):
     """The inspected JSON prefix is malformed or incomplete."""
 
 
-class ByteRange:
-    """Feed only a located metadata value to Reader through a UTF-8 decoder.
+class ByteRange(io.IOBase):
+    """Give the UTF-8 reader an unseekable view of one metadata value.
 
-    A decoder on the whole file could read/validate beyond that selected value.
-    This borrowed range supplies EOF at its boundary; only the enclosing checked
-    file scope closes the handle. No second open or retained metadata copy.
+    A decoder on the whole file could read or validate beyond the selected
+    value. The view supplies EOF at its boundary, and closing it leaves the
+    borrowed file open for the lister's subsequent reads.
     """
 
     def __init__(self, stream, region):
@@ -47,7 +47,12 @@ class ByteRange:
         self.remaining = region.stop - region.start
         stream.seek(region.start)
 
-    def read(self, size):
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1, /) -> bytes:
+        if self.closed:
+            raise ValueError('I/O operation on closed byte range')
         if size < 0:
             raise ValueError('range reads must be bounded')
         data = self.stream.read(min(size, self.remaining)) if self.remaining else b''
@@ -200,9 +205,11 @@ class Reader:
     async def kind(self):
         """Inspect the next value/delimiter after JSON whitespace."""
         while await self._fill():
-            self.position = _SPACE.match(self.buffer, self.position).end()
-            if self.position < len(self.buffer):
-                return self.buffer[self.position]
+            match = _NON_SPACE.search(self.buffer, self.position)
+            if match is not None:
+                self.position = match.start()
+                return match.group()
+            self.position = len(self.buffer)
         return ''
 
     async def expect(self, char):

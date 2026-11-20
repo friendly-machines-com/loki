@@ -16,6 +16,7 @@ import sys
 import time
 import uuid
 from pprint import pformat
+from typing import TypeGuard
 
 from . import formats
 from . import json_streams
@@ -26,7 +27,7 @@ from . import texts
 _CHAT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
 
 
-def valid_chat_id(chat_id: str) -> bool:
+def valid_chat_id(chat_id: object) -> TypeGuard[str]:
     """The same identifier alphabet applies to allocation and saved-name admission."""
     return isinstance(chat_id, str) and _CHAT_ID_RE.fullmatch(chat_id) is not None
 
@@ -320,11 +321,12 @@ async def _listing_cwd(stream):
     except json_streams.Error:
         region = None
     if region is not None:
-        reader = json_streams.Reader(codecs.getreader('utf-8')(json_streams.ByteRange(stream, region)))
-        cwd = await _saved_cwd(reader)
-        if await reader.kind():
-            raise json_streams.Error('Extra data in saved session metadata')
-        return cwd
+        with json_streams.ByteRange(stream, region) as view:
+            reader = json_streams.Reader(codecs.getreader('utf-8')(view))
+            cwd = await _saved_cwd(reader)
+            if await reader.kind():
+                raise json_streams.Error('Extra data in saved session metadata')
+            return cwd
     stream.seek(0)
     reader = json_streams.Reader(codecs.getreader('utf-8')(stream))
     await reader.expect('{')
@@ -376,7 +378,7 @@ async def list_saved_sessions(chat_log_dir: str, *, query: str = '') -> list[dic
                     continue
                 if words:
                     stream.seek(0)
-                    search = codecs.getreader('utf-8')(stream, errors='replace')
+                    search = codecs.getreader('utf-8')(stream, 'replace')
                     parts = []
                     while part := search.read(json_streams.CHUNK_SIZE):
                         parts.append(part)
@@ -387,7 +389,7 @@ async def list_saved_sessions(chat_log_dir: str, *, query: str = '') -> list[dic
                     if not matches:
                         continue
                 stream.seek(0)
-                snippet = await preview(codecs.getreader('utf-8')(stream, errors='replace'))
+                snippet = await preview(codecs.getreader('utf-8')(stream, 'replace'))
                 summaries.append({'id': _saved_chat_id(entry.name), 'path': entry.path,
                                   'mtime': facts.st_mtime, 'preview': snippet, 'cwd': cwd})
         except (OSError, UnicodeError, json_streams.Error, RecursionError):
