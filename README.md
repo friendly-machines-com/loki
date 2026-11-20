@@ -379,20 +379,24 @@ Slash commands are entered **inside Loki**. Command-line options such as
 run `"$LOKI" --help` in Bash or `& $LOKI --help` in PowerShell.
 
 - `/pwd` shows the directory used for relative file paths and Bash commands.
-- `/cd DIR` changes that directory. It does not relocate the current chat's
-  saved-session directory. On Windows the directory must be permitted by the
-  configured container.
+- `/cd` changes that directory to your home directory.
+- `/cd DIR` changes it to `DIR`. For example, `/cd src` selects `src` under
+  the directory shown by `/pwd`.
+- `/cd -` goes back to the previous directory, so you can return after a
+  temporary switch. Use `/cd ./-` for a child directory named `-`.
 - `!command` runs a shell command directly, without asking the model to generate
   it. For example, `!bash hello.sh` runs the demo from the walkthrough.
   The result is sent to the model as well.
 - `/model` selects a connection/model; switching does not discard the chat.
 - `/todo` displays the current task list, including while the agent works.
 
-The launcher's `--shell-cwd DIR` option sets the initial logical tool directory;
-`/cd` updates that same kind of parameter. Neither changes Loki's OS process cwd.
-Loki runtimes, workers and helpers retain the controlled process cwd, while an
-ordinary tool subprocess can be launched with the requested project directory.
-Keep the Windows launch rules separate from the POSIX walkthrough; see
+A `cd` inside a Bash command affects only that call. Use `/cd` to change the
+working directory for later calls.
+
+`--shell-cwd DIR` sets the working directory at startup.
+
+On Windows, the selected directory must be permitted by the configured
+container; see
 [Windows process directory and history](#windows-process-directory-and-history).
 
 Most successful Bash stdout, Read file bodies, and loaded Skill instructions

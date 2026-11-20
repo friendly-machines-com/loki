@@ -134,6 +134,17 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("C:worksub", outcome.text)
 
+    async def test_cd_home_and_previous_directory_shortcuts(self):
+        with tempfile.TemporaryDirectory() as start, tempfile.TemporaryDirectory() as home:
+            self.session.shell_cwd = start
+            with mock.patch.object(loki.paths, 'home_directory', return_value=home):
+                outcome = await acp_commands.run('/cd', self.session)
+            self.assertEqual(outcome.text, f'cwd: {home}')
+            outcome = await acp_commands.run('/cd -', self.session)
+            self.assertEqual(outcome.text, f'cwd: {start}')
+            outcome = await acp_commands.run('/cd -', self.session)
+            self.assertEqual(outcome.text, f'cwd: {home}')
+
     async def test_status_without_a_connection_says_so(self):
         outcome = await acp_commands.run("/status", self.session)
 

@@ -723,14 +723,9 @@ def display_path(path: str) -> str:
     return path
 
 
-def change_shell_cwd(path: str | None = None) -> str:
+def change_shell_cwd(path: str) -> str:
     session = current_session()
-    target = path or ""
-    if not target:
-        target = paths.home_directory()
-    elif target == "-":
-        target = session.previous_shell_cwd
-    resolved = _resolve_path(target)
+    resolved = _resolve_path(path)
     observed = os.stat(resolved)
     if not stat.S_ISDIR(observed.st_mode):
         raise FileNotFoundError(resolved)
@@ -2662,6 +2657,12 @@ def print_shell_cwd(text_writer=None):
 def change_shell_cwd_from_text(arg_text: str, text_writer=None) -> bool:
     try:
         target = _parse_cd_arg_text(arg_text)
+        # Only the slash command interprets shortcuts. Startup arguments and
+        # saved directories must look up the supplied name, even if it is '-'.
+        if not target:
+            target = paths.home_directory()
+        elif target == "-":
+            target = current_session().previous_shell_cwd
         change_shell_cwd(target)
     except (FileNotFoundError, NotADirectoryError) as e:
         sys.stdout.flush()

@@ -12,7 +12,7 @@ from unittest import mock
 from config_fixtures import setUpModule as set_up_config
 from response_header_fixtures import setUpModule as set_up_response_headers
 from loki_entrypoints import child_environment, configure_container, entrypoint
-from loki_agent import loki, savefiles, sessions, settings, terminal_frontend
+from loki_agent import loki, private_files, savefiles, sessions, settings, terminal_frontend
 
 
 def setUpModule():
@@ -26,6 +26,15 @@ class WorkspaceHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(session.response_headers.close)
         self.enterContext(mock.patch.object(loki, '_DEFAULT_SESSION', session))
         return session
+
+    def make_dash_directory(self, workspace):
+        directory = private_files.open_directory(workspace)
+        try:
+            private_files.create_directory_at(directory, '-')
+        finally:
+            private_files.close(directory)
+        with os.scandir(workspace) as entries:
+            return next(entry.path for entry in entries if entry.name == '-')
 
     async def test_allocation_listing_and_resume_keep_workspace_after_cd(self):
         process_cwd = os.getcwd()
@@ -83,6 +92,35 @@ class WorkspaceHistoryTests(unittest.IsolatedAsyncioTestCase):
                 ['--shell-cwd', workspace, '--headless'], settings.Settings()), 0)
         self.assertIs(session.workspace_cwd, workspace)
         self.assertEqual(session.shell_cwd, 'tool lookup spelling')
+
+    async def test_cli_dash_cwd_names_a_directory(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            session = self.session(workspace)
+            args = ['--shell-cwd', '-', '--headless']
+            with mock.patch.object(terminal_frontend, 'build_config_from_env', return_value=object()), \
+                    mock.patch.object(terminal_frontend, 'apply_runtime_config'), \
+                    mock.patch.object(terminal_frontend, 'current_model', return_value='dummy'), \
+                    mock.patch.object(terminal_frontend.subagents, 'run_cli_async', new_callable=mock.AsyncMock,
+                                      return_value=0) as run, redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(await terminal_frontend.async_main(args, settings.Settings()), 2)
+                self.assertIn('cwd is not a directory', error.getvalue())
+                run.assert_not_awaited()
+                self.assertEqual(session.shell_cwd, workspace)
+                self.assertEqual(session.workspace_cwd, workspace)
+
+                dash = self.make_dash_directory(workspace)
+                self.assertEqual(await terminal_frontend.async_main(args, settings.Settings()), 0)
+                run.assert_awaited_once()
+            self.assertEqual(session.shell_cwd, dash)
+            self.assertEqual(session.workspace_cwd, '-')
+
+    async def test_saved_dash_cwd_names_a_directory(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            session = self.session(workspace)
+            dash = self.make_dash_directory(workspace)
+            loki.load_session_state({'shell_cwd': '-'})
+            self.assertEqual(session.shell_cwd, dash)
+            self.assertEqual(session.workspace_cwd, workspace)
 
     async def test_empty_cli_workspace_fails_without_rebinding_history(self):
         session = self.session(os.getcwd())
