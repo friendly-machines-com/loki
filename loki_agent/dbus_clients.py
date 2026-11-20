@@ -19,10 +19,12 @@ Specifications & Standards referenced:
 import asyncio
 import collections
 import os
+import re
 import socket
 import struct
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional, Tuple
+from urllib.parse import unquote_to_bytes
 
 
 class DbusError(RuntimeError):
@@ -43,7 +45,7 @@ class AsyncDBusWireClient:
         self._serial = 1
 
     @classmethod
-    async def connect(cls, socket_path: str) -> "AsyncDBusWireClient":
+    async def connect(cls, socket_path: str | bytes) -> "AsyncDBusWireClient":
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(socket_path)
         sock.setblocking(False)
@@ -239,14 +241,25 @@ class PortalInhibitor:
     @classmethod
     async def try_connect(cls) -> Optional["PortalInhibitor"]:
         # Resolve session bus socket from environment or systemd user runtime
-        sock_path = None
+        sock_path: str | bytes | None = None
         addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
         if addr:
             for part in addr.split(";"):
                 if part.startswith("unix:"):
                     params = dict(kv.split("=", 1) for kv in part[5:].split(",") if "=" in kv)
                     if "path" in params:
-                        sock_path = params["path"]
+                        value = params["path"]
+                        sock_path = None
+                        # D-Bus escapes bytes within each address field. URL
+                        # unquoting alone accepts malformed fields; validate first,
+                        # then keep the decoded bytes so non-UTF-8 names survive.
+                        if not re.fullmatch(r"(?:[-0-9A-Za-z_/.*]|%[0-9A-Fa-f]{2})+", value):
+                            continue
+                        decoded = unquote_to_bytes(value)
+                        # NUL is not part of a pathname; leading NUL selects
+                        # the abstract socket namespace on Linux.
+                        if b"\0" not in decoded:
+                            sock_path = decoded
                     elif "abstract" in params:
                         sock_path = "\0" + params["abstract"]
 
