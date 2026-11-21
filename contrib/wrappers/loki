@@ -5,6 +5,7 @@ exec bwrap \
   --unshare-ipc \
   --proc /proc \
   --dev /dev \
+  --ro-bind /etc/ssl /etc/ssl \
   --ro-bind $HOME/src/loki $HOME/src/loki \
   --ro-bind /usr /usr \
   --ro-bind /bin /bin \
