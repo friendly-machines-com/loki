@@ -27,7 +27,6 @@ from .lifetimes import finish_cleanup
 from .sessions import Session
 
 
-_DISCONNECTED = object()
 _UNCHANGED = object()
 _MODEL_DEFAULT_CONFIG_VALUE = "default"
 _EFFORT_CONFIG_VALUE_PREFIX = "effort:"
@@ -93,7 +92,10 @@ class Worker:
         self.compaction_requests = compactions.Requests(
             self._settle_compaction_replies, on_unstarted=self._publish_compaction_event)
         self._model_options: list[dict] = []
-        self._option_leaves: dict[str, object] = {}
+        # For a catalog choice, modelsdev.build_groups supplies the provider ID,
+        # the provider record with any model overrides applied, and the model
+        # entry, in that order.
+        self._option_leaves: dict[str, modelsdev.ExplicitConnectionOption | ConnectionDescriptor | tuple[str, dict, dict] | None] = {}
         self._current_option_value: str | None = None
         self._configuration_error: str | None = None
         # An uncommitted open is inert, not merely model-less: local commands
@@ -447,10 +449,12 @@ class Worker:
         # The worker knows the active checkpoint; the front alone can approve
         # sending a credential. Check before describing destinations and again
         # when applying the selection after that potentially suspended request.
-        leaf = self._option_leaves.get(value)
+        # A stored None is the disconnected choice; a missing key is invalid.
+        try:
+            leaf = self._option_leaves[value]
+        except KeyError:
+            raise acps.TransportError("unknown model value", code=acps.INVALID_PARAMS) from None
         if leaf is None:
-            raise acps.TransportError("unknown model value", code=acps.INVALID_PARAMS)
-        if leaf is _DISCONNECTED:
             return None
         if isinstance(leaf, modelsdev.ExplicitConnectionOption):
             config = connections.build_config_from_env(credentials=loki.CREDENTIALS)
@@ -598,7 +602,7 @@ class Worker:
             "value": "loki-disconnected",
             "name": "No model configured",
             "description": description,
-        }, _DISCONNECTED
+        }, None
 
     def _set_choices(self, choices, current_value: str):
         deduplicated = {}
