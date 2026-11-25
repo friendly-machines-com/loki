@@ -3419,7 +3419,7 @@ class StatusTextTests(unittest.TestCase):
             activity.set_compaction_running(True)
             self.assertEqual(len(repaints), count)
             activity.reset()
-        self.assertEqual(outputs, [False] * 2)
+        self.assertEqual(outputs, [False] * 3)
         self.assertFalse(activity.compaction_running)
 
     def test_ps_bold_tracks_running_jobs_and_stops_at_the_command(self):

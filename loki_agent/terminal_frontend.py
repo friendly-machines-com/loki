@@ -748,8 +748,6 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
             # A queued request can be cancelled while an older attempt is
             # still unwinding. Only the executor's outcome ends the bold state.
             _terminal_activity.set_compaction_running(False)
-            if kind == "compaction_completed":
-                return
         failed = kind == "compaction_failed"
         text = compactions.failure_text(event["error"]) if failed else event["text"]
         _emit_immediate_output("/compact", text, is_error=failed)

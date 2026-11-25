@@ -1178,7 +1178,7 @@ print(json.dumps(result))
         self.assertEqual(attempts, [1, 2])
         self.assertEqual(output.getvalue().count("Compaction requested."), 2)
         self.assertEqual(output.getvalue().count("Context compaction cancelled."), 1)
-        self.assertNotIn("Context compacted.", output.getvalue())
+        self.assertEqual(output.getvalue().count("/compact:\nContext compacted.\n"), 1)
 
     async def test_tui_reports_a_pending_compaction_when_the_turn_aborts(self):
         from test_loki_tool_loop import ScriptedInputSession
@@ -1254,7 +1254,9 @@ print(json.dumps(result))
             self.assertEqual(errors.getvalue().count("Context compaction failed: "), 1)
             self.assertIn("did not return exactly one checkpoint", errors.getvalue())
         else:
-            self.assertNotIn("Context compacted.", output.getvalue() + errors.getvalue())
+            self.assertEqual(output.getvalue().count(
+                "/compact:\nContext compacted. Earlier messages remain in the transcript.\n"), 1)
+            self.assertNotIn("Context compacted.", errors.getvalue())
             self.assertEqual(sum(event["type"] == "context_replace" for event in saved), 1)
             self.assertEqual(formats.item_text(formats.active_events(saved)[-1]), "ordinary answer")
 
