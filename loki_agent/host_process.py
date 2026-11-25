@@ -44,7 +44,7 @@ def label(signum) -> str:
 
 
 async def create_exec(*command, owning=False, before_resume=None,
-                      state_directory=None, tool_command=None, **kwargs):
+                      state_directory=None, tool_command=None, allow_abstract_unix=False, **kwargs):
     """Preserve the caller's image/cwd; only trusted callers select authority."""
     if sys.platform == 'win32':
         from . import windows_subprocesses
@@ -55,13 +55,13 @@ async def create_exec(*command, owning=False, before_resume=None,
     if before_resume is not None:
         before_resume()
     if sys.platform.startswith('linux') and not owning:
-        # Lifetime ownership and argv never grant writer authority. The owning
-        # runtime chooses both this root and the sanctioned bootstrap image.
+        # Lifetime ownership and target argv do not grant authority. The
+        # runtime chooses the state root, bootstrap image and socket permission.
         if state_directory is None or not tool_command:
             raise OSError(errno.EINVAL, 'command state protection is unavailable')
         from . import tool_executions
         return await tool_executions.create_exec(
-            tool_command, state_directory, command,
+            tool_command, state_directory, command, allow_abstract_unix=allow_abstract_unix,
             before_publish=before_resume, **kwargs)
     return await create_posix_process(*command, before_publish=before_resume, **kwargs)
 

@@ -108,7 +108,7 @@ class CredentialSupervisor:
             self.broker, allowed, manage_approvals=manage_approvals)
 
     async def run_terminal_runtime(
-            self, executable: str, arguments: list[str]) -> int:
+            self, executable: str, arguments: list[str], *, allow_abstract_unix: bool = False) -> int:
         """Run one terminal/headless child while serving its credentials."""
         # The Windows workspace gate runs before any channel is created.
         workspace = runtime_isolation.configured_workspace(arguments)
@@ -124,7 +124,7 @@ class CredentialSupervisor:
         try:
             process = await runtime_isolation.start_runtime(
                 executable, arguments, workspace, self.environment,
-                delegation, credential_directory=(
+                delegation, allow_abstract_unix=allow_abstract_unix, credential_directory=(
                     self.storage.directory_handle
                     if self.storage is not None else None))
             delegation.child_spawned()

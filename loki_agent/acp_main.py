@@ -11,6 +11,7 @@ import os
 import sys
 
 from . import runtime_isolation
+from .arguments import public_abstract_unix_permission
 from .credentials import CredentialStore, capture_process_credentials
 from .runtime_isolation import RuntimeIsolationError
 from .windows_api import WindowsApiError
@@ -22,7 +23,7 @@ from .process_protections import (
 )
 
 
-async def amain(credentials: CredentialStore) -> int:
+async def amain(credentials: CredentialStore, *, allow_abstract_unix: bool = False) -> int:
     from . import acps
     from .acp import Front
     from .credential_storages import JsonCredentialStorage
@@ -50,7 +51,7 @@ async def amain(credentials: CredentialStore) -> int:
 
     storage = JsonCredentialStorage()
     try:
-        front = Front(read, write, credentials, storage)
+        front = Front(read, write, credentials, storage, allow_abstract_unix=allow_abstract_unix)
         await front.run()
         return 0
     except acps.MessageTooLarge as error:
@@ -94,6 +95,7 @@ def main() -> int:
         from .subagents import main as subagent_main
         return subagent_main(sys.argv[2:])
 
+    allow_abstract_unix, _ignored = public_abstract_unix_permission(sys.argv[1:])
     credentials = capture_process_credentials()
     try:
         protect_credential_process()
@@ -104,7 +106,7 @@ def main() -> int:
         return 2
     from .credential_storages import CredentialStorageError
     try:
-        return asyncio.run(amain(credentials))
+        return asyncio.run(amain(credentials, allow_abstract_unix=allow_abstract_unix))
     except CredentialStorageError as error:
         print(f"Credential storage error: {error}", file=sys.stderr)
         return 2

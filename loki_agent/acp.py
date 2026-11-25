@@ -319,7 +319,7 @@ class SessionOperations:
 class Front:
     def __init__(
             self, read, write, credentials: CredentialStore,
-            credential_storage=None):
+            credential_storage=None, *, allow_abstract_unix: bool = False):
         self.read = read
         self.write = write
         self.credential_supervisor = (
@@ -327,6 +327,9 @@ class Front:
                 credentials, credential_storage))
         self.environment = self.credential_supervisor.environment
         self.credential_broker = self.credential_supervisor.broker
+        # New and resumed workers use the front's invocation permission, not
+        # parameters from the editor or restored session data.
+        self._allow_abstract_unix = allow_abstract_unix
         self._sessions: dict[str, SessionOperations] = {}
         self._connected = True
         self._tasks: set[asyncio.Task] = set()
@@ -1194,6 +1197,7 @@ class Front:
                 storage = self.credential_supervisor.storage
                 process = await runtime_isolation.start_worker(
                     cwd, self.environment, delegation,
+                    allow_abstract_unix=self._allow_abstract_unix,
                     credential_directory=(storage.directory_handle
                                           if storage is not None else None))
                 # Adopt the process before releasing child copies: their

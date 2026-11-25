@@ -1261,7 +1261,7 @@ class TerminalEntrypointContractTests(unittest.TestCase):
         supervisor_class.assert_called_once_with(
             credentials, storage)
         supervisor.run_terminal_runtime.assert_awaited_once_with(
-            "/checkout/loki.py", ["--headless"])
+            "/checkout/loki.py", ["--headless"], allow_abstract_unix=False)
 
     def test_internal_runtime_never_captures_root_credentials(self):
         with mock.patch.object(
@@ -1273,7 +1273,7 @@ class TerminalEntrypointContractTests(unittest.TestCase):
                 mock.patch.object(
                     terminal_entrypoint,
                     "_terminal_runtime_arguments",
-                    return_value=(11, 12, 13 if os.name == 'posix' else None, ["--headless"])) as descriptors, \
+                    return_value=(11, 12, 13 if os.name == 'posix' else None, ["--headless"], False)) as descriptors, \
                 mock.patch.object(
                     terminal_frontend,
                     "main",
@@ -1288,7 +1288,7 @@ class TerminalEntrypointContractTests(unittest.TestCase):
         # This is the routing contract: the descriptors the seam produced
         # reach the frontend, and the runtime never captures root credentials.
         descriptors.assert_called_once_with([])
-        terminal_main.assert_called_once_with(["--headless"], 11, 12)
+        terminal_main.assert_called_once_with(["--headless"], 11, 12, allow_abstract_unix=False)
         if os.name == "posix":
             self.isolation.assert_called_once_with(13)
         else:

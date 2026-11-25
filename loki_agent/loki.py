@@ -46,6 +46,7 @@ from . import savefiles
 from . import skills
 from . import texts
 from . import tool_runtime
+from .arguments import abstract_unix_launch_args
 from .connections import ConnectionDescriptor
 from .credentials import (
     CredentialInventory,
@@ -484,6 +485,7 @@ def _tool_process_creator():
     session = current_session()
     store = session.response_headers
     command = _tool_bootstrap_command() if sys.platform.startswith('linux') else None
+    allow_abstract_unix = session.allow_abstract_unix
 
     async def create(*arguments, **options):
         session.require_active()
@@ -496,7 +498,8 @@ def _tool_process_creator():
 
         return await host_process.create_exec(
             *arguments, state_directory=store.directory_handle,
-            tool_command=command, before_resume=check_owner, **options)
+            tool_command=command, allow_abstract_unix=allow_abstract_unix,
+            before_resume=check_owner, **options)
 
     return create
 
@@ -2269,7 +2272,8 @@ def _format_started_background_job(job: jobs.Job, kind: str = "job") -> str:
 
 
 def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
-    depth = current_session().subagent_depth
+    session = current_session()
+    depth = session.subagent_depth
     if depth >= tool_contracts.MAX_SUBAGENT_DEPTH:
         raise ValueError(
             f"maximum subagent depth reached ({tool_contracts.MAX_SUBAGENT_DEPTH})")
@@ -2285,10 +2289,11 @@ def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
         *command,
         '--subagent',
         agent_type,
+        *abstract_unix_launch_args(session.allow_abstract_unix),
         '--subagent-depth',
         str(depth + 1),
         '--root-conversation-id',
-        current_session().root_conversation_id,
+        session.root_conversation_id,
         '--prompt',
         prompt,
         '--shell-cwd',

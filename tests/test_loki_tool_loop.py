@@ -5844,8 +5844,9 @@ class SubagentLaunchTests(unittest.TestCase):
                             mock.patch.object(sys, 'platform', platform), \
                             mock.patch.object(sys, 'frozen', frozen, create=True):
                         result = loki._subagent_argv('Explore', 'inspect this')
+                    policy = ['--tool-host-abstract-unix', 'deny'] if platform == 'linux' else []
                     self.assertEqual(result, [
-                        *prefix, '--subagent', 'Explore', '--subagent-depth', str(depth + 1),
+                        *prefix, '--subagent', 'Explore', *policy, '--subagent-depth', str(depth + 1),
                         '--root-conversation-id', loki.current_session().root_conversation_id,
                         '--prompt', 'inspect this', '--shell-cwd', loki.current_shell_cwd(),
                     ])

@@ -1,10 +1,14 @@
-"""Terminal/headless invocation grammar, independent of UI and execution."""
+"""Public invocation and trusted tool policy launch arguments."""
 
 import getopt
 import sys
 
 
-USAGE = """\
+_ALLOW_ABSTRACT_UNIX = '--allow-tool-host-abstract-unix'
+_ABSTRACT_UNIX_POLICY = '--tool-host-abstract-unix'
+
+
+USAGE = f"""\
 usage: loki [options]
 
 Options:
@@ -16,6 +20,9 @@ Options:
                           (an explicit value outranks a resumed one)
       --dangerously-skip-permissions
                           skip permission prompts
+      {_ALLOW_ABSTRACT_UNIX}
+                          allow tools to reach host abstract Unix sockets
+                          (Linux, must be the first argument)
       --print-default-system-prompt
                           print built-in instructions and exit (use alone)
   -h, --help              show this help and exit
@@ -35,6 +42,33 @@ CLI_SHORT_OPTS = 'r:p:h'
 CLI_LONG_OPTS = ['resume=', 'prompt=', 'headless', 'toolset=',
                  'shell-cwd=',
                  'dangerously-skip-permissions', 'help']
+
+
+def public_abstract_unix_permission(args: list[str]) -> tuple[bool, list[str]]:
+    """Only an exact leading option grants access; leave all other args alone."""
+    if sys.platform.startswith('linux') and args[:1] == [_ALLOW_ABSTRACT_UNIX]:
+        return True, args[1:]
+    return False, args
+
+
+def abstract_unix_launch_args(allowed: bool) -> list[str]:
+    # Use existing private argv, not an environment setting or conversation
+    # option. Send deny explicitly too: a pre-policy receiver can reject the
+    # new launch grammar rather than start the command without the policy.
+    if not sys.platform.startswith('linux'):
+        return []
+    return [_ABSTRACT_UNIX_POLICY, 'allow' if allowed else 'deny']
+
+
+def read_abstract_unix_launch_args(args: list[str]) -> tuple[bool, list[str]]:
+    # Called only at the designated private argument position, never on
+    # target argv or prompts. A live older parent still sending the original
+    # layout lends no permission to a newly execed bootstrap.
+    if not sys.platform.startswith('linux') or args[:1] != [_ABSTRACT_UNIX_POLICY]:
+        return False, args
+    if len(args) < 2 or args[1] not in ['allow', 'deny']:
+        raise ValueError('invalid permission for host abstract Unix sockets')
+    return args[1] == 'allow', args[2:]
 
 
 def parse_cli_args(args):

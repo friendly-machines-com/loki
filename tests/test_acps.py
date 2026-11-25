@@ -12,6 +12,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -820,7 +821,7 @@ class FrontSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await front._open_worker(
                     cwd=ROOT, open_method="session/new")
         spawned.assert_awaited_once_with(
-            ROOT, front.environment, delegation, credential_directory=None)
+            ROOT, front.environment, delegation, allow_abstract_unix=False, credential_directory=None)
         delegation.close.assert_awaited_once_with()
         self.assertFalse(front.workers)
         self.assertFalse(any(owner.state == "opening"
@@ -1489,8 +1490,8 @@ else:
     _observe_process_exit = observe_process_exit
 
     async def _front(self, env, workspace, *, cleanup, closed_stderr=False, protected_installation=False,
-                     lifetime_boundary=False, on_diagnostics=None):
-        command = loki_acp_command()
+                     lifetime_boundary=False, on_diagnostics=None, arguments=None):
+        command = [*loki_acp_command(), *(arguments or [])]
         if (protected_installation or lifetime_boundary) and sys.platform.startswith('linux'):
             # Trusted outer-fixture setup, before the actual sanctioned front.
             # Reuse the deployment fixture's mount operations, never install
@@ -2119,7 +2120,7 @@ class FrontWorkerTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                 if not self._reader_task.done():
                     self._reader_task.set_result(None)
 
-        async def fake_spawn(cwd, environment, delegation, *, credential_directory=None):
+        async def fake_spawn(cwd, environment, delegation, *, credential_directory=None, allow_abstract_unix=False):
             spawned["cwd"] = cwd
             spawned["environment"] = environment
             spawned["delegation"] = delegation
@@ -3150,6 +3151,11 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
             await asyncio.sleep(0.01)
 
     async def test_shipped_front_agent_runs_restricted_external_search(self):
+        for allowed in ([False, True] if sys.platform.startswith('linux') else [False]):
+            with self.subTest(allowed=allowed):
+                await self._agent_runs_restricted_external_search(allowed)
+
+    async def _agent_runs_restricted_external_search(self, allowed):
         root = self.enterContext(tempfile.TemporaryDirectory(prefix='acp-agent-workflow-'))
         workspace = os.path.join(root, 'workspace')
         private_files.make_private_directory(workspace)
@@ -3166,8 +3172,14 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
         # This is the arbitrary external payload, not a sandbox installer. Real
         # rg invokes the selected interpreter with the searched filename as its
         # preprocessor argument. Explore still advertises/adopts only Grep.
-        configuration = json.dumps({'state': state, 'witness': witness})
-        source = '''import errno, json, os
+        abstract_address = None
+        if sys.platform.startswith('linux'):
+            listener = self.enterContext(socket.socket(socket.AF_UNIX))
+            listener.bind(b'')
+            listener.listen()
+            abstract_address = listener.getsockname().hex()
+        configuration = json.dumps({'state': state, 'witness': witness, 'abstract_address': abstract_address})
+        source = '''import errno, json, os, socket
 configuration = json.loads(CONFIGURATION)
 records = []
 for directory, _children, names in os.walk(os.path.join(configuration['state'], 'jobs')):
@@ -3194,6 +3206,14 @@ for operation, target, mode in [
         failures[operation] = {'allowed': True}
 with open(path, 'rb') as stream:
     unchanged = stream.read() == before
+if configuration['abstract_address'] is not None:
+    with socket.socket(socket.AF_UNIX) as connection:
+        try:
+            connection.connect(bytes.fromhex(configuration['abstract_address']))
+        except OSError as error:
+            failures['abstract_socket'] = error.errno
+        else:
+            failures['abstract_socket'] = 0
 with open(configuration['witness'], 'x', encoding='utf-8') as stream:
     json.dump({'pid': os.getpid(), 'parent': os.getppid(), 'owner': owner,
                'read': bool(before), 'unchanged': unchanged,
@@ -3232,7 +3252,12 @@ print('ACP_AGENT_ORDINARY_COMMAND_OBSERVED')
         url, requests, authorizations = await self._provider(respond)
         environment['LOKI_API_BASE'] = url
         configure_container(environment, workspace)
-        front, diagnostics = await self._front(environment, workspace, cleanup=self.addAsyncCleanup)
+        flag = '--allow-tool-host-abstract-unix'
+        # ACP must still ignore unrelated public arguments. A non-leading
+        # occurrence of the permission option is also not a grant.
+        public_args = ([flag, '--unused-fixture-option'] if allowed else ['--unused-fixture-option', flag])
+        front, diagnostics = await self._front(
+            environment, workspace, cleanup=self.addAsyncCleanup, arguments=public_args)
         await self._request(front, 1, 'initialize', {'protocolVersion': 1})
         opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
         session_id = opened['sessionId']
@@ -3253,6 +3278,8 @@ print('ACP_AGENT_ORDINARY_COMMAND_OBSERVED')
         self.assertTrue(observed['read'])
         self.assertTrue(observed['unchanged'])
         self.assertEqual(observed['credential_environment'], [])
+        if abstract_address is not None:
+            self.assertEqual(observed['abstract_socket'], 0 if allowed else errno.EPERM)
         self.assertNotEqual(observed['pid'], observed['parent'])
         self.assertEqual(observed['owner']['status'], 'running')
         for operation in ['mutation', 'creation']:
@@ -4817,7 +4844,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                         messages.append(message)
                         changed.set()
 
-                    async def launch(cwd, environment, delegation, *, credential_directory=None):
+                    async def launch(cwd, environment, delegation, *, credential_directory=None, allow_abstract_unix=False):
                         session = Session(shell_cwd=cwd)
                         resources.push_async_callback(session.close_state)
                         session_stores.append(session.response_headers)
@@ -6217,7 +6244,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
 
                 stack.enter_context(mock.patch.object(f.storage, 'approve_destinations', new=record))
 
-                async def launch(cwd, environment, delegation, *, credential_directory=None):
+                async def launch(cwd, environment, delegation, *, credential_directory=None, allow_abstract_unix=False):
                     session = Session(shell_cwd=cwd)
                     stack.push_async_callback(session.close_state)
                     # Same-process authority, as in the existing selection

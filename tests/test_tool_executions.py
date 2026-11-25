@@ -13,14 +13,34 @@ import os
 import shlex
 import shutil
 import signal
+import socket
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
 from loki_entrypoints import child_environment, entrypoint
-from loki_agent import credential_storages, host_process, private_files, response_headers, settings, tool_runtime
+from loki_agent import arguments, credential_storages, host_process, private_files, response_headers, settings, tool_runtime
 from process_lifecycle_fixtures import ProcessResources
+
+
+class AbstractUnixLaunchArgumentTests(unittest.TestCase):
+    def test_only_leading_public_option_grants_access(self):
+        flag = '--allow-tool-host-abstract-unix'
+        payload = ['--prompt', flag]
+        with mock.patch.object(sys, 'platform', 'linux'):
+            self.assertEqual(arguments.public_abstract_unix_permission([flag, *payload]), (True, payload))
+            self.assertEqual(arguments.public_abstract_unix_permission(payload), (False, payload))
+
+    def test_private_handoff_does_not_parse_target_arguments(self):
+        target = ['--', 'tool', '--tool-host-abstract-unix', 'allow']
+        with mock.patch.object(sys, 'platform', 'linux'):
+            self.assertEqual(arguments.read_abstract_unix_launch_args(target), (False, target))
+            for allowed in [False, True]:
+                launch = [*arguments.abstract_unix_launch_args(allowed), *target]
+                self.assertEqual(arguments.read_abstract_unix_launch_args(launch), (allowed, target))
+            with self.assertRaisesRegex(ValueError, 'invalid permission'):
+                arguments.read_abstract_unix_launch_args(['--tool-host-abstract-unix', 'unknown', *target])
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux ordinary-child mount view')
@@ -42,6 +62,101 @@ class OrdinaryStateTests(unittest.IsolatedAsyncioTestCase):
         return await host_process.create_exec(
             *command, state_directory=self.directory,
             tool_command=[sys.executable, entrypoint(frontend), '--tool-exec'], **options)
+
+    async def test_default_scope_and_explicit_permission_through_both_dispatchers(self):
+        with contextlib.ExitStack() as cleanup:
+            stream = cleanup.enter_context(socket.socket(socket.AF_UNIX))
+            datagram = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM))
+            pathname = cleanup.enter_context(socket.socket(socket.AF_UNIX))
+            tcp = cleanup.enter_context(socket.create_server(('127.0.0.1', 0)))
+            stream.bind(b'')
+            stream.listen()
+            datagram.bind(b'')
+            with tempfile.NamedTemporaryFile(dir=self.workspace) as name:
+                socket_path = name.name
+            pathname.bind(socket_path)
+            pathname.listen()
+            probe = '''import json, socket, sys
+assert sys.argv[5:] == ['--tool-host-abstract-unix', 'allow']
+report = {}
+
+def try_access(name, action):
+    try:
+        action()
+    except OSError as error:
+        report[name] = error.errno
+    else:
+        report[name] = 0
+
+with socket.socket(socket.AF_UNIX) as peer:
+    try_access('stream', lambda: peer.connect(bytes.fromhex(sys.argv[1])))
+with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as peer:
+    address = bytes.fromhex(sys.argv[2])
+    try_access('sendto', lambda: peer.sendto(b'test', address))
+    try_access('dgram_connect', lambda: peer.connect(address))
+with socket.socket(socket.AF_UNIX) as peer:
+    try_access('pathname', lambda: peer.connect(sys.argv[3]))
+with socket.create_connection(('127.0.0.1', int(sys.argv[4]))):
+    pass
+read, write = socket.socketpair()
+with read, write:
+    write.sendall(b'ok')
+    assert read.recv(2) == b'ok'
+print(json.dumps(report))
+'''
+            command = [sys.executable, '-c', probe, stream.getsockname().hex(), datagram.getsockname().hex(),
+                       socket_path, str(tcp.getsockname()[1]), '--tool-host-abstract-unix', 'allow']
+            # A subprocess of the target must inherit the same restriction.
+            descendant = [sys.executable, '-c', 'import subprocess,sys; sys.exit(subprocess.call(sys.argv[1:]))', *command]
+            for frontend in ['loki', 'loki-acp']:
+                for allowed in [False, True]:
+                    with self.subTest(frontend=frontend, allowed=allowed):
+                        process = await self.spawn(
+                            *descendant, frontend=frontend, allow_abstract_unix=allowed,
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                        try:
+                            output, errors, status = await asyncio.gather(
+                                process.stdout.read(), process.stderr.read(), process.wait())
+                            self.assertEqual(status, 0, errors)
+                            denied = 0 if allowed else errno.EPERM
+                            self.assertEqual(json.loads(output), {
+                                'stream': denied, 'sendto': denied, 'dgram_connect': denied, 'pathname': 0,
+                            })
+                        finally:
+                            await process.aclose()
+
+    async def test_enforcement_refusal_never_executes_target(self):
+        # Exhaust Landlock's layers in a disposable outer process, then exec
+        # the real bootstrap. Neither the test runner nor host is restricted
+        # by the fixture, and the bootstrap must surface the kernel refusal.
+        prepare = '''import ctypes, errno, os, sys
+from loki_agent import landlock_bindings, runtime_isolations
+runtime_isolations._set_no_new_privileges(ctypes.CDLL(None, use_errno=True))
+for _ in range(32):
+    try:
+        landlock_bindings.restrict_abstract_unix_sockets()
+    except OSError as error:
+        if error.errno != errno.E2BIG:
+            raise
+        break
+else:
+    raise AssertionError('Landlock layer limit was not reached')
+os.execv(sys.argv[1], sys.argv[1:])
+'''
+        with tempfile.TemporaryFile(dir=self.workspace) as marker:
+            process = None
+            try:
+                with self.assertRaisesRegex(OSError, 'Landlock enforcement failed') as failed:
+                    process = await host_process.create_exec(
+                        sys.executable, '-c', 'import os,sys; os.write(int(sys.argv[1]), b"ran")',
+                        str(marker.fileno()), state_directory=self.directory, pass_fds=[marker.fileno()],
+                        tool_command=[sys.executable, '-c', prepare, sys.executable, entrypoint('loki'), '--tool-exec'])
+            finally:
+                if process is not None:
+                    await process.aclose()
+            self.assertEqual(failed.exception.errno, errno.E2BIG)
+            marker.seek(0)
+            self.assertEqual(marker.read(), b'')
 
     async def test_reads_and_live_owner_publication_are_allowed_but_mutation_is_denied(self):
         code = r'''
@@ -110,6 +225,39 @@ print(json.dumps(result), file=sys.stderr, flush=True)
                 self.assertEqual(stream.read(), 'owning-writer')
         finally:
             await process.aclose()
+
+    async def test_terminal_allow_option_crosses_the_real_runtime(self):
+        with socket.socket(socket.AF_UNIX) as listener, \
+                tempfile.NamedTemporaryFile(dir=self.workspace, mode='w', encoding='utf-8') as probe:
+            listener.bind(b'')
+            listener.listen()
+            probe.write('import socket, sys\n'
+                        'with socket.socket(socket.AF_UNIX) as peer:\n'
+                        '    try: peer.connect(bytes.fromhex(sys.argv[1]))\n'
+                        '    except OSError as error: result = error.errno\n'
+                        '    else: result = 0\n'
+                        'print("ABSTRACT_SOCKET_ERRNO", result)\n')
+            probe.flush()
+            shell = shlex.join([sys.executable, probe.name, listener.getsockname().hex()])
+            environment = child_environment(
+                HOME=self.workspace, PATH=os.environ.get('PATH', ''), XDG_CONFIG_HOME=self.workspace,
+                XDG_STATE_HOME=self.workspace, LOKI_PROVIDER='dummy', LOKI_MODEL='dummy',
+                LOKI_API_BASE='http://dummy.invalid/v1')
+            for allowed in [False, True]:
+                with self.subTest(allowed=allowed):
+                    flags = ['--allow-tool-host-abstract-unix'] if allowed else []
+                    process = await asyncio.create_subprocess_exec(
+                        entrypoint('loki'), *flags, '--dangerously-skip-permissions',
+                        cwd=self.workspace, env=environment, stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    resources = ProcessResources(process)
+                    try:
+                        output, errors = await process.communicate(('!' + shell + '\n/quit\n').encode())
+                        self.assertEqual(process.returncode, 0, errors)
+                        expected = 0 if allowed else errno.EPERM
+                        self.assertIn(f'ABSTRACT_SOCKET_ERRNO {expected}\n'.encode(), output, errors)
+                    finally:
+                        await resources.cleanup()
 
     async def test_real_runtime_preserves_a_credential_cover_nested_under_the_state_view(self):
         config = self.workspace + os.sep + 'config'
@@ -285,17 +433,25 @@ print(json.dumps(result), file=sys.stderr, flush=True)
             await session.close_state()
 
     async def test_all_configured_hook_phases_use_the_explicit_root_without_xdg(self):
+        listener = self.enterContext(socket.socket(socket.AF_UNIX))
+        listener.bind(b'')
+        listener.listen()
         script = self.workspace + os.sep + 'hook.py'
         with open(script, 'w', encoding='ascii') as stream:
-            stream.write('import json, os, sys\n'
+            stream.write('import json, os, socket, sys\n'
                          'payload = json.load(sys.stdin)\n'
                          'try: open(sys.argv[1], "w").close()\n'
                          'except OSError as error: number = error.errno\n'
                          'else: number = 0\n'
+                         'with socket.socket(socket.AF_UNIX) as peer:\n'
+                         '    try: peer.connect(bytes.fromhex(sys.argv[3]))\n'
+                         '    except OSError as error: abstract = error.errno\n'
+                         '    else: abstract = 0\n'
                          'with open(sys.argv[2] + os.sep + payload["event"] + ".json", "w") as out:\n'
-                         '    json.dump({"errno": number, "xdg": os.environ.get("XDG_STATE_HOME"), "cwd": os.getcwd()}, out)\n'
+                         '    json.dump({"errno": number, "abstract": abstract,\n'
+                         '               "xdg": os.environ.get("XDG_STATE_HOME"), "cwd": os.getcwd()}, out)\n'
                          'print("{}")\n')
-        command = [sys.executable, script, self.other, self.workspace]
+        command = [sys.executable, script, self.other, self.workspace, listener.getsockname().hex()]
         sections = ['pre_tool_call', 'pre_tool_gate', 'post_tool_call', 'turn_end', 'turn_error']
         # Decode actual user configuration, then bind its commands to the
         # explicit creator. Shell-context cwd deliberately names the protected
@@ -320,7 +476,8 @@ print(json.dumps(result), file=sys.stderr, flush=True)
         self.assertIsNone(decision.delay_seconds)
         for name in sections:
             with open(self.workspace + os.sep + name + '.json', encoding='ascii') as stream:
-                self.assertEqual(json.load(stream), {'errno': errno.EROFS, 'xdg': None, 'cwd': self.workspace})
+                self.assertEqual(json.load(stream), {'errno': errno.EROFS, 'abstract': errno.EPERM,
+                                                     'xdg': None, 'cwd': self.workspace})
         with open(self.other, encoding='ascii') as stream:
             self.assertEqual(stream.read(), 'owner-original')
 

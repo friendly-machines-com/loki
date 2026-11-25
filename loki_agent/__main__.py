@@ -11,6 +11,7 @@ import sys
 
 from . import host_ipc
 from . import runtime_isolation
+from .arguments import public_abstract_unix_permission, read_abstract_unix_launch_args
 from .windows_api import WindowsApiError
 from .credentials import capture_process_credentials
 from .diagnostics import configure_logging
@@ -42,13 +43,15 @@ def _terminal_runtime_arguments(args):
             raise ValueError("credential protection is unavailable")
         directory_fd = _descriptor(args[separator + 1])
         separator += 2
-    if args[separator] != "--":
+    allow_abstract_unix, rest = read_abstract_unix_launch_args(args[separator:])
+    if rest[:1] != ["--"]:
         raise ValueError("credential protection is unavailable")
     return (
         _descriptor(args[1]),
         _descriptor(args[3]),
         directory_fd,
-        args[separator + 1:],
+        rest[1:],
+        allow_abstract_unix,
     )
 
 
@@ -74,7 +77,7 @@ def main() -> int:
 
     if sys.argv[1:2] == ["--runtime"]:
         try:
-            owner_fd, capability_fd, directory_fd, args = (
+            owner_fd, capability_fd, directory_fd, args, allow_abstract_unix = (
                 _terminal_runtime_arguments(sys.argv[2:]))
             _protect_runtime(directory_fd)
         except (ProcessProtectionError, RuntimeIsolationError, WindowsApiError,
@@ -83,7 +86,7 @@ def main() -> int:
         if not configure_logging(contained=True):
             return 2
         from .terminal_frontend import main as terminal_main
-        return terminal_main(args, owner_fd, capability_fd)
+        return terminal_main(args, owner_fd, capability_fd, allow_abstract_unix=allow_abstract_unix)
 
     if sys.argv[1:2] == ["--subagent"]:
         try:
@@ -125,8 +128,9 @@ def main() -> int:
         from .authentication_commands import main as authentication_main
         return authentication_main(
             sys.argv[2:], program=sys.argv[0])
+    allow_abstract_unix, args = public_abstract_unix_permission(sys.argv[1:])
     try:
-        status = runtime_isolation.preflight(sys.argv[1:])
+        status = runtime_isolation.preflight(args)
     except (RuntimeIsolationError, WindowsApiError) as error:
         return _report_security_error(error)
     if status is not None:
@@ -141,7 +145,7 @@ def main() -> int:
     try:
         storage = JsonCredentialStorage()
         supervisor = CredentialSupervisor(credentials, storage)
-        return asyncio.run(supervisor.run_terminal_runtime(sys.argv[0], sys.argv[1:]))
+        return asyncio.run(supervisor.run_terminal_runtime(sys.argv[0], args, allow_abstract_unix=allow_abstract_unix))
     except CredentialStorageError as error:
         print(f"Credential storage error: {error}", file=sys.stderr)
         return 2

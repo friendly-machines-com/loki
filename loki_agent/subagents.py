@@ -24,6 +24,7 @@ from . import host_ipc
 from . import loki as _core
 from . import protocols
 from . import texts
+from .arguments import read_abstract_unix_launch_args
 
 
 USAGE_OPTIONS = """\
@@ -58,6 +59,7 @@ class SubagentOptions:
     root_conversation_id: str | None = None
     session_owner_fd: int | None = None
     credential_capability_fd: int | None = None
+    allow_abstract_unix: bool = False
     help: bool = False
 
 
@@ -98,8 +100,9 @@ def parse_args(args) -> SubagentOptions:
         return SubagentOptions("", help=True)
 
     subagent_type = args[0]
+    allow_abstract_unix, rest = read_abstract_unix_launch_args(args[1:])
     options, positional = getopt.getopt(
-        args[1:],
+        rest,
         "p:h",
         [
             "prompt=",
@@ -142,7 +145,7 @@ def parse_args(args) -> SubagentOptions:
         elif option_name in ["-h", "--help"]:
             values["help"] = True
 
-    return SubagentOptions(subagent_type=subagent_type, **values)
+    return SubagentOptions(subagent_type=subagent_type, allow_abstract_unix=allow_abstract_unix, **values)
 
 
 async def run_prompt_async(subagent_type: str, prompt: str,
@@ -253,8 +256,12 @@ async def async_main(args) -> int:
     session = _core.current_session()
     previous_depth = session.subagent_depth
     previous_root = session.delegated_root_conversation_id
+    previous_permission = session.allow_abstract_unix
     session.subagent_depth = depth
     session.delegated_root_conversation_id = options.root_conversation_id
+    # Explore is an owning runtime; only the ordinary commands it launches
+    # may install Landlock. Nested Explore runtimes carry the same permission.
+    session.allow_abstract_unix = options.allow_abstract_unix
     try:
         try:
             runtime = await credential_runtimes.CredentialRuntime.connect(
@@ -312,6 +319,7 @@ async def async_main(args) -> int:
     finally:
         session.subagent_depth = previous_depth
         session.delegated_root_conversation_id = previous_root
+        session.allow_abstract_unix = previous_permission
         try:
             await session.close_state()
         finally:

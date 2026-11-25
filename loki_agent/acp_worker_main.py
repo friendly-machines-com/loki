@@ -14,6 +14,7 @@ import sys
 
 from . import credential_capabilities, credential_runtimes, host_ipc
 from . import runtime_isolation
+from .arguments import read_abstract_unix_launch_args
 from .windows_api import WindowsApiError
 from .process_protections import (
     ProcessProtectionError,
@@ -23,7 +24,7 @@ from .runtime_isolation import RuntimeIsolationError
 from .lifetimes import finish_cleanup
 
 
-async def amain(owner_fd: int, capability_fd: int, write) -> int:
+async def amain(owner_fd: int, capability_fd: int, write, *, allow_abstract_unix: bool = False) -> int:
     runtime = None
     try:
         runtime = await credential_runtimes.CredentialRuntime.connect(
@@ -41,14 +42,14 @@ async def amain(owner_fd: int, capability_fd: int, write) -> int:
         return 1
 
     try:
-        return await _serve_connected_runtime(runtime, write)
+        return await _serve_connected_runtime(runtime, write, allow_abstract_unix=allow_abstract_unix)
     finally:
         # Connection transfers ownership before deferred imports or Session
         # construction. Every later exit must therefore close this runtime.
         await runtime.close()
 
 
-async def _serve_connected_runtime(runtime, write):
+async def _serve_connected_runtime(runtime, write, *, allow_abstract_unix=False):
     from . import acps, connections, loki, settings
     from .acp_worker import Worker
     from .sessions import Session
@@ -104,7 +105,7 @@ async def _serve_connected_runtime(runtime, write):
                 await worker.close()
         return 0
 
-    session = Session(shell_cwd=os.getcwd())
+    session = Session(shell_cwd=os.getcwd(), allow_abstract_unix=allow_abstract_unix)
     try:
         # One worker serves one conversation; install its default only inside
         # the acquired Session lifetime so installation failures close it too.
@@ -172,6 +173,7 @@ def main() -> int:
 
     args = sys.argv[2:] if sys.argv[1:2] == ["--worker"] else sys.argv[1:]
     try:
+        allow_abstract_unix, args = read_abstract_unix_launch_args(args)
         owner_fd, capability_fd, null_handle, directory_fd = _runtime_descriptors(args)
         with ExitStack() as cleanup:
             null_fd = None
@@ -195,7 +197,7 @@ def main() -> int:
         return 2
     # On Windows only fd 1's non-inheritable NUL reference remains now.
     # Quarantine precedes connection, so its failure owns no live runtime.
-    return asyncio.run(amain(owner_fd, capability_fd, write))
+    return asyncio.run(amain(owner_fd, capability_fd, write, allow_abstract_unix=allow_abstract_unix))
 
 
 if __name__ == "__main__":

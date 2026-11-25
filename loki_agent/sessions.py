@@ -121,6 +121,10 @@ class Session:
     # installs the explicit depth delegated by its parent.
     subagent_depth: int = 0
 
+    # Launch permission shared by jobs and hooks until this runtime exits.
+    # Provider configuration and restored transcripts do not own that authority.
+    allow_abstract_unix: bool = field(default=False, kw_only=True)
+
     # JobManager, created on first use.
     job_manager: Any = None
     # Runtime shutdown is not a turn cancellation or a closed Store: cleanup

@@ -2104,7 +2104,7 @@ async def _run_frontend(args) -> int:
 
 
 async def _run_credential_runtime(
-        args, owner_fd: int, capability_fd: int) -> int:
+        args, owner_fd: int, capability_fd: int, *, allow_abstract_unix: bool = False) -> int:
     runtime = None
     session = None
     try:
@@ -2130,6 +2130,7 @@ async def _run_credential_runtime(
         # to their supervisor; retaining a local fallback here would recreate
         # the asymmetric in-process credential escape hatch.
         session = current_session()
+        session.allow_abstract_unix = allow_abstract_unix
         _core.CREDENTIALS = runtime.install(session)
         completed, result = await runtime.run(_run_frontend(args))
         return result if completed else 1
@@ -2142,7 +2143,7 @@ async def _run_credential_runtime(
                 await runtime.close()
 
 
-def main(args, owner_fd: int, capability_fd: int) -> int:
+def main(args, owner_fd: int, capability_fd: int, *, allow_abstract_unix: bool = False) -> int:
     """Run the capability-only terminal/headless runtime."""
     return asyncio.run(
-        _run_credential_runtime(args, owner_fd, capability_fd))
+        _run_credential_runtime(args, owner_fd, capability_fd, allow_abstract_unix=allow_abstract_unix))

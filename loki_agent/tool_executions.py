@@ -17,6 +17,7 @@ import signal
 import sys
 
 from . import host_ipc
+from .arguments import abstract_unix_launch_args, read_abstract_unix_launch_args
 
 
 _STATUS_LIMIT = 4096
@@ -70,7 +71,7 @@ async def _read_status(fd):
         loop.remove_reader(fd)
 
 
-async def create_exec(tool_command, state_directory, command, **options):
+async def create_exec(tool_command, state_directory, command, *, allow_abstract_unix, **options):
     from . import host_process
 
     if not command:
@@ -99,7 +100,8 @@ async def create_exec(tool_command, state_directory, command, **options):
                 os.close(selected)
 
         cleanup.callback(close_writer)
-        arguments = [*tool_command, str(root), str(writer), '--inherit-fds', json.dumps(inherited)]
+        arguments = [*tool_command, str(root), str(writer), '--inherit-fds', json.dumps(inherited),
+                     *abstract_unix_launch_args(allow_abstract_unix)]
         if cwd is not None:
             arguments.extend(['--cwd', os.fsdecode(cwd)])
         arguments.extend(['--', *command])
@@ -156,16 +158,21 @@ def main(arguments) -> int:
         inherited = json.loads(arguments[index + 1])
         if not isinstance(inherited, list) or any(type(fd) is not int or fd < 0 for fd in inherited):
             raise ValueError('command inherited descriptors are invalid')
-        index += 2
-        if arguments[index:index + 1] == ['--cwd']:
-            cwd = arguments[index + 1]
-            index += 2
-        if arguments[index:index + 1] != ['--'] or not arguments[index + 1:]:
+        allow_abstract_unix, rest = read_abstract_unix_launch_args(arguments[index + 2:])
+        if rest[:1] == ['--cwd']:
+            cwd = rest[1]
+            rest = rest[2:]
+        if rest[:1] != ['--'] or not rest[1:]:
             raise ValueError('command is missing')
-        command = arguments[index + 1:]
+        command = rest[1:]
         from . import runtime_isolations
         selected, root = root, None
         runtime_isolations.isolate_state_directory(selected)
+        if not allow_abstract_unix:
+            # Keep this in command protection setup, including the existing
+            # startup-report format. The final sweep also covers this import.
+            from . import landlock_bindings
+            landlock_bindings.restrict_abstract_unix_sockets()
         stage = 'cwd'
         if cwd is not None:
             os.chdir(cwd)

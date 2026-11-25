@@ -1001,6 +1001,8 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "--credential-capability-fd", spawned["args"])
             self.assertEqual(
                 spawned["args"][-2:], ("--", "--headless"))
+            if sys.platform.startswith('linux'):
+                self.assertEqual(spawned['args'][-4:-2], ('--tool-host-abstract-unix', 'deny'))
             self.assertIn("--credential-directory-fd", spawned["args"])
             self.assertIn(spawned['directory_fd'], spawned["kwargs"]["pass_fds"])
             self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 3)
@@ -1326,10 +1328,11 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(loop, 'subprocess_exec', new=spawn):
             await runtime_isolation.start_worker(
                 '/work', {'SAFE': 'value'}, delegation,
-                credential_directory=storage.directory_handle)
+                credential_directory=storage.directory_handle, allow_abstract_unix=sys.platform.startswith('linux'))
 
+        policy = ['--tool-host-abstract-unix', 'allow'] if sys.platform.startswith('linux') else []
         self.assertEqual(list(spawned['args']), [
-            '/installed/bin/loki', '--worker', *delegation.child_arguments(),
+            '/installed/bin/loki', '--worker', *policy, *delegation.child_arguments(),
             '--credential-directory-fd', str(spawned['directory_fd'])])
         kwargs = spawned['kwargs']
         self.assertIs(kwargs['stdin'], asyncio.subprocess.PIPE)

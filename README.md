@@ -792,6 +792,33 @@ therefore fail before displaying a prompt. Other POSIX systems do not gain the
 Linux credential-mount cover. Avoid weakening your host's security settings just
 to make an unknown container configuration start; use an environment you control.
 
+#### Host abstract Unix sockets on Linux
+
+Linux **tool commands** (Bash, Glob/Grep's `rg`, and external hooks) cannot
+make new outbound connections or unconnected datagram sends to host abstract
+Unix sockets by default. Their descendants inherit the restriction. The
+terminal/headless runtime, ACP workers, and Explore subagents are not scoped
+themselves; the ordinary tools they launch are.
+
+This requires enabled Landlock ABI 6 or newer (introduced in Linux 6.12) and a
+recognized Linux interpreter ABI. If the restriction cannot be enforced,
+the tool does not start. The binding supports the shared Linux syscall numbers
+(including x86-64, i386/i686, armhf, armel, AArch64, and RISC-V) and MIPS
+O32, N32, and N64. It does not use x32, legacy ARM OABI, or Alpha syscall
+numbers. Distributions can replace the native binding in
+`loki_agent/landlock_bindings.py` without changing the launch protocol.
+
+To explicitly **allow access** for an invocation you trust, pass
+`--allow-tool-host-abstract-unix` as the first argument to `loki.py` or to the
+`loki-acp` launcher configured in your editor. This skips only the Landlock
+scope; it does not relax mount or descriptor restrictions. Settings, saved
+chats, and tool arguments cannot grant this permission.
+
+The scope leaves pathname Unix sockets and IP traffic alone. It does not revoke
+connected descriptors or prevent publishing a listener. Landlock also restricts
+`ptrace` across its domains. Keep your outer sandbox and firewall, and keep the
+launcher, interpreter, and startup imports outside tool-writable mounts.
+
 ## Context compaction
 
 A model has a limit on the amount of conversation it can consider at once -- its

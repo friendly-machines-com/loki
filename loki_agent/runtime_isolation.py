@@ -19,6 +19,7 @@ import os
 import sys
 
 from . import acps, host_ipc, host_process, streams
+from .arguments import abstract_unix_launch_args
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ if sys.platform == "win32":
         return None
 
     async def start_runtime(executable, arguments, workspace, environment,
-                            delegation, *, credential_directory=None):
+                            delegation, *, credential_directory=None, allow_abstract_unix=False):
         command = [
             executable, "--runtime", *delegation.child_arguments(),
             "--", *arguments,
@@ -115,7 +116,7 @@ if sys.platform == "win32":
             executable, command[1:], environment, workspace, inherited,
             current_directory=os.getcwd())
 
-    async def start_worker(cwd, environment, delegation, *, credential_directory=None):
+    async def start_worker(cwd, environment, delegation, *, credential_directory=None, allow_abstract_unix=False):
         """The ACP worker, contained like the terminal runtime.
 
         The session cwd is the workspace: its container must already be
@@ -181,7 +182,7 @@ else:
             stdin=stdin, stdout=stdout, stderr=stderr, **options)
 
     async def start_runtime(executable, arguments, workspace, environment,
-                            delegation, *, credential_directory=None):
+                            delegation, *, credential_directory=None, allow_abstract_unix=False):
         if credential_directory is None:
             raise RuntimeIsolationError("credential protection is unavailable")
         directory_fd = host_ipc.duplicate_for_child(credential_directory)
@@ -189,6 +190,7 @@ else:
             command = [
                 executable, "--runtime", *delegation.child_arguments(),
                 "--credential-directory-fd", str(directory_fd),
+                *abstract_unix_launch_args(allow_abstract_unix),
                 "--", *arguments,
             ]
             logger.debug("runtime command: %r", command)
@@ -200,7 +202,7 @@ else:
             # launch copy closes. Storage still owns its original handle.
             os.close(directory_fd)
 
-    async def start_worker(cwd, environment, delegation, *, credential_directory=None):
+    async def start_worker(cwd, environment, delegation, *, credential_directory=None, allow_abstract_unix=False):
         """The ACP worker on POSIX: piped stdio, delegated descriptors.
 
         ``cwd`` is unused here -- the worker learns the session directory
@@ -213,8 +215,8 @@ else:
             raise RuntimeIsolationError("credential protection is unavailable")
         directory_fd = host_ipc.duplicate_for_child(credential_directory)
         try:
-            command = [*worker_command(), *delegation.child_arguments(),
-                       "--credential-directory-fd", str(directory_fd)]
+            command = [*worker_command(), *abstract_unix_launch_args(allow_abstract_unix),
+                       *delegation.child_arguments(), "--credential-directory-fd", str(directory_fd)]
             logger.debug("worker command: %r", command)
             return await _create_posix_process(
                 delegation, *command, limit=acps.MAX_MESSAGE_BYTES,
