@@ -198,7 +198,7 @@ async def _image(argument: str, session) -> Outcome:
 
 
 async def _bang(command: str, cancel_event=None) -> Outcome:
-    output = await loki.run_bash_async(command, cancel_event=cancel_event)
+    output = await loki.run_bang_async(command, cancel_event=cancel_event)
     return Outcome(
         text=f"{loki.computer}: [Running local command: {command}]\n{output}",
         model_text=(

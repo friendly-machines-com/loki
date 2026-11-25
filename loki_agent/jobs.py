@@ -13,21 +13,23 @@ import signal
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
-from . import credential_capabilities, executables, files, host_ipc, host_process
+from . import credential_capabilities, diagnostics, executables, files, host_ipc, host_process
 from . import private_files
 from . import process_outputs, tool_contracts, tool_runtime
 from .lifetimes import finish_cleanup
 
 
 def _bash_output(stdout: str, stderr: str, exit_code: int | None,
-                 status: str = "completed", no_output_expected: bool = False):
+                 status: str = "completed", no_output_expected: bool = False, *, details: str = ""):
     parts = [f"status: {status}"]
     if exit_code is not None:
         parts.append(f"exit_code: {exit_code}")
     if no_output_expected:
         parts.append("no_output_expected: true")
+    if details:
+        parts.append(details)
     return process_outputs.ProcessOutput("\n".join(parts), stdout, stderr)
 
 
@@ -126,6 +128,10 @@ class Job:
 
 class SubagentCapacityError(RuntimeError):
     """The process already owns its maximum number of live subagents."""
+
+
+class ManualShellError(RuntimeError):
+    """A !command failure with the recorded job and log paths, when available."""
 
 
 class _JobRevokedDuringLaunch(RuntimeError):
@@ -467,11 +473,14 @@ class JobManager:
                      env: dict | None = None, cwd: str | None = None,
                      session_owned: bool = False,
                      credential_refs=None, credential_authority=None, credential_destinations=None,
-                     subagent: bool = False) -> tuple[Job, BinaryIO | None, BinaryIO | None]:
+                     subagent: bool = False, *,
+                     on_registered: Callable[[Job], None] | None = None) -> tuple[Job, BinaryIO | None, BinaryIO | None]:
         """Return the launched job followed by its stdout and stderr readers.
 
         On foreground success, _foreground owns and closes both readers. If
         launch fails, _spawn closes them. A background launch has no readers.
+        Manual commands borrow the job record at registration, because a
+        failed launch has no return value but may already have saved logs.
         """
         if self._closed:
             raise RuntimeError('This conversation has closed')
@@ -534,6 +543,8 @@ class JobManager:
                     f"job was revoked while launching (status={job.status})")
 
         try:
+            if on_registered is not None:
+                on_registered(job)
             if subagent:
                 # Reserved inside the failure boundary, immediately before the
                 # first operation that can yield to another task: a refusal
@@ -754,7 +765,7 @@ class JobManager:
                           description='', shell=False, env=None, cwd=None,
                           cancel_event=None, session_owned=False,
                           credential_refs=None, credential_authority=None,
-                          credential_destinations=None, subagent=False):
+                          credential_destinations=None, subagent=False, on_registered=None):
         """Run once and lend both captures until the caller finishes reading.
 
         Bash shows a preview; searches choose their page before shortening it.
@@ -765,7 +776,8 @@ class JobManager:
             command, display_command, description, False, timeout_ms, shell,
             env=env, cwd=cwd, session_owned=session_owned,
             credential_refs=credential_refs, credential_authority=credential_authority,
-            credential_destinations=credential_destinations, subagent=subagent)
+            credential_destinations=credential_destinations, subagent=subagent,
+            on_registered=on_registered)
         assert stdout is not None and stderr is not None
         with stdout, stderr:
             status = await self._finish_foreground(job, timeout_ms, cancel_event)
@@ -889,6 +901,51 @@ class JobManager:
         # cancellation are tool failures; stderr text does not decide status.
         return _shell_result(
             _bash_output(stdout, stderr, job.exit_code), structured=structured)
+
+    async def run_manual_shell(self, command: str, *, cwd: str,
+                               cancel_event: asyncio.Event | None = None) -> str:
+        """Return the text that terminal and ACP !commands show and send.
+
+        The Bash tool's preview can discard the ends of both streams, and
+        JobStatus opens the log names again. Borrow the original foreground
+        captures, which _foreground closes on return or error.
+        """
+        if not command.strip():
+            return _bash_output('', '', 0, no_output_expected=True).render()
+        timeout_ms = tool_contracts.BASH_DEFAULT_TIMEOUT_MS
+        job: Job | None = None
+        status = None
+        failure = None
+        out = err = ''
+
+        def remember(registered):
+            nonlocal job
+            job = registered
+
+        try:
+            async with self._foreground(command, command, timeout_ms, shell=True, cwd=cwd,
+                                        cancel_event=cancel_event, on_registered=remember) as result:
+                job, status, stdout, stderr = result
+                out, err = process_outputs.tail_previews(stdout, stderr, tool_contracts.BASH_MAX_OUTPUT_CHARS)
+        except Exception as error:
+            failure = error
+        details = []
+        if job is not None:
+            details.extend([f'job_id: {job.id}', f'stdout_path: {job.stdout_path}', f'stderr_path: {job.stderr_path}'])
+        if status == 'timed_out':
+            details.append(f'command timed out after {timeout_ms}ms')
+        if failure is not None:
+            action = 'run command' if status is None else 'read command output'
+            details.append(f'Could not {action}: {diagnostics.exception_text(failure)}')
+            if job is not None and status is None:
+                details.append('Capture files may be unavailable.')
+        if status is None:
+            status = job.status if job is not None else 'failed'
+        exit_code = job.exit_code if job is not None else None
+        text = _bash_output(out, err, exit_code, status=status, details='\n'.join(details)).render()
+        if failure is not None:
+            raise ManualShellError(text) from failure
+        return text
 
     def run_exec(self, argv: list[str], timeout_ms: int | None = None, **options):
         if not argv:

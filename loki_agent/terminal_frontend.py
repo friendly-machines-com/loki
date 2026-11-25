@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from . import attachments
 from .arguments import USAGE, parse_cli_args, preflight as argument_preflight
 from .diagnostics import debug_json, exception_text
+from .jobs import ManualShellError
 from . import command_deliveries
 from . import compactions
 from . import formats
@@ -78,7 +79,7 @@ from .loki import (
     record_agent_mode_instruction,
     reinstall_provider,
     resolve_chat_log_path,
-    run_bash_async,
+    run_bang_async,
     run_tool_loop_async,
     save_chat_log,
     set_session_connection,
@@ -1867,7 +1868,12 @@ async def async_main(args, configuration: settings.Settings) -> int:
                             end="")
                         terminal.write_text(cmd)
                         print("]")
-                        cmd_output = await run_bash_async(cmd)
+                        try:
+                            cmd_output = await run_bang_async(cmd)
+                        except ManualShellError as error:
+                            terminal.write_text(str(error), multiline=True)
+                            print()
+                            continue
                         terminal.write_text(cmd_output, multiline=True)
                         print()
                         # Morph the user input so the AI sees exactly what you did and the result

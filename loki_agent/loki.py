@@ -851,6 +851,14 @@ async def run_bash_async(command: str,
         cwd=cwd if cwd is not None else current_shell_cwd(), structured=structured)
 
 
+async def run_bang_async(command: str, *, cancel_event: asyncio.Event | None = None) -> str:
+    try:
+        manager = current_job_manager()
+    except Exception as error:
+        raise jobs.ManualShellError(f'Could not run command: {diagnostics.exception_text(error)}') from error
+    return await manager.run_manual_shell(command, cwd=current_shell_cwd(), cancel_event=cancel_event)
+
+
 def run_jobs() -> str:
     return current_job_manager().list_jobs()
 

@@ -442,7 +442,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("process_output", result)
         self.assertIn("job-stdout", process_outputs.presentation_text(result["content"]))
 
-    async def test_manual_shell_calls_keep_the_complete_text_projection(self):
+    async def test_programmatic_shell_calls_keep_the_complete_text_projection(self):
         job = types.SimpleNamespace(exit_code=0)
         with mock.patch.object(self.manager, "run_foreground", new=mock.AsyncMock(
                 return_value=[job, "completed", "stdout-secret", "stderr-message"])):
@@ -450,6 +450,167 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(output, str)
         self.assertIn("stdout-secret", output)
         self.assertIn("stderr-message", output)
+
+    async def test_bang_failure_before_job_registration_has_no_log_hint(self):
+        with mock.patch.object(loki, 'current_job_manager', side_effect=OSError('job storage unavailable')):
+            with self.assertRaisesRegex(job_runtime.ManualShellError, 'Could not run command: job storage unavailable') as raised:
+                await loki.run_bang_async('printf not-run')
+        self.assertNotIn('job_id:', str(raised.exception))
+        self.assertEqual(self.manager.jobs, {})
+
+    async def test_bang_reports_rejected_reader_binding_without_starting_child(self):
+        open_capture = job_runtime._open_capture
+        real_fstat = os.fstat
+        readers = []
+        mismatched_fd = None
+
+        def track_reader(directory, name):
+            nonlocal mismatched_fd
+            reader = open_capture(directory, name)
+            readers.append(reader)
+            if name == 'stderr.log':
+                mismatched_fd = reader.fileno()
+            return reader
+
+        def identity(fd):
+            nonlocal mismatched_fd
+            facts = real_fstat(fd)
+            if fd == mismatched_fd:
+                mismatched_fd = None
+                return types.SimpleNamespace(st_dev=facts.st_dev, st_ino=facts.st_ino + 1)
+            return facts
+
+        launch = mock.AsyncMock(side_effect=AssertionError('unverified capture must not launch'))
+        with (mock.patch.object(job_runtime, '_open_capture', track_reader),
+              mock.patch.object(job_runtime.os, 'fstat', side_effect=identity),
+              mock.patch.object(self.manager, '_create_exec', launch)):
+            with self.assertRaisesRegex(job_runtime.ManualShellError, r'Could not verify stderr\.log') as raised:
+                await loki.run_bang_async('printf not-run')
+
+        launch.assert_not_awaited()
+        self.assertEqual(len(readers), 2)
+        self.assertTrue(all(reader.closed for reader in readers))
+        job = next(iter(self.manager.jobs.values()))
+        self.assertEqual(job.status, 'failed')
+        self.assertIsNone(job.process)
+        self.assertIn(f'job_id: {job.id}', str(raised.exception))
+        self.assertIn(f'stdout_path: {job.stdout_path}', str(raised.exception))
+        self.assertIn(f'stderr_path: {job.stderr_path}', str(raised.exception))
+        with open(job.stdout_path, 'rb') as saved:
+            self.assertEqual(saved.read(), b'')
+        with open(job.stderr_path, 'rb') as saved:
+            self.assertIn(b'launch failed', saved.read())
+
+    async def test_bang_preview_failure_reports_completed_job_and_logs(self):
+        from loki_agent import acp_commands
+
+        with mock.patch.object(process_outputs, 'tail_previews', side_effect=OSError('preview read failed')) as read:
+            with self.assertRaises(job_runtime.ManualShellError) as raised:
+                await acp_commands.run('!printf saved-output', self.session)
+
+        job = next(iter(self.manager.jobs.values()))
+        text = str(raised.exception)
+        self.assertIn('status: completed\nexit_code: 0', text)
+        self.assertIn('Could not read command output: preview read failed', text)
+        self.assertIn(f'stdout_path: {job.stdout_path}', text)
+        self.assertIn(f'stderr_path: {job.stderr_path}', text)
+        self.assertTrue(all(reader.closed for reader in read.call_args.args[:2]))
+        with open(job.stdout_path, 'rb') as saved:
+            self.assertEqual(saved.read(), b'saved-output')
+
+    async def test_bang_previews_keep_separate_tails_and_log_paths_in_both_frontends(self):
+        from shlex import quote
+        from loki_agent import acp_commands
+        from test_loki_tool_loop import ScriptedInputSession
+
+        limit = 128
+        long_stdout = 'stdout start ' + 'o' * 200 + ' stdout end'
+        long_stderr = 'stderr start ' + 'e' * 200 + ' stderr end'
+        cases = [
+            ['short stdout', 'short stderr', False, False],
+            ['', 'stderr only', False, False],
+            ['', '', False, False],
+            ['x' * 100, 'short stderr', False, False],
+            [long_stdout, 'short stderr', True, False],
+            [long_stdout, long_stderr, True, True],
+        ]
+        commands = [f"!printf '%s' {quote(out)}; printf '%s' {quote(err)} >&2" for out, err, _, _ in cases]
+
+        def check(preview, job, case):
+            out, err, out_cut, err_cut = case
+            header = (f'status: completed\nexit_code: 0\njob_id: {job.id}\n'
+                      f'stdout_path: {job.stdout_path}\nstderr_path: {job.stderr_path}')
+            self.assertTrue(preview.startswith(header), preview)
+            out_view, _, err_view = preview.removeprefix(header).partition('\n[stderr]\n')
+            self.assertEqual(out_view.startswith('\n[stdout]\n'), bool(out))
+            out_view = out_view.removeprefix('\n[stdout]\n')
+            self.assertLessEqual(len(out_view) + len(err_view), limit)
+            for path, full, shown, cut in [
+                    [job.stdout_path, out, out_view, out_cut], [job.stderr_path, err, err_view, err_cut]]:
+                with open(path, encoding='utf-8') as saved:
+                    self.assertEqual(saved.read(), full)
+                if cut:
+                    marker = '[output truncated]\n'
+                    self.assertTrue(shown.startswith(marker), shown)
+                    suffix = shown.removeprefix(marker)
+                    self.assertTrue(suffix and len(suffix) < len(full) and full.endswith(suffix), shown)
+                else:
+                    self.assertEqual(shown, full)
+
+        seen = []
+        rejected = 'printf not-launched'
+        create_exec = self.manager._create_exec
+
+        async def start(*argv, **kwargs):
+            if len(argv) == 3 and argv[2] == rejected:
+                raise OSError('launch refused by fixture')
+            return await create_exec(*argv, **kwargs)
+
+        async def turn(items, **_kwargs):
+            seen.append(formats.item_text(items[-1]))
+            return 'done'
+
+        with mock.patch.object(tool_contracts, 'BASH_MAX_OUTPUT_CHARS', limit):
+            for command, case in zip(commands, cases):
+                with self.subTest(frontend='ACP', clipped=case[2:]):
+                    outcome = await acp_commands.run(command, self.session)
+                    preview = outcome.text.split('\n', 1)[1]
+                    self.assertTrue(outcome.model_text.endswith(f'\nOutput:\n```\n{preview}\n```'))
+                    check(preview, list(self.manager.jobs.values())[-1], case)
+
+            config = self.session.runtime_config
+            with tempfile.NamedTemporaryFile(dir=self.directory, delete=False) as chat:
+                chat_path = chat.name
+            with (
+                mock.patch.object(terminal_frontend, 'input_session',
+                                  return_value=ScriptedInputSession(['!' + rejected, *commands, None])),
+                mock.patch.object(self.manager, '_create_exec', new=start),
+                mock.patch.object(terminal_frontend.terminals, 'open_terminal_stdin'),
+                mock.patch.object(terminal_frontend, 'restore_output_area_after_input'),
+                mock.patch.object(terminal_frontend, '_redraw_status'),
+                mock.patch.object(terminal_frontend, 'explicit_api_base_configured', return_value=True),
+                mock.patch.object(terminal_frontend, 'build_config_from_env', return_value=config),
+                mock.patch.object(terminal_frontend, 'new_chat_log_path', return_value=chat_path),
+                mock.patch.object(terminal_frontend, 'run_terminal_turn_async', side_effect=turn),
+                mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', tool_runtime.ToolHookPipeline()),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
+
+        jobs = list(self.manager.jobs.values())
+        self.assertEqual(len(jobs), 2 * len(cases) + 1)
+        failed = jobs[len(cases)]
+        self.assertEqual(failed.status, 'failed')
+        self.assertIn('Could not run command: launch refused by fixture', output.getvalue())
+        self.assertIn(f'job_id: {failed.id}', output.getvalue())
+        self.assertIn(f'stdout_path: {failed.stdout_path}', output.getvalue())
+        self.assertIn(f'stderr_path: {failed.stderr_path}', output.getvalue())
+        self.assertEqual(len(seen), len(cases))
+        for model_text, job, case in zip(seen, jobs[len(cases) + 1:], cases):
+            with self.subTest(frontend='terminal', clipped=case[2:]):
+                preview = model_text.split('\nOutput:\n```\n', 1)[1].removesuffix('\n```')
+                self.assertIn(preview, output.getvalue())
+                check(preview, job, case)
 
     async def test_model_tool_loop_preserves_metadata_in_event_and_saved_result(self):
         snapshots = []

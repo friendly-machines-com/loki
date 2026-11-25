@@ -124,6 +124,30 @@ def preview(stream, max_chars: int, *, tail=False) -> str:
     return text
 
 
+def tail_previews(stdout, stderr, max_chars: int) -> tuple[str, str]:
+    """Share the !command output budget while the two readers are borrowed.
+
+    Cutting a rendered reply would clip the end of stdout and can hide stderr.
+    Cap the streams before adding labels and job metadata instead.
+    """
+    out = preview(stdout, max_chars, tail=True)
+    err = preview(stderr, max_chars, tail=True)
+    if len(out) + len(err) <= max_chars:
+        return out, err
+
+    # Split the budget when both are long; give unused space to the other.
+    out_chars = min(len(out), max(max_chars // 2, max_chars - len(err)))
+
+    def fit(text, chars):
+        if len(text) <= chars:
+            return text
+        # This also removes any earlier omission marker before the kept suffix.
+        payload = chars - len(OUTPUT_TRUNCATED) - 1
+        return f'{OUTPUT_TRUNCATED}\n{text[-payload:]}' if payload > 0 else OUTPUT_TRUNCATED
+
+    return fit(out, out_chars), fit(err, max_chars - out_chars)
+
+
 def capture_chunks(stream):
     """Read the same capture from the beginning, before a search picks its page.
 

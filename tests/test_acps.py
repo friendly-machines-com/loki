@@ -3677,8 +3677,6 @@ def _command_fixture(root):
     with open(os.path.join(destination, " screen shot.png "), "wb") as stream:
         stream.write(png)
     command = "cat payload.txt >> executed.txt && cat executed.txt"
-    output = "status: completed\nexit_code: 0\n[stdout]\n" + payload.decode()
-    model_text = f"I ran the local command `{command}`.\nOutput:\n```\n{output}\n```"
     image = {"type": "image", "source": {
         "type": "base64", "media_type": "image/png",
         "data": base64.b64encode(png).decode("ascii"),
@@ -3692,7 +3690,7 @@ def _command_fixture(root):
         "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
         "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "Local command answer.",
     })
-    return workspace, destination, payload, png, command, output, model_text, image, environment
+    return workspace, destination, payload, png, command, image, environment
 
 
 async def _command_status(environment, cleanup):
@@ -3773,10 +3771,26 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
                          ["message", "model_response", "message", "model_response"])
         self.assertEqual(blob["session_state"]["shell_cwd"], destination)
 
-    async def test_shipped_commands_snapshot_bang_two_turns_and_close(self):
+    def _bang_model_text(self, messages, session_id, command, payload, answer):
         import socket
+        updates = _tool_updates(messages, session_id)
+        acknowledgement = updates[0]['content']['text']
+        prefix = f"{socket.gethostname()}: [Running local command: {command}]\n"
+        self.assertTrue(acknowledgement.startswith(prefix), acknowledgement)
+        output = acknowledgement.removeprefix(prefix)
+        lines = output.split('\n')
+        self.assertEqual(lines[:3], ['status: completed', 'exit_code: 0', 'job_id: 1'])
+        for line, label, content in [[lines[3], 'stdout_path: ', payload], [lines[4], 'stderr_path: ', b'']]:
+            self.assertTrue(line.startswith(label), line)
+            with open(line.removeprefix(label), 'rb') as stream:
+                self.assertEqual(stream.read(), content)
+        self.assertEqual(lines[5:], ['[stdout]', payload.decode()])
+        self.assertEqual(updates, _assistant_chunks(acknowledgement, answer))
+        return f"I ran the local command `{command}`.\nOutput:\n```\n{output}\n```"
+
+    async def test_shipped_commands_snapshot_bang_two_turns_and_close(self):
         root = self.enterContext(tempfile.TemporaryDirectory())
-        workspace, destination, payload, png, command, output, model_text, image, env = _command_fixture(root)
+        workspace, destination, payload, png, command, image, env = _command_fixture(root)
         store, status_path, status_bytes = await _command_status(env, self.addCleanup)
         configure_container(env, workspace)
         # The new virtual cwd is also a supported configured workspace on
@@ -3828,9 +3842,7 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
         with open(os.path.join(destination, " screen shot.png "), "wb") as stream:
             stream.write(b"\xff\xd8\xffreplacement source")
         messages = await prompt(8, "!" + command)
-        acknowledgement = f"{socket.gethostname()}: [Running local command: {command}]\n{output}"
-        self.assertEqual(_tool_updates(messages, session_id),
-                         _assistant_chunks(acknowledgement, "Local command answer."))
+        model_text = self._bang_model_text(messages, session_id, command, payload, "Local command answer.")
         self.assertEqual(_tool_updates(await prompt(9, "Second prompt"), session_id),
                          _assistant_chunks("Local command answer."))
         with open(os.path.join(destination, "executed.txt"), "rb") as stream:
@@ -3845,14 +3857,13 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
 
     async def test_wire_commands_snapshot_bang_and_durable_two_turns(self):
         import copy
-        import socket
         from contextlib import ExitStack
         from loki_agent import formats, loki, paths, protocols
         from loki_agent.sessions import Session
         async with AsyncExitStack() as resources:
             root = resources.enter_context(tempfile.TemporaryDirectory())
             stack = resources.enter_context(ExitStack())
-            workspace, destination, payload, png, command, output, model_text, image, env = _command_fixture(root)
+            workspace, destination, payload, png, command, image, env = _command_fixture(root)
             store, status_path, status_bytes = await _command_status(env, resources.callback)
             state_root = paths.loki_state_dir(env)
             stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
@@ -3928,9 +3939,8 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
                     self.assertEqual(stream.read(), status_bytes)
                 with open(os.path.join(destination, " screen shot.png "), "wb") as stream:
                     stream.write(b"\xff\xd8\xffreplacement source")
-                acknowledgement = f"{socket.gethostname()}: [Running local command: {command}]\n{output}"
-                self.assertEqual(_tool_updates(await prompt("!" + command), session_id),
-                                 _assistant_chunks(acknowledgement, "Image accepted."))
+                model_text = self._bang_model_text(
+                    await prompt("!" + command), session_id, command, payload, "Image accepted.")
                 self.assertEqual([item["content"] for item in requests[0] if item.get("role") == "user"],
                                  [[{"type": "text", "text": model_text}, image]])
                 self.assertEqual(_tool_updates(await prompt("Second prompt"), session_id),
@@ -4715,7 +4725,11 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     completion.assert_not_awaited()
                     updates = _tool_updates(messages, "prompt-owner")
                     self.assertEqual(updates[-1], _assistant_chunks("[turn cancelled by user]")[0])
-                    self.assertIn("bang-ready", updates[0]["content"]["text"])
+                    preview = updates[0]["content"]["text"]
+                    self.assertIn("status: cancelled", preview)
+                    self.assertIn("bang-ready", preview)
+                    self.assertIn(f"stdout_path: {job.stdout_path}", preview)
+                    self.assertIn(f"stderr_path: {job.stderr_path}", preview)
                     await asyncio.sleep(0)
                     await asyncio.sleep(0)
                     resources.assert_released(self)
