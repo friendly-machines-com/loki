@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 from loki_entrypoints import (
     child_environment, configure_container, entrypoint, loki_command)
-from job_fixtures import job_manager, managed_jobs
+from job_fixtures import captured_result, job_manager, managed_jobs
 from process_lifecycle_fixtures import observe_fixture, running_fixture_task
 from terminal_input_fixtures import PromptKeyboard
 from response_header_fixtures import isolated_response_headers, setUpModule as set_up_response_headers
@@ -5914,19 +5914,14 @@ class SubagentLaunchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             loki.current_session().shell_cwd = tmpdir
             manager = mock.Mock()
-            manager.run_exec = mock.AsyncMock(return_value=(
-                types.SimpleNamespace(exit_code=0),
-                "exited",
-                "",
-                "",
-            ))
+            manager.run_exec = mock.Mock(return_value=captured_result(types.SimpleNamespace(exit_code=0)))
             with mock.patch.object(
                     loki, "current_job_manager",
                     return_value=manager):
                 asyncio.run(loki.run_agent_async(
                     "inspect", "inspect this"))
 
-            args, kwargs = manager.run_exec.await_args
+            args, kwargs = manager.run_exec.call_args
             self.assertEqual(kwargs["cwd"], os.getcwd())
             self.assertTrue(kwargs["session_owned"])
             self.assertTrue(kwargs["subagent"])
@@ -5934,6 +5929,18 @@ class SubagentLaunchTests(unittest.TestCase):
                 args[0][-2:],
                 ["--shell-cwd", tmpdir],
             )
+
+    def test_foreground_subagent_keeps_both_tails(self):
+        manager = mock.Mock(run_exec=mock.Mock(return_value=captured_result(
+            types.SimpleNamespace(exit_code=0), out=b'out-start ' + b'x' * 32 + b'out-end',
+            err=b'err-start ' + b'x' * 32 + b'err-end')))
+        with (mock.patch.object(loki, 'current_job_manager', return_value=manager),
+              mock.patch.object(loki.tool_contracts, 'BASH_MAX_OUTPUT_CHARS', len('out-end'))):
+            result = asyncio.run(loki.run_agent_async('inspect', 'inspect this'))
+        self.assertIn('[output truncated]\nout-end', result)
+        self.assertIn('[output truncated]\nerr-end', result)
+        self.assertNotIn('out-start', result)
+        self.assertNotIn('err-start', result)
 
     def test_subagent_receives_only_current_credential_capability(self):
         credential = (
@@ -5950,12 +5957,7 @@ class SubagentLaunchTests(unittest.TestCase):
         )
         effort_profile = _effort_profile("low", "high")
         manager = mock.Mock()
-        manager.run_exec = mock.AsyncMock(return_value=(
-            types.SimpleNamespace(exit_code=0),
-            "completed",
-            "",
-            "",
-        ))
+        manager.run_exec = mock.Mock(return_value=captured_result(types.SimpleNamespace(exit_code=0)))
         loki.apply_runtime_config(connections.make_runtime_config(
             "https://chatgpt.com/backend-api/codex/responses",
             protocols.OPENAI_RESPONSES,
@@ -5975,7 +5977,7 @@ class SubagentLaunchTests(unittest.TestCase):
             asyncio.run(loki.run_agent_async(
                 "inspect", "inspect this"))
 
-        _args, kwargs = manager.run_exec.await_args
+        _args, kwargs = manager.run_exec.call_args
         self.assertEqual(kwargs["credential_refs"], {credential})
         self.assertEqual(
             kwargs["env"]["LOKI_CREDENTIAL_REF"],

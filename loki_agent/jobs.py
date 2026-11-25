@@ -13,6 +13,7 @@ import signal
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import BinaryIO
 
 from . import credential_capabilities, executables, files, host_ipc, host_process
 from . import private_files
@@ -42,41 +43,47 @@ def _now_iso() -> str:
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
 
-def _decode_spooled_output(data: bytes) -> str:
-    try:
-        return data.decode('utf-8')
-    except UnicodeDecodeError:
-        return data.decode('utf-8', errors='replace')
-
-
-def _read_spool_tail(directory_fd, name: str,
-                     max_chars: int = tool_contracts.JOB_TAIL_CHARS) -> str:
-    """Read the last ``max_chars`` of one spool, relative to its directory.
-
-    The read resolves from the retained session handle, never a pathname, and
-    is bounded: it positions at most ``max_chars * 4`` bytes from the end
-    (UTF-8 may use multiple bytes per character; trimmed after decoding so the
-    character cap is stable).
-    """
-    if max_chars <= 0:
-        return ''
-    try:
-        fd = private_files.open_read_at(directory_fd, name)
-    except FileNotFoundError:
-        return ""
+def _open_capture(directory, name):
+    fd = private_files.open_read_at(directory, name)
     try:
         facts = private_files.information(fd)
         if not facts.regular or facts.reparse_point:
             raise OSError("job spool is not a regular file")
-        start = max(0, facts.size - max_chars * 4)
-        if start:
-            private_files.seek(fd, start, os.SEEK_SET)
-        text = _decode_spooled_output(private_files.read(fd, max_chars * 4 + 1))
-    finally:
+    except BaseException:
         private_files.close(fd)
-    if len(text) > max_chars:
-        return text[-max_chars:]
-    return text
+        raise
+    return private_files.binary_file(fd, 'rb')
+
+
+def _open_matching_capture(directory, name, writer):
+    """Return an owned reader bound to the child's write-only capture.
+
+    A duplicate of the writer would still be write-only. A separate relative
+    open can select a different file, so require matching, usable identities
+    before launch. On failure this function, not the caller, closes the reader.
+    """
+    reader = _open_capture(directory, name)
+    try:
+        original = os.fstat(writer.fileno())
+        opened = os.fstat(reader.fileno())
+        if not original.st_ino or original.st_dev != opened.st_dev or original.st_ino != opened.st_ino:
+            raise OSError(f'Could not verify {name} as the original command output')
+    except BaseException:
+        reader.close()
+        raise
+    return reader
+
+
+def _read_spool_tail(directory_fd, name: str,
+                     max_chars: int = tool_contracts.JOB_TAIL_CHARS) -> str:
+    if max_chars <= 0:
+        return ''
+    try:
+        stream = _open_capture(directory_fd, name)
+    except FileNotFoundError:
+        return ''
+    with stream:
+        return process_outputs.preview(stream, max_chars, tail=True)
 
 
 @dataclass
@@ -459,7 +466,13 @@ class JobManager:
                      background: bool, timeout_ms: int | None, shell: bool,
                      env: dict | None = None, cwd: str | None = None,
                      session_owned: bool = False,
-                     credential_refs=None, credential_authority=None, credential_destinations=None, subagent: bool = False) -> Job:
+                     credential_refs=None, credential_authority=None, credential_destinations=None,
+                     subagent: bool = False) -> tuple[Job, BinaryIO | None, BinaryIO | None]:
+        """Return the launched job followed by its stdout and stderr readers.
+
+        On foreground success, _foreground owns and closes both readers. If
+        launch fails, _spawn closes them. A background launch has no readers.
+        """
         if self._closed:
             raise RuntimeError('This conversation has closed')
         if session_owned and shell:
@@ -509,6 +522,9 @@ class JobManager:
         spawn_command = command
         proc = None
         job_dir_fd = None
+        reader_cleanup = contextlib.ExitStack()
+        stdout_reader = stderr_reader = None
+        launch_complete = False
 
         def check_starting():
             # Windows invokes this after stdio attachment but before resume;
@@ -551,6 +567,11 @@ class JobManager:
             job_dir_fd = self._job_directory(job_id, create=True)
             with self._open_spool_stream(job_dir_fd, 'stdout.log') as stdout_file, \
                     self._open_spool_stream(job_dir_fd, 'stderr.log') as stderr_file:
+                if not background:
+                    stdout_reader = reader_cleanup.enter_context(
+                        _open_matching_capture(job_dir_fd, 'stdout.log', stdout_file))
+                    stderr_reader = reader_cleanup.enter_context(
+                        _open_matching_capture(job_dir_fd, 'stderr.log', stderr_file))
                 # A job gets no input, so its stdin is a pipe with no writer
                 # rather than the null device: the AppContainer that confines
                 # the Windows runtime denies that device, so a DEVNULL stdin
@@ -618,7 +639,7 @@ class JobManager:
             check_starting()
             job.status = "running"
             self._write_metadata(job)
-            return job
+            launch_complete = True
         except BaseException as error:
             if proc is not None:
                 unpublished = job.status != 'running'
@@ -682,17 +703,23 @@ class JobManager:
             # Each independent owner must release its resource even if another
             # close fails. The session handle is retained; only this job's
             # transient lookup handle belongs to this launch.
-            async with contextlib.AsyncExitStack() as cleanup:
-                if credential_server is not None and not capability_handed_off:
-                    cleanup.push_async_callback(credential_server.close)
-                if owner_parent is not None and not parent_handed_off:
-                    cleanup.callback(host_ipc.close_end, owner_parent)
-                if credential_child is not None:
-                    cleanup.callback(host_ipc.close_end, credential_child)
-                if owner_child is not None:
-                    cleanup.callback(host_ipc.close_end, owner_child)
-                if job_dir_fd is not None:
-                    cleanup.callback(private_files.close, job_dir_fd)
+            with reader_cleanup:
+                async with contextlib.AsyncExitStack() as cleanup:
+                    if credential_server is not None and not capability_handed_off:
+                        cleanup.push_async_callback(credential_server.close)
+                    if owner_parent is not None and not parent_handed_off:
+                        cleanup.callback(host_ipc.close_end, owner_parent)
+                    if credential_child is not None:
+                        cleanup.callback(host_ipc.close_end, credential_child)
+                    if owner_child is not None:
+                        cleanup.callback(host_ipc.close_end, owner_child)
+                    if job_dir_fd is not None:
+                        cleanup.callback(private_files.close, job_dir_fd)
+                # Until launch and its cleanup both succeed, _spawn owns the
+                # readers, including a first reader if opening the second fails.
+                if launch_complete and not background:
+                    reader_cleanup.pop_all()
+        return job, stdout_reader, stderr_reader
 
     async def _wait_for_job(self, job: Job) -> int:
         return await job.process.wait()
@@ -722,22 +749,29 @@ class JobManager:
         finally:
             await self._close_credential_capability(job)
 
-    async def run_foreground(self, command, display_command: str, timeout_ms: int | None,
-                             description: str = "", shell: bool = False,
-                             output_chars: int = tool_contracts.BASH_MAX_OUTPUT_CHARS,
-                             env: dict | None = None, cwd: str | None = None,
-                             cancel_event: asyncio.Event | None = None,
-                             session_owned: bool = False,
-                             credential_refs=None, credential_authority=None,
-                             credential_destinations=None, subagent: bool = False):
-        job = await self._spawn(command, display_command, description, False, timeout_ms, shell,
-                                env=env, cwd=cwd,
-                                session_owned=session_owned,
-                                credential_refs=credential_refs,
-                                credential_authority=credential_authority,
-                                credential_destinations=credential_destinations,
-                                subagent=subagent)
+    @contextlib.asynccontextmanager
+    async def _foreground(self, command, display_command, timeout_ms,
+                          description='', shell=False, env=None, cwd=None,
+                          cancel_event=None, session_owned=False,
+                          credential_refs=None, credential_authority=None,
+                          credential_destinations=None, subagent=False):
+        """Run once and lend both captures until the caller finishes reading.
 
+        Bash shows a preview; searches choose their page before shortening it.
+        Both read the files selected at launch. Errors, interruption and normal
+        return all release the read handles here, without reopening the logs.
+        """
+        job, stdout, stderr = await self._spawn(
+            command, display_command, description, False, timeout_ms, shell,
+            env=env, cwd=cwd, session_owned=session_owned,
+            credential_refs=credential_refs, credential_authority=credential_authority,
+            credential_destinations=credential_destinations, subagent=subagent)
+        assert stdout is not None and stderr is not None
+        with stdout, stderr:
+            status = await self._finish_foreground(job, timeout_ms, cancel_event)
+            yield job, status, stdout, stderr
+
+    async def _finish_foreground(self, job, timeout_ms, cancel_event):
         exit_task = asyncio.create_task(self._wait_for_job(job))
         cancel_task = None
         try:
@@ -755,18 +789,17 @@ class JobManager:
                 # Cancellation wins a simultaneous finish. The watcher's later
                 # cancellation in finally is not evidence of user intent.
                 interrupted = cancel_event is not None and cancel_event.is_set()
-                if not interrupted and exit_task in done:
-                    self._record_exit(job, exit_task.result())
-                    await self._close_credential_capability(job)
-                    return job, "completed", self._spool_tail(job, 'stdout.log', output_chars), self._spool_tail(job, 'stderr.log', output_chars)
-
-            exit_code = await self._terminate_process_group(
-                job, signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
-            status = "cancelled" if interrupted else "timed_out"
-            job.status = status
+            if not interrupted and exit_task in done:
+                status = "completed"
+                exit_code = exit_task.result()
+            else:
+                exit_code = await self._terminate_process_group(
+                    job, signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
+                status = "cancelled" if interrupted else "timed_out"
+                job.status = status
             self._record_exit(job, exit_code)
             await self._close_credential_capability(job)
-            return job, status, self._spool_tail(job, 'stdout.log', output_chars), self._spool_tail(job, 'stderr.log', output_chars)
+            return status
         except BaseException:
             # Cover the entire ownership scope, including cancellation during
             # pre-wait cleanup or escalation, not just the initial wait.
@@ -783,6 +816,13 @@ class JobManager:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def run_foreground(self, command, display_command, timeout_ms, *,
+                             output_chars=tool_contracts.BASH_MAX_OUTPUT_CHARS, **options):
+        async with self._foreground(command, display_command, timeout_ms, **options) as result:
+            job, status, stdout, stderr = result
+            return (job, status, process_outputs.preview(stdout, output_chars, tail=True),
+                    process_outputs.preview(stderr, output_chars, tail=True))
 
     async def run_shell(self, command: str,
                         timeout: int | None = tool_contracts.BASH_DEFAULT_TIMEOUT_MS,
@@ -805,7 +845,7 @@ class JobManager:
         cwd = cwd or os.getcwd()
 
         if run_in_background:
-            job = await self._spawn(command, command, description, True, None, True, cwd=cwd)
+            job, _, _ = await self._spawn(command, command, description, True, None, True, cwd=cwd)
             try:
                 self._start_monitor(job)
             except RuntimeError:
@@ -850,25 +890,10 @@ class JobManager:
         return _shell_result(
             _bash_output(stdout, stderr, job.exit_code), structured=structured)
 
-    async def run_exec(self, argv: list[str], timeout_ms: int | None = None, description: str = "",
-                       output_chars: int = tool_contracts.BASH_MAX_OUTPUT_CHARS,
-                       env: dict | None = None, cwd: str | None = None,
-                       cancel_event: asyncio.Event | None = None,
-                       session_owned: bool = False,
-                       credential_refs=None, credential_authority=None,
-                       credential_destinations=None, subagent: bool = False):
+    def run_exec(self, argv: list[str], timeout_ms: int | None = None, **options):
         if not argv:
             raise ValueError("argv must not be empty")
-        return await self.run_foreground(argv, " ".join(argv), timeout_ms,
-                                         description=description, shell=False,
-                                         output_chars=output_chars, env=env,
-                                         cwd=cwd or os.getcwd(),
-                                         cancel_event=cancel_event,
-                                         session_owned=session_owned,
-                                         credential_refs=credential_refs,
-                                         credential_authority=credential_authority,
-                                         credential_destinations=credential_destinations,
-                                         subagent=subagent)
+        return self._foreground(argv, " ".join(argv), timeout_ms, shell=False, **options)
 
     async def run_background_exec(self, argv: list[str], description: str = "",
                                   env: dict | None = None, cwd: str | None = None,
@@ -877,13 +902,14 @@ class JobManager:
                                   credential_destinations=None, subagent: bool = False) -> Job:
         if not argv:
             raise ValueError("argv must not be empty")
-        job = await self._spawn(argv, " ".join(argv), description, True, None, False,
-                                env=env, cwd=cwd or os.getcwd(),
-                                session_owned=session_owned,
-                                credential_refs=credential_refs,
-                                credential_authority=credential_authority,
-                                credential_destinations=credential_destinations,
-                                subagent=subagent)
+        job, _, _ = await self._spawn(
+            argv, " ".join(argv), description, True, None, False,
+            env=env, cwd=cwd or os.getcwd(),
+            session_owned=session_owned,
+            credential_refs=credential_refs,
+            credential_authority=credential_authority,
+            credential_destinations=credential_destinations,
+            subagent=subagent)
         self._start_monitor(job)
         return job
 

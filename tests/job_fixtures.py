@@ -7,9 +7,10 @@ they do not disable the ordinary-child namespace or substitute a process.
 
 from contextlib import AsyncExitStack, asynccontextmanager
 import sys
+import tempfile
 
 from loki_entrypoints import entrypoint
-from loki_agent import host_process, jobs, private_files
+from loki_agent import host_process, jobs, private_files, process_outputs, tool_contracts
 
 
 def bootstrap_command():
@@ -41,6 +42,25 @@ def job_manager(base_dir, *, cleanup, async_cleanup=None, runner=None):
     else:
         cleanup(manager.close)
     return manager
+
+
+async def exec_preview(manager, argv, timeout_ms=None, **options):
+    """Finish a real direct job and return the test's text witnesses."""
+    async with manager.run_exec(argv, timeout_ms, **options) as execution:
+        job, status, stdout, stderr = execution
+        limit = tool_contracts.BASH_MAX_OUTPUT_CHARS
+        return job, status, process_outputs.preview(stdout, limit), process_outputs.preview(stderr, limit)
+
+
+@asynccontextmanager
+async def captured_result(job, status='completed', *, out=b'', err=b''):
+    """Substitute a completed child, not the code reading its capture."""
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        stdout.write(out)
+        stderr.write(err)
+        stdout.flush()
+        stderr.flush()
+        yield job, status, stdout, stderr
 
 
 @asynccontextmanager

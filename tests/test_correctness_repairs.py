@@ -11,7 +11,7 @@ import types
 import unittest
 from unittest import mock
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
-from job_fixtures import job_manager, managed_jobs
+from job_fixtures import exec_preview, job_manager, managed_jobs
 from process_lifecycle_fixtures import observe_fixture
 
 from loki_agent import (
@@ -907,8 +907,8 @@ class JobOwnershipContractTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             async with managed_jobs(os.path.join(tmpdir, "jobs")) as manager:
-                task = asyncio.create_task(manager.run_exec(
-                    [sys.executable, "-c", "import threading; threading.Event().wait()"],
+                task = asyncio.create_task(exec_preview(
+                    manager, [sys.executable, "-c", "import threading; threading.Event().wait()"],
                     cwd=tmpdir))
                 # Registration precedes launch. Observe a live process so this
                 # tests cancellation of running work, not cancellation before spawn.
@@ -1086,9 +1086,8 @@ class JobOwnershipContractTests(unittest.IsolatedAsyncioTestCase):
                 with mock.patch.object(manager, "_write_metadata",
                                        side_effect=OSError("metadata unavailable")):
                     with self.assertRaisesRegex(OSError, "metadata unavailable"):
-                        await manager.run_exec(
-                            [sys.executable, "-c",
-                             "import threading; threading.Event().wait()"],
+                        await exec_preview(
+                            manager, [sys.executable, "-c", "import threading; threading.Event().wait()"],
                             cwd=tmpdir, session_owned=True, subagent=True)
 
                 job = next(iter(manager.jobs.values()))
@@ -1108,8 +1107,8 @@ class JobOwnershipContractTests(unittest.IsolatedAsyncioTestCase):
                             manager, "_write_metadata",
                             side_effect=PermissionError("cannot record")):
                     with self.assertRaises(FileNotFoundError):
-                        await manager.run_exec(
-                            ["definitely-not-a-program"], cwd=tmpdir)
+                        await exec_preview(
+                            manager, ["definitely-not-a-program"], cwd=tmpdir)
 
     async def test_session_close_during_launch_does_not_publish_a_live_child(self):
         from loki_agent.acp_worker import Worker
@@ -1178,8 +1177,8 @@ class JobOwnershipContractTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             async with managed_jobs(os.path.join(tmpdir, "jobs")) as manager:
                 with self.assertRaises(OSError):
-                    await manager.run_exec(
-                        [os.path.join(tmpdir, "not-a-program")], 5_000,
+                    await exec_preview(
+                        manager, [os.path.join(tmpdir, "not-a-program")], 5_000,
                         cwd=tmpdir)
                 jobs = list(manager.jobs.values())
                 self.assertEqual(len(jobs), 1)
@@ -1200,8 +1199,8 @@ class JobOwnershipContractTests(unittest.IsolatedAsyncioTestCase):
             async with managed_jobs(os.path.join(tmpdir, "jobs")) as manager:
                 manager._active_subagents = tool_contracts.MAX_ACTIVE_DIRECT_SUBAGENTS
                 with self.assertRaises(job_runtime.SubagentCapacityError):
-                    await manager.run_exec(
-                        [os.path.join(tmpdir, "not-a-program")], 5_000,
+                    await exec_preview(
+                        manager, [os.path.join(tmpdir, "not-a-program")], 5_000,
                         cwd=tmpdir, session_owned=True, subagent=True)
 
                 self.assertEqual(manager._active_subagents,

@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from job_fixtures import captured_result
 from loki_entrypoints import child_environment, configure_container, loki_command
 from test_acps import _ACPFrontFixture
 from loki_agent import formats, loki, models, protocols, subagents
@@ -100,12 +101,12 @@ class ThinkingDelegationTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase
         command = loki_command()
         job = mock.Mock(id="j", cwd="cwd", pid=1, pgid=1, status="running", exit_code=0,
                         stdout_path="out", stderr_path="err")
-        manager = mock.Mock(run_exec=mock.AsyncMock(return_value=[job, "completed", "answer", ""]),
+        manager = mock.Mock(run_exec=mock.Mock(return_value=captured_result(job, out=b'answer')),
                             run_background_exec=mock.AsyncMock(return_value=job))
         with mock.patch.object(loki, "current_job_manager", return_value=manager), mock.patch.object(sys, "argv", [command[-1]]):
             await loki.run_agent_async("task", "prompt", thinking=snapshot)
             await loki.run_agent_async("task", "prompt", run_in_background=True, thinking=snapshot)
-        for call in [manager.run_exec.await_args, manager.run_background_exec.await_args]:
+        for call in [manager.run_exec.call_args, manager.run_background_exec.await_args]:
             self.assertEqual(call.args[0][:len(command)], command)
             data = json.loads(call.kwargs["env"]["LOKI_TURN_THINKING"])
             self.assertEqual(data["settings"]["mode"], "manual")

@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import errno
 import hashlib
+import io
 import os
 import stat
 import sys
@@ -497,6 +498,89 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
     return f"Successfully edited {file_path} ({count} replacement{'s' if count != 1 else ''})."
 
 
+async def _read_search_page(stream, *, separators, limit, cancel_event, tool, offset=0):
+    """Page ripgrep's captured records, keeping only what will be shown.
+
+    A text preview cannot count all Glob matches or reach a late Grep page.
+    Read the shared capture before clipping, without keeping it all in memory.
+    A long content line can use the remaining display space; do not skip it
+    and show later records in its place.
+    """
+    max_chars = tool_contracts.BASH_MAX_OUTPUT_CHARS
+    page = io.StringIO()
+    record_bytes = bytearray()
+    total = shown = field = 0
+    pending = clipped = record_oversized = False
+    # Count output is path NUL decimal-count LF. Content uses LF, not NUL.
+    separators = separators.encode('ascii')
+    last_field = len(separators) - 1
+    uses_lines = separators.endswith(b'\n')
+    content_lines = separators == b'\n'
+    starts_with_name = separators.startswith(b'\0')
+
+    def finish_record():
+        nonlocal total, shown, field, pending, clipped, record_oversized
+        if not clipped and offset <= total and (not limit or total < offset + limit):
+            record = record_bytes.decode('utf-8', errors='replace')
+            if uses_lines:
+                record = record.removesuffix('\r')
+            room = max_chars - page.tell() - bool(shown)
+            clipped = record_oversized or len(record) > room
+            if not clipped or (content_lines and room > 0):
+                if shown:
+                    page.write('\n')
+                page.write(record[:room] if clipped else record)
+                shown += 1
+        record_bytes.clear()
+        total += 1
+        field = 0
+        pending = record_oversized = False
+
+    for chunk in process_outputs.capture_chunks(stream):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError(f'{tool} search was cancelled by the user')
+        start = 0
+        while start < len(chunk):
+            mark = chunk.find(separators[field], start)
+            end = len(chunk) if mark < 0 else mark
+            if not pending and starts_with_name and end == start:
+                raise RuntimeError('ripgrep returned an empty filename')
+            pending = True
+            if not clipped and not record_oversized and offset <= total and (not limit or total < offset + limit):
+                count_separator = mark >= 0 and field < last_field
+                # UTF-8 uses at most four bytes per character. Leave room
+                # for a trailing CR stripped before the final character check.
+                room = max_chars - page.tell() - bool(shown) + uses_lines
+                byte_room = 4 * room - len(record_bytes)
+                if end - start + count_separator > byte_room:
+                    if content_lines:
+                        record_bytes.extend(chunk[start:start + byte_room])
+                        record_oversized = True
+                    else:
+                        clipped = True
+                        record_bytes.clear()
+                else:
+                    record_bytes.extend(chunk[start:end])
+                    if count_separator:
+                        record_bytes.extend(b':')
+            if mark < 0:
+                break
+            start = end + 1
+            if field == last_field:
+                finish_record()
+            else:
+                field += 1
+        # Scan a large capture without starving the turn's cancel watcher.
+        await asyncio.sleep(0)
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError(f'{tool} search was cancelled by the user')
+    if pending:
+        if separators != b'\n':
+            raise RuntimeError('ripgrep returned an incomplete file listing')
+        finish_record()
+    return page.getvalue(), total, clipped
+
+
 async def run_glob_async(
         pattern: str, path: str | None = None,
         cancel_event: asyncio.Event | None = None, *,
@@ -507,37 +591,28 @@ async def run_glob_async(
     if not rg:
         raise FileNotFoundError('ripgrep binary not found. Install rg.')
     root = resolve_path(path, cwd) if path else cwd
-    args = [rg, '--files', '--color=never']
+    # Keep recently changed files at the start, where the preview keeps them.
+    # Ripgrep sorts the actual entries; Loki never looks up printed names.
+    args = [rg, '--files', '--color=never', '--sortr', 'modified', '--null']
     if hidden:
         args.append('--hidden')
     if no_ignore:
         args.append('--no-ignore')
     args.extend(['--glob', pattern, root])
     start = time.perf_counter()
-    job, status, stdout, stderr = await run_exec(
-        args, description=f"Glob {pattern!r}",
-        cancel_event=cancel_event)
-    if status == "cancelled":
-        raise RuntimeError('glob search was cancelled by the user')
+    async with run_exec(args, description=f"Glob {pattern!r}", cancel_event=cancel_event) as result:
+        job, status, stdout, stderr = result
+        if status == "cancelled":
+            raise RuntimeError('glob search was cancelled by the user')
+        if job.exit_code not in [0, 1]:
+            error = process_outputs.preview(stderr, tool_contracts.BASH_MAX_OUTPUT_CHARS).strip()
+            raise RuntimeError(f'ripgrep failed with exit code {job.exit_code}' + (f'\n{error}' if error else ''))
+        matches, num_files, clipped = '', 0, False
+        if job.exit_code == 0:
+            matches, num_files, clipped = await _read_search_page(
+                stdout, separators='\0', limit=GLOB_MAX_RESULTS, cancel_event=cancel_event, tool='glob')
     duration_ms = int((time.perf_counter() - start) * 1000)
-    stderr = stderr.strip()
-    if job.exit_code not in [0, 1]:
-        raise RuntimeError(f'ripgrep failed with exit code {job.exit_code}' + (f'\n{stderr}' if stderr else ''))
-    matches = stdout.splitlines()
-    num_files = len(matches)
-    truncated = len(matches) > GLOB_MAX_RESULTS
-
-    def mtime_or_zero(file_path: str) -> float:
-        try:
-            return os.path.getmtime(file_path)
-        except OSError:
-            return 0
-
-    # Put recently changed files first because coding tasks usually care about
-    # active work more than lexicographic directory order.
-    matches.sort(key=mtime_or_zero, reverse=True)
-    matches = matches[:GLOB_MAX_RESULTS]
-    if not matches:
+    if not num_files:
         result = f"No files matched pattern {pattern!r} in {root}"
         hints = []
         if not hidden:
@@ -547,12 +622,14 @@ async def run_glob_async(
         if hints:
             result += "\nNote: " + "; ".join(hints) + "."
         return result
+    truncated = clipped or num_files > GLOB_MAX_RESULTS
     return "\n".join([
         f"duration_ms: {duration_ms}",
         f"num_files: {num_files}",
         f"truncated: {str(truncated).lower()}",
+        *([process_outputs.OUTPUT_TRUNCATED] if clipped else []),
         "[filenames]",
-        *matches,
+        matches,
     ])
 
 
@@ -566,12 +643,6 @@ def _parse_nonnegative_int(value, name: str, default: int | None = None) -> tupl
     if number < 0:
         return None, f"Error: {name} must be non-negative"
     return number, None
-
-
-def _select_limited(lines: list[str], offset: int, head_limit: int) -> tuple[list[str], bool]:
-    if head_limit == 0:
-        return lines[offset:], False
-    return lines[offset:offset + head_limit], len(lines) > offset + head_limit
 
 
 async def run_grep_async(pattern: str, path: str | None = None, glob: str | None = None,
@@ -596,10 +667,15 @@ async def run_grep_async(pattern: str, path: str | None = None, glob: str | None
 
     args = [rg, '--color=never']
     if output_mode == 'files_with_matches':
-        args.append('--files-with-matches')
+        args.extend(['--files-with-matches', '--null'])
+        separators = '\0'
     elif output_mode == 'count':
-        args.extend(['--count-matches', '--with-filename'])
+        args.extend(['--count-matches', '--with-filename', '--null'])
+        separators = '\0\n'
     else:
+        # Page the lines ripgrep actually prints, preserving its context and
+        # only-matching modes. JSON output would not honour the same flags.
+        separators = '\n'
         args.append('--with-filename')
         if kwargs.get('-n', True):
             args.append('--line-number')
@@ -638,28 +714,29 @@ async def run_grep_async(pattern: str, path: str | None = None, glob: str | None
     args.extend(['--', pattern, root])
 
     start = time.perf_counter()
-    job, status, stdout, stderr = await run_exec(
-        args, description=f"Grep {pattern!r}",
-        cancel_event=cancel_event)
-    if status == "cancelled":
-        raise RuntimeError('grep search was cancelled by the user')
+    async with run_exec(args, description=f"Grep {pattern!r}", cancel_event=cancel_event) as result:
+        job, status, stdout, stderr = result
+        if status == "cancelled":
+            raise RuntimeError('grep search was cancelled by the user')
+        if job.exit_code not in [0, 1]:
+            error = process_outputs.preview(stderr, tool_contracts.BASH_MAX_OUTPUT_CHARS).strip()
+            raise RuntimeError(f'ripgrep failed with exit code {job.exit_code}' + (f'\n{error}' if error else ''))
+        if job.exit_code == 1:
+            return f"No matches for {pattern!r}"
+        selected, num_entries, clipped = await _read_search_page(
+            stdout, separators=separators, limit=head_limit, offset=offset_n, cancel_event=cancel_event, tool='grep')
     duration_ms = int((time.perf_counter() - start) * 1000)
-    stderr = stderr.strip()
-    if job.exit_code not in [0, 1]:
-        raise RuntimeError(f'ripgrep failed with exit code {job.exit_code}' + (f'\n{stderr}' if stderr else ''))
-
-    lines = stdout.splitlines()
-    selected, truncated = _select_limited(lines, offset_n, head_limit)
-    if not selected:
+    if offset_n >= num_entries:
         return f"No matches for {pattern!r}"
-    result = "\n".join([
+    truncated = clipped or (head_limit > 0 and num_entries > offset_n + head_limit)
+    return "\n".join([
         f"mode: {output_mode}",
         f"duration_ms: {duration_ms}",
-        f"num_entries: {len(lines)}",
+        f"num_entries: {num_entries}",
         f"applied_offset: {offset_n}",
         f"applied_limit: {head_limit}",
         f"truncated: {str(truncated).lower()}",
+        *([process_outputs.OUTPUT_TRUNCATED] if clipped else []),
         "[results]",
-        *selected,
+        selected,
     ])
-    return process_outputs.truncate_text(result, tool_contracts.BASH_MAX_OUTPUT_CHARS)

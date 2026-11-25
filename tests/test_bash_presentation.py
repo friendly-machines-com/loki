@@ -114,6 +114,16 @@ class PresentationTests(unittest.TestCase):
         self.assertNotIn("important-stderr", event["content"])
         self.assertIn("important-stderr", self.render(event))
 
+    def test_preview_rejects_a_short_read_of_the_sampled_range(self):
+        with tempfile.TemporaryFile() as capture:
+            capture.write(b'visible')
+            capture.flush()
+            with mock.patch.object(process_outputs.os, 'fstat', return_value=types.SimpleNamespace(st_size=64)):
+                for tail, limit in [[False, 32], [True, 32], [True, 4]]:
+                    with self.subTest(tail=tail, limit=limit):
+                        with self.assertRaisesRegex(OSError, 'output ended before the preview'):
+                            process_outputs.preview(capture, limit, tail=tail)
+
     def test_preamble_notes_are_visible_even_with_hidden_stdout(self):
         event = process_event()
         event["process_output"]["preamble"] = "Hook warning\n\n"

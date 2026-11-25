@@ -243,11 +243,12 @@ class JobProcessGroupTests(unittest.IsolatedAsyncioTestCase):
                     real_spawn = manager._spawn
 
                     async def held_spawn(*args, **kwargs):
-                        group.job = await real_spawn(*args, **kwargs)
+                        result = await real_spawn(*args, **kwargs)
+                        group.job, _, _ = result
                         spawned.set()
                         await release.wait()
                         waiting.set()
-                        return group.job
+                        return result
 
                     timeout = 20 if cause in ['timeout', 'during_cleanup'] else None
                     with group.grace_clock() as clock, \
@@ -297,9 +298,10 @@ class JobProcessGroupTests(unittest.IsolatedAsyncioTestCase):
             cancel_event = asyncio.Event()
 
             async def capture_spawn(*args, **kwargs):
-                group.job = await real_spawn(*args, **kwargs)
+                result = await real_spawn(*args, **kwargs)
+                group.job, _, _ = result
                 spawned.set()
-                return group.job
+                return result
 
             with group.grace_clock() as clock, \
                     mock.patch.object(manager, '_spawn', side_effect=capture_spawn):
@@ -378,9 +380,10 @@ class JobProcessGroupTests(unittest.IsolatedAsyncioTestCase):
             spawned = asyncio.Event()
 
             async def capture_spawn(*args, **kwargs):
-                group.job = await real_spawn(*args, **kwargs)
+                result = await real_spawn(*args, **kwargs)
+                group.job, _, _ = result
                 spawned.set()
-                return group.job
+                return result
 
             with mock.patch.object(manager, '_spawn', side_effect=capture_spawn):
                 group.task = asyncio.create_task(manager.run_foreground(

@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
-from job_fixtures import job_manager, managed_jobs
+from job_fixtures import exec_preview, job_manager, managed_jobs
 from loki_agent import executables, host_ipc
 
 
@@ -67,8 +67,8 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             workspace = root / "workspace"
             workspace.mkdir()
             async with managed_jobs(str(root / "jobs")) as manager:
-                job, status, stdout, stderr = await manager.run_exec(
-                    [sys.executable, "-c", _REPORTS_EOF],
+                job, status, stdout, stderr = await exec_preview(
+                    manager, [sys.executable, "-c", _REPORTS_EOF],
                     description="noninteractive stdin", cwd=str(workspace))
             self.assertEqual(status, "completed", stderr)
             self.assertEqual(job.status, "exited", stderr)
@@ -125,9 +125,8 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             workspace = root / "workspace"
             workspace.mkdir()
             async with managed_jobs(str(root / "jobs")) as manager:
-                job, status, stdout, stderr = await manager.run_exec(
-                    [sys.executable, "-c", _REPORTS_EOF,
-                     "--color=never", "--", "marker"],
+                job, status, stdout, stderr = await exec_preview(
+                    manager, [sys.executable, "-c", _REPORTS_EOF, "--color=never", "--", "marker"],
                     description="search child stdin", cwd=str(workspace))
             self.assertEqual(status, "completed", stderr)
             self.assertEqual(job.exit_code, 0, stderr)
@@ -147,8 +146,8 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             workspace = root / "workspace"
             workspace.mkdir()
             async with managed_jobs(str(root / "jobs")) as manager:
-                job, status, stdout, stderr = await manager.run_exec(
-                    [sys.executable, "-c", _REPORTS_EOF],
+                job, status, stdout, stderr = await exec_preview(
+                    manager, [sys.executable, "-c", _REPORTS_EOF],
                     description="subagent stdin", cwd=str(workspace),
                     session_owned=True, subagent=True)
             self.assertEqual(status, "completed", stderr)
@@ -208,8 +207,8 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                                   async_cleanup=job_scope.push_async_callback)
             cancel = asyncio.Event()
             try:
-                task = asyncio.create_task(manager.run_exec(
-                    [sys.executable, str(script)],
+                task = asyncio.create_task(exec_preview(
+                    manager, [sys.executable, str(script)],
                     description="cancelled stdin", cwd=str(workspace),
                     cancel_event=cancel))
                 # Wait for the child's own marker: it has reported EOF and is
@@ -269,8 +268,8 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             workspace = root / "workspace"
             workspace.mkdir()
             async with managed_jobs(str(root / "jobs")) as manager:
-                await manager.run_exec(
-                    [sys.executable, "-c", _REPORTS_EOF],
+                await exec_preview(
+                    manager, [sys.executable, "-c", _REPORTS_EOF],
                     description="stdin ownership", cwd=str(workspace))
                 job, = [job for job in manager.jobs.values()]
                 stdin = getattr(job.process, "stdin", None)
@@ -291,8 +290,8 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             workspace.mkdir()
             async with managed_jobs(str(root / "jobs")) as manager:
                 with self.assertRaises(FileNotFoundError):
-                    await manager.run_exec(
-                        ["definitely-not-a-real-program"],
+                    await exec_preview(
+                        manager, ["definitely-not-a-real-program"],
                         description="stdin leak on failure", cwd=str(workspace))
                 for job in manager.jobs.values():
                     self.assertIsNone(

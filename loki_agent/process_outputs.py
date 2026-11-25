@@ -10,8 +10,11 @@ content remains intact. Nothing here trusts presentation data as process state.
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, fields
 
+
+OUTPUT_TRUNCATED = "[output truncated]"
 
 MEDIA_PLACEHOLDERS = {
     "image": "[Image content]",
@@ -100,3 +103,38 @@ def truncate_text(s: str, max_chars: int) -> str:
     if len(s) <= max_chars:
         return s
     return s[:max_chars] + f"\n... [output truncated: {len(s)} chars total, {max_chars} shown]"
+
+
+def preview(stream, max_chars: int, *, tail=False) -> str:
+    """Preview a sampled range; an early EOF is not intentional clipping."""
+    if max_chars <= 0:
+        return ''
+    size = os.fstat(stream.fileno()).st_size
+    start = max(0, size - max_chars * 4) if tail else 0
+    length = min(size - start, max_chars * 4 + 1)
+    stream.seek(start)
+    data = stream.read(length)
+    if len(data) < length:
+        raise OSError('Command output ended before the preview could be read.')
+    text = data.decode('utf-8', errors='replace')
+    if tail:
+        return OUTPUT_TRUNCATED + '\n' + text[-max_chars:] if start or len(text) > max_chars else text
+    if len(text) > max_chars or len(data) < size:
+        return text[:max_chars] + '\n' + OUTPUT_TRUNCATED
+    return text
+
+
+def capture_chunks(stream):
+    """Read the same capture from the beginning, before a search picks its page.
+
+    Unlike preview(), this stops at the opening size, not the display limit.
+    The caller keeps the stream open; nothing here reopens or owns the file.
+    """
+    remaining = os.fstat(stream.fileno()).st_size
+    stream.seek(0)
+    while remaining:
+        chunk = stream.read(min(remaining, 64 * 1024))
+        if not chunk:
+            raise OSError('Search output ended before it could be read in full.')
+        remaining -= len(chunk)
+        yield chunk

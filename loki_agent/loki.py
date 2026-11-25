@@ -2322,17 +2322,19 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
             credential_destinations=destinations, subagent=True)
         return _format_started_background_job(job, 'subagent')
 
-    job, status, stdout, stderr = await manager.run_exec(
-        argv,
-        description=description or 'subagent task',
-        env=environment, cwd=os.getcwd(), cancel_event=cancel_event,
-        session_owned=True,
-        credential_refs=references, credential_authority=authority,
-        credential_destinations=destinations, subagent=True)
-    if status == 'cancelled':
-        raise RuntimeError('subagent was cancelled by the user')
-    result = _format_subagent_result(agent_type, description, "completed",
-                                     job.exit_code, stdout, stderr)
+    async with manager.run_exec(
+            argv, description=description or 'subagent task',
+            env=environment, cwd=os.getcwd(), cancel_event=cancel_event,
+            session_owned=True, credential_refs=references, credential_authority=authority,
+            credential_destinations=destinations, subagent=True) as execution:
+        job, status, stdout, stderr = execution
+        if status == 'cancelled':
+            raise RuntimeError('subagent was cancelled by the user')
+        limit = tool_contracts.BASH_MAX_OUTPUT_CHARS
+        result = _format_subagent_result(
+            agent_type, description, "completed", job.exit_code,
+            process_outputs.preview(stdout, limit, tail=True),
+            process_outputs.preview(stderr, limit, tail=True))
     if job.exit_code != 0:
         raise RuntimeError(f'subagent exited with code {job.exit_code}\n{result}')
     return result

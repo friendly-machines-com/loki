@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from job_fixtures import job_manager
+from job_fixtures import exec_preview, job_manager
 from loki_agent import authentications, credential_storages, files, jobs
 from loki_agent import private_files, response_headers, settings, windows_api
 
@@ -61,7 +61,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         (decoy_job / 'stdout.log').write_text('FORGED STDOUT')
         (decoy_job / 'stderr.log').write_text('FORGED STDERR')
         (decoy_job / 'job.json').write_text('FORGED METADATA')
-        first, status, stdout, stderr = await manager.run_exec([
+        first, status, stdout, stderr = await exec_preview(manager, [
             sys.executable, '-c', "import sys; print('real output'); print('real error', file=sys.stderr)"])
         self.assertEqual(status, 'completed')
         self.assertEqual(stdout, 'real output' + os.linesep)
@@ -75,18 +75,35 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('owner diagnostic', (original / 'stderr.log').read_text())
         self.assertEqual(json.loads((original / 'job.json').read_text())['description'], 'updated metadata')
         self.assertEqual((decoy_job / 'job.json').read_text(), 'FORGED METADATA')
-        second, _, second_out, _ = await manager.run_exec([sys.executable, '-c', "print('second')"])
+        second, _, second_out, _ = await exec_preview(manager, [sys.executable, '-c', "print('second')"])
         self.assertEqual(second_out, 'second' + os.linesep)
         self.assertTrue((original.parent / second.id / 'stdout.log').exists())
         self.assertFalse((decoy_session / second.id).exists())
         with self.assertRaises(OSError):
-            await manager.run_exec([str(self.root / 'does-not-exist')])
+            await exec_preview(manager, [str(self.root / 'does-not-exist')])
         self.assertIn('launch failed', (original.parent / '3' / 'stderr.log').read_text())
         self.assertEqual((decoy_job / 'stdout.log').read_text(), 'FORGED STDOUT')
         await manager.aclose()
         self.assertIsNone(manager._session_fd)
         with self.assertRaisesRegex(ValueError, 'closed'):
             manager.job_status(first.id)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX unlink of an open file')
+    async def test_foreground_reply_reads_the_original_capture_after_unlink(self):
+        manager = job_manager(str(self.parent), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup)
+        wait = manager._wait_for_job
+
+        async def remove_name_after_exit(job):
+            exit_code = await wait(job)
+            os.unlink(job.stdout_path)
+            return exit_code
+
+        with mock.patch.object(manager, '_wait_for_job', remove_name_after_exit):
+            job, status, stdout, stderr = await exec_preview(manager, [sys.executable, '-c', "print('captured')"])
+        self.assertEqual(status, 'completed', stderr)
+        self.assertEqual(job.exit_code, 0, stderr)
+        self.assertEqual(stdout, 'captured\n')
+        self.assertFalse(os.path.exists(job.stdout_path))
 
     async def test_job_output_handles_allow_overwrite_and_truncate_but_refuse_replacement(self):
         """Jobs own their capture bytes, but creation must not overwrite an existing entry."""
@@ -129,7 +146,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
                     job = await manager.run_background_exec(command)
                     await job.process.wait()
                 else:
-                    job, status, output, errors = await manager.run_exec(command)
+                    job, status, output, errors = await exec_preview(manager, command)
                     self.assertEqual(status, 'completed')
                     self.assertEqual(output, stdout)
                     self.assertEqual(errors, stderr)
@@ -351,9 +368,9 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         target.mkdir()
         (Path(manager.session_dir) / '1').symlink_to(target, target_is_directory=True)
         with self.assertRaises(OSError):
-            await manager.run_exec([sys.executable, '-c', "print('must not run')"])
+            await exec_preview(manager, [sys.executable, '-c', "print('must not run')"])
         self.assertEqual(list(target.iterdir()), [])
-        job, _, _, _ = await manager.run_exec([sys.executable, '-c', "print('ok')"])
+        job, _, _, _ = await exec_preview(manager, [sys.executable, '-c', "print('ok')"])
         os.unlink(job.stdout_path)
         os.mkfifo(job.stdout_path)
         with self.assertRaisesRegex(OSError, 'regular file'):
