@@ -372,7 +372,7 @@ class LaunchTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(api, 'token_is_app_container', return_value=contained), \
                 mock.patch.object(api, 'token_app_container_sid', return_value='package'), \
                 mock.patch.object(api, 'token_capabilities', return_value=(
-                    [[sid, api.SE_GROUP_ENABLED] for sid in sorted(runtime._NETWORK_CAPABILITIES)]
+                    [(sid, api.SE_GROUP_ENABLED) for sid in sorted(runtime._NETWORK_CAPABILITIES)]
                     if capabilities is None else capabilities)), \
                 mock.patch.object(api, 'resume_thread',
                                   side_effect=lambda *args: events.append('resume')), \
@@ -411,10 +411,15 @@ class LaunchTests(unittest.IsolatedAsyncioTestCase):
                              sorted(runtime._NETWORK_CAPABILITIES))
             self.assertEqual(create.call_args.kwargs['object_security'],
                              'D:P(A;;GA;;;S-1-5-21-1)(A;;GA;;;SY)(A;;GA;;;BA)')
-            self.assertEqual(create.call_args.kwargs['inherited_handles'],
-                             [40, 41, 130, 131, 132] if stdio is None else [40, 41, 132, *stdio])
-            self.assertEqual(create.call_args.kwargs['standard_handles'],
-                             [130, 131, 132] if stdio is None else [*stdio, 132])
+            if stdio is None:
+                expected_handles = [40, 41, 130, 131, 132]
+                expected_stdio = (130, 131, 132)
+            else:
+                stdin, stdout = stdio
+                expected_handles = [40, 41, 132, stdin, stdout]
+                expected_stdio = (stdin, stdout, 132)
+            self.assertEqual(create.call_args.kwargs['inherited_handles'], expected_handles)
+            self.assertEqual(create.call_args.kwargs['standard_handles'], expected_stdio)
             # Stdio remains borrowed; only our duplicate and native owners close.
             self.assertCountEqual([call.args[0] for call in close.call_args_list],
                                   [*([22] if not creation_failure else []),
@@ -441,13 +446,13 @@ class LaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('resume', events)
 
     async def test_extra_capabilities_are_terminated_without_resume(self):
-        enabled = [[sid, api.SE_GROUP_ENABLED] for sid in sorted(runtime._NETWORK_CAPABILITIES)]
-        events = await self.exercise(True, capabilities=enabled + [['unexpected-capability', api.SE_GROUP_ENABLED]])
+        enabled = [(sid, api.SE_GROUP_ENABLED) for sid in sorted(runtime._NETWORK_CAPABILITIES)]
+        events = await self.exercise(True, capabilities=enabled + [('unexpected-capability', api.SE_GROUP_ENABLED)])
         self.assertIn('terminate', events)
         self.assertNotIn('resume', events)
 
     async def test_disabled_capabilities_are_terminated_without_resume(self):
-        events = await self.exercise(True, capabilities=[[sid, 0] for sid in sorted(runtime._NETWORK_CAPABILITIES)])
+        events = await self.exercise(True, capabilities=[(sid, 0) for sid in sorted(runtime._NETWORK_CAPABILITIES)])
         self.assertIn('terminate', events)
         self.assertNotIn('resume', events)
 
@@ -493,7 +498,7 @@ class LocalLaunchTests(unittest.TestCase):
                 return lambda *args: 88
             if name == 'AssignProcessToJobObject':
                 def assign(job, process):
-                    seen['job_events'].append(['assign', job, process])
+                    seen['job_events'].append(('assign', job, process))
                     if seen.get('fail_assignment'):
                         raise OSError('assignment refused')
                     return 1
@@ -501,7 +506,7 @@ class LocalLaunchTests(unittest.TestCase):
             if name == 'SetInformationJobObject':
                 def restrict(job, kind, value, size):
                     seen['ui_flags'] = ctypes.cast(value, ctypes.POINTER(ctypes.c_uint32))[0]
-                    seen['job_events'].append(['restrict', job, kind, seen['ui_flags']])
+                    seen['job_events'].append(('restrict', job, kind, seen['ui_flags']))
                     return 1
                 return restrict
             if name == 'QueryInformationJobObject':
@@ -517,8 +522,8 @@ class LocalLaunchTests(unittest.TestCase):
             raise AssertionError('unexpected native call: ' + name)
 
         role = runtime.state.tool_role_sid('S-1-15-2-1')
-        original_sids = [['S-1-5-21-2', 0]]
-        filtered_sids = [*original_sids, [role, 7]]
+        original_sids = [('S-1-5-21-2', 0)]
+        filtered_sids = [*original_sids, (role, 7)]
         values = {
             'bind': job_call,
             'current_process_handle': lambda: 99,
@@ -529,13 +534,13 @@ class LocalLaunchTests(unittest.TestCase):
             'token_integrity_level': lambda token: 'S-1-16-4096',
             'token_restricting_sids': lambda token: original_sids if owning or token == 44 else filtered_sids,
             'token_capabilities': lambda token: [] if token == 66 and mismatch == 'capabilities' else [
-                [sid, api.SE_GROUP_ENABLED] for sid in sorted(runtime._NETWORK_CAPABILITIES)],
+                (sid, api.SE_GROUP_ENABLED) for sid in sorted(runtime._NETWORK_CAPABILITIES)],
             'token_logon_sid': lambda token: 'S-1-5-5-0-99',
             'create_write_restricted_token': mock.Mock(return_value=77),
             'token_default_dacl': lambda token: original if token == 44 else private if token == 66 and owning else compatible,
             'duplicate_primary_token': lambda *args: 77,
             'acl_sddl': lambda acl: 'D:existing-grants',
-            'set_token_default_dacl': lambda *args: seen['sets'].append(list(args)) or (private if args[0] == 66 else compatible),
+            'set_token_default_dacl': lambda token, dacl: seen['sets'].append((token, dacl)) or (private if token == 66 else compatible),
             'close_handle': seen['closed'].append,
             'create_process_suspended': mock.Mock(return_value=info),
             'resume_thread': mock.Mock(),
@@ -555,10 +560,10 @@ class LocalLaunchTests(unittest.TestCase):
                 process = runtime.ContainedProcess(None)
                 cwd = '/trusted' if owning else '/workspace'
                 runtime.prepare_local(process, ['/chosen/image.exe', '--subagent'], {'SAFE': 'yes'},
-                                      cwd, [21, 22, 23, 31], [21, 22, 23], owning=owning)
+                                      cwd, [21, 22, 23, 31], (21, 22, 23), owning=owning)
                 self.assertEqual(process.pid, 103)
                 call = seen['create'].call_args
-                self.assertEqual(list(call.args), ['/chosen/image.exe', ['--subagent']])
+                self.assertEqual(call.args, ('/chosen/image.exe', ['--subagent']))
                 self.assertEqual(call.kwargs['current_directory'], cwd)
                 self.assertEqual(call.kwargs['primary_token'], 77)
                 self.assertFalse(call.kwargs['search_path'])
@@ -572,9 +577,9 @@ class LocalLaunchTests(unittest.TestCase):
                                      [role, *runtime.state.TOOL_COMPATIBILITY_SIDS, 'S-1-5-5-0-99'])
                 else:
                     seen['filter'].assert_not_called()
-                self.assertEqual(seen['sets'][0], [77, compatible])
+                self.assertEqual(seen['sets'][0], (77, compatible))
                 private = 'D:P(A;;GA;;;S-1-5-21-1)(A;;GA;;;SY)(A;;GA;;;BA)'
-                self.assertEqual(seen['sets'][1:], [[66, private]] if owning else [])
+                self.assertEqual(seen['sets'][1:], [(66, private)] if owning else [])
                 self.assertNotIn(44, [entry[0] for entry in seen['sets']])
                 self.assertCountEqual(seen['closed'], [44, 55, 66, 77])
                 seen['resume'].assert_not_called()
@@ -588,10 +593,10 @@ class LocalLaunchTests(unittest.TestCase):
                 process = runtime.ContainedProcess(None)
                 try:
                     runtime.prepare_local(
-                        process, ['/chosen/image.exe'], {}, '/workspace', [], [1, 2, 3],
+                        process, ['/chosen/image.exe'], {}, '/workspace', [], (1, 2, 3),
                         owning=owning)
-                    self.assertEqual(seen['job_events'], [['assign', 88, 101]] if owning else [
-                        ['assign', 88, 101], ['restrict', 88, 4, 1]])
+                    self.assertEqual(seen['job_events'], [('assign', 88, 101)] if owning else [
+                        ('assign', 88, 101), ('restrict', 88, 4, 1)])
                     seen['resume'].assert_not_called()
                 finally:
                     process.close()
@@ -603,7 +608,7 @@ class LocalLaunchTests(unittest.TestCase):
             try:
                 with self.assertRaisesRegex(OSError, 'assignment refused'):
                     runtime.prepare_local(
-                        process, ['/chosen/image.exe'], {}, '/workspace', [], [1, 2, 3],
+                        process, ['/chosen/image.exe'], {}, '/workspace', [], (1, 2, 3),
                         owning=False)
                 # An empty leaf job cannot terminate the suspended child.
                 # Close it locally; the factory must still retire the child.
@@ -623,7 +628,7 @@ class LocalLaunchTests(unittest.TestCase):
                 try:
                     with self.assertRaisesRegex(api.WindowsApiError, 'UI boundary mismatch'):
                         runtime.prepare_local(
-                            process, ['/chosen/image.exe'], {}, '/workspace', [], [1, 2, 3],
+                            process, ['/chosen/image.exe'], {}, '/workspace', [], (1, 2, 3),
                             owning=False)
                     self.assertIsNone(process.job)
                     self.assertEqual(seen['closed'].count(88), 1)
@@ -638,14 +643,14 @@ class LocalLaunchTests(unittest.TestCase):
         # must forward that value, not derive another directory from the role.
         with self.calls(True) as seen:
             runtime.prepare_local(runtime.ContainedProcess(None), ['/chosen/loki.exe'], {},
-                                  '/explicit-trusted-directory', [], [1, 2, 3], owning=True)
+                                  '/explicit-trusted-directory', [], (1, 2, 3), owning=True)
             self.assertEqual(seen['create'].call_args.kwargs['current_directory'], '/explicit-trusted-directory')
 
     def _identity_failure(self, owning, mismatch):
         with self.calls(owning, mismatch=mismatch) as seen:
             process = runtime.ContainedProcess(None)
             with self.assertRaises(api.WindowsApiError):
-                runtime.prepare_local(process, ['/chosen/loki.exe'], {}, '/trusted', [], [1, 2, 3],
+                runtime.prepare_local(process, ['/chosen/loki.exe'], {}, '/trusted', [], (1, 2, 3),
                                       owning=owning)
             self.assertEqual(process.information.hProcess, 101)
             self.assertNotIn(101, seen['closed'])
@@ -676,19 +681,19 @@ class LocalLaunchTests(unittest.TestCase):
     def test_only_bare_external_commands_use_windows_command_lookup(self):
         """Qualification chooses a native launch parameter; it must never rewrite the image."""
         cases = [
-            ['cmd.exe', True],
-            [r'.\cmd.exe', False],
-            ['tools/cmd.exe', False],
-            [r'C:cmd.exe', False],
-            [r'C:\tools\cmd.exe', False],
-            [r'\tools\cmd.exe', False],
-            [r'\\server\share\cmd.exe', False],
+            ('cmd.exe', True),
+            (r'.\cmd.exe', False),
+            ('tools/cmd.exe', False),
+            (r'C:cmd.exe', False),
+            (r'C:\tools\cmd.exe', False),
+            (r'\tools\cmd.exe', False),
+            (r'\\server\share\cmd.exe', False),
         ]
         for image, search in cases:
             for owning in [False, True]:
                 with self.subTest(image=image, owning=owning), self.calls(owning) as seen:
                     runtime.prepare_local(runtime.ContainedProcess(None), [image, '/c', 'exit'], {},
-                                          '/workspace', [], [1, 2, 3], owning=owning)
+                                          '/workspace', [], (1, 2, 3), owning=owning)
                     self.assertEqual(seen['create'].call_args.args[0], image)
                     self.assertEqual(seen['create'].call_args.kwargs['search_path'],
                                      search and not owning)
@@ -864,7 +869,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
             full = {name: value for name, value in os.environ.items()
                     if not is_credential_name(name) and not name.startswith('LOKI_')}
             full.update(reduced)
-            for label, environment in [['reduced', reduced], ['full', full]]:
+            for label, environment in [('reduced', reduced), ('full', full)]:
                 with self.subTest(environment=label):
                     process = subprocess.run(
                         [entrypoint('loki'), '--headless', '--prompt', 'environment check'],

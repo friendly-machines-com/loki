@@ -162,10 +162,10 @@ class PsTests(unittest.TestCase):
 
     def test_default_filters_history_but_all_and_jobs_tool_keep_it(self):
         for job_id, status in [
-                ["1", "exited"], ["2", "running"], ["3", "failed"],
-                ["4", "starting"], ["5", "stopped"], ["6", "signaled"],
-                ["7", "timed_out"], ["8", "cancelled"],
-                ["9", "owner_closed"], ["10", "stopping"]]:
+                ("1", "exited"), ("2", "running"), ("3", "failed"),
+                ("4", "starting"), ("5", "stopped"), ("6", "signaled"),
+                ("7", "timed_out"), ("8", "cancelled"),
+                ("9", "owner_closed"), ("10", "stopping")]:
             self.add_job(job_id, status)
         self.assertEqual(
             self.listed_ids(loki.run_ps("")), ["2", "3", "4", "6", "7"])
@@ -196,8 +196,8 @@ class PsTests(unittest.TestCase):
 
     def test_exited_and_stopped_jobs_are_history_only(self):
         for job_id, status, exit_code in [
-                ["1", "running", 0], ["2", "running", 42],
-                ["3", "stopping", -9], ["4", "stopping", -15]]:
+                ("1", "running", 0), ("2", "running", 42),
+                ("3", "stopping", -9), ("4", "stopping", -15)]:
             job = self.add_job(job_id, status)
             job.process.returncode = exit_code
         self.assertEqual(self.listed_ids(loki.run_ps("")), [])
@@ -261,8 +261,8 @@ class PsTests(unittest.TestCase):
     def test_terminal_ps_recognition_does_not_intercept_paths_or_other_commands(self):
         from loki_agent import command_deliveries
         for text, expected in [
-                [" /ps ", ""], ["/ps all", "all"], ["/ps stop 1", "stop 1"],
-                ["/ps kill 1", "kill 1"], ["/ps bad argument", "bad argument"]]:
+                (" /ps ", ""), ("/ps all", "all"), ("/ps stop 1", "stop 1"),
+                ("/ps kill 1", "kill 1"), ("/ps bad argument", "bad argument")]:
             with self.subTest(text=text):
                 parsed = command_deliveries.terminal_immediate(text)
                 self.assertIsNotNone(parsed)

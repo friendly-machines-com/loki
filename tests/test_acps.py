@@ -648,7 +648,7 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
 class FrontSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def test_version_selection_uses_uint16_and_highest_supported_not_above_request(self):
         with mock.patch.object(acps, "SUPPORTED_PROTOCOL_VERSIONS", [1, 2]):
-            for requested, expected in [[1, 1], [2, 2], [3, 2], [65535, 2]]:
+            for requested, expected in [(1, 1), (2, 2), (3, 2), (65535, 2)]:
                 self.assertEqual(acps.negotiate_protocol_version({"protocolVersion": requested}), expected)
             with self.assertRaises(acps.TransportError) as unsupported:
                 acps.negotiate_protocol_version({"protocolVersion": 0})
@@ -714,9 +714,9 @@ class FrontSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_compaction_reporting_uses_v1_client_capability_object_not_elicitation(self):
         front = acp.Front(lambda: None, mock.Mock(), CredentialStore({}))
         self.addAsyncCleanup(front.shutdown)
-        for session, expected in [[None, False], [{}, False], [{"compaction": None}, False],
-                                  [{"compaction": True}, False], [{"compaction": []}, False],
-                                  [{"compaction": {}}, True]]:
+        for session, expected in [(None, False), ({}, False), ({"compaction": None}, False),
+                                  ({"compaction": True}, False), ({"compaction": []}, False),
+                                  ({"compaction": {}}, True)]:
             result = front.initialize({"protocolVersion": 1, "clientCapabilities": {
                 "session": session, "elicitation": {"form": {}}}})
             self.assertEqual(result["protocolVersion"], 1)
@@ -1775,10 +1775,10 @@ class SessionListingTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_saved_metadata_is_not_a_front_failure(self):
         with tempfile.TemporaryDirectory() as workspace:
             self.write_log(workspace, 'kept', {'shell_cwd': workspace})
-            for session_id, state in [['list', ['not', 'a', 'mapping']],
-                                      ['number', {'shell_cwd': 3}],
-                                      ['empty', {'shell_cwd': ''}],
-                                      ['missing', None]]:
+            for session_id, state in [('list', ['not', 'a', 'mapping']),
+                                      ('number', {'shell_cwd': 3}),
+                                      ('empty', {'shell_cwd': ''}),
+                                      ('missing', None)]:
                 self.write_log(workspace, session_id, state)
             invalid = self.write_log(workspace, 'bytes', {'shell_cwd': workspace})
             with open(invalid, 'wb') as stream:
@@ -1893,7 +1893,7 @@ class SessionListingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(path, entry.path)
             self.assertEqual(options, {})
             try:
-                yield [SimpleNamespace(buffer=source), SimpleNamespace(st_mtime=1000)]
+                yield (SimpleNamespace(buffer=source), SimpleNamespace(st_mtime=1000))
             finally:
                 source.close()
 
@@ -2301,7 +2301,7 @@ if "--worker" in sys.argv:
             workers = [int(line) for line in output.split()]
             self.assertEqual(len(workers), 1, workers)
             reports = []
-            for pid, parent, worker in [[front.pid, os.getpid(), False], [workers[0], front.pid, True]]:
+            for pid, parent, worker in [(front.pid, os.getpid(), False), (workers[0], front.pid, True)]:
                 raw = windows_process_environment(pid, parent)
                 reports.append({'pid': pid, 'worker': worker,
                                 'name_present': credential_name.encode() + b'=' in raw,
@@ -2699,14 +2699,14 @@ class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
             if expected_permissions is not None:
                 self.assertEqual(permissions(), expected_permissions)
 
-        turns = [["first prompt", "first answer"]]
+        turns = [("first prompt", "first answer")]
         read_saved(turns)
         # Observe permissions independently; fresh workers must preserve them.
         expected_permissions = permissions()
         del env["LOKI_DUMMY_TOOL_CALL"]
         for method, extension, prompt, answer in [
-                ["session/load", False, "loaded prompt", "loaded answer"],
-                ["session/resume", True, "resumed prompt", "resumed answer"]]:
+                ("session/load", False, "loaded prompt", "loaded answer"),
+                ("session/resume", True, "resumed prompt", "resumed answer")]:
             with self.subTest(method=method):
                 env["LOKI_DUMMY_REPLY"] = answer
                 front, diagnostics = await self._front(env, workspace, cleanup=self.addAsyncCleanup)
@@ -2733,7 +2733,7 @@ class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                     expected_replay = [
                         (kind, {"type": "text", "text": text})
                         for user, assistant in turns
-                        for kind, text in [["user_message_chunk", user], ["agent_message_chunk", assistant]]
+                        for kind, text in [("user_message_chunk", user), ("agent_message_chunk", assistant)]
                     ] if method == "session/load" else []
                     self.assertEqual(_historical_chunks(replay, session_id), expected_replay)
                     if method == "session/resume":
@@ -2751,7 +2751,7 @@ class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(_historical_chunks(updates, session_id), [
                         ("agent_message_chunk", {"type": "text", "text": answer})])
                     await self._finish(front, diagnostics, session_id)
-                    turns.append([prompt, answer])
+                    turns.append((prompt, answer))
                     read_saved(turns)
 
 
@@ -2955,8 +2955,8 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
     async def test_fresh_worker_covers_retained_storage_after_configuration_parent_moves(self):
         from loki_agent import credential_storages
 
-        for relative, closed_stderr in [[False, False], [True, False],
-                                        [False, True], [True, True]]:
+        for relative, closed_stderr in [(False, False), (True, False),
+                                        (False, True), (True, True)]:
             async with AsyncExitStack() as cleanup:
                 cleanup.enter_context(self.subTest(relative=relative, closed_stderr=closed_stderr))
                 root = cleanup.enter_context(tempfile.TemporaryDirectory())
@@ -3176,15 +3176,15 @@ for directory, _children, names in os.walk(os.path.join(configuration['state'], 
         with open(path, encoding='utf-8') as stream:
             record = json.load(stream)
         if '--subagent' in (record.get('argv') or []):
-            records.append([path, record])
+            records.append((path, record))
 assert len(records) == 1, records
 path, owner = records[0]
 with open(path, 'rb') as stream:
     before = stream.read()
 failures = {}
 for operation, target, mode in [
-        ['mutation', path, 'wb'],
-        ['creation', os.path.join(configuration['state'], 'forbidden-new-file'), 'xb']]:
+        ('mutation', path, 'wb'),
+        ('creation', os.path.join(configuration['state'], 'forbidden-new-file'), 'xb')]:
     try:
         with open(target, mode) as stream:
             stream.write(b'forbidden state write')
@@ -3397,11 +3397,11 @@ if phase == 'turn_end':
             elif 'read-configuration' not in completed:
                 selected = [{'id': name, 'type': 'function', 'function': {
                     'name': 'Read', 'arguments': json.dumps({'file_path': path})}}
-                    for name, path in [['read-code', script], ['read-configuration', configuration]]]
+                    for name, path in [('read-code', script), ('read-configuration', configuration)]]
             elif 'write-configuration' not in completed:
                 selected = [{'id': name, 'type': 'function', 'function': {
                     'name': 'Write', 'arguments': json.dumps({'file_path': path, 'content': 'tampered'})}}
-                    for name, path in [['write-code', script], ['write-configuration', configuration]]]
+                    for name, path in [('write-code', script), ('write-configuration', configuration)]]
             else:
                 return {'role': 'assistant', 'content': 'Host hook workflow complete.'}
             return {'role': 'assistant', 'content': None, 'tool_calls': selected}
@@ -3780,7 +3780,7 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
         output = acknowledgement.removeprefix(prefix)
         lines = output.split('\n')
         self.assertEqual(lines[:3], ['status: completed', 'exit_code: 0', 'job_id: 1'])
-        for line, label, content in [[lines[3], 'stdout_path: ', payload], [lines[4], 'stderr_path: ', b'']]:
+        for line, label, content in [(lines[3], 'stdout_path: ', payload), (lines[4], 'stderr_path: ', b'')]:
             self.assertTrue(line.startswith(label), line)
             with open(line.removeprefix(label), 'rb') as stream:
                 self.assertEqual(stream.read(), content)

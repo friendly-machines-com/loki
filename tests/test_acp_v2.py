@@ -56,11 +56,11 @@ class NegotiationTests(unittest.IsolatedAsyncioTestCase):
             await source.send(acps.request(2, "initialize", {
                 "protocolVersion": 2, "info": {"name": "client", "version": "test"}}))
             for identifier, method, params, code in [
-                [None, "session/new", {}, acps.INVALID_REQUEST],
-                [3, "session/load", {}, acps.METHOD_NOT_FOUND],
-                [4, "session/resume", {"replayFrom": {"type": "unknown"}}, acps.INVALID_PARAMS],
-                [5, "session/set_config_option", {"type": "boolean", "value": True}, acps.INVALID_PARAMS],
-                [6, "session/prompt", {"sessionId": "unknown"}, -32002],
+                (None, "session/new", {}, acps.INVALID_REQUEST),
+                (3, "session/load", {}, acps.METHOD_NOT_FOUND),
+                (4, "session/resume", {"replayFrom": {"type": "unknown"}}, acps.INVALID_PARAMS),
+                (5, "session/set_config_option", {"type": "boolean", "value": True}, acps.INVALID_PARAMS),
+                (6, "session/prompt", {"sessionId": "unknown"}, -32002),
             ]:
                 await source.send(acps.request(identifier, method, params))
                 self.assertEqual(messages[-1]["error"]["code"], code)
@@ -90,8 +90,8 @@ class FrontCancellationTests(unittest.IsolatedAsyncioTestCase):
                     owner.channel = mock.Mock(_closed=False, process=mock.Mock(returncode=None),
                                               request=mock.AsyncMock(side_effect=request), close=mock.AsyncMock())
                     owner.forwarded.clear()
-                    owners.append([owner, owner.forwarded])
-                for identifier, name in [[1, "one"], [2, "two"]]:
+                    owners.append((owner, owner.forwarded))
+                for identifier, name in [(1, "one"), (2, "two")]:
                     front.handle(acps.request(identifier, "session/prompt", {
                         "sessionId": name, "prompt": [{"type": "text", "text": "work"}]}))
                 front.handle(acps.notification(method, {"requestId": 1} if method == "$/cancel_request" else {"sessionId": "one"}))
@@ -320,8 +320,8 @@ class WireV2Tests(fixtures._ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                 seen.append(json.loads(line))
 
         identifiers = []
-        for request_id, text, reason in [[3, "/compact", "end_turn"], [4, "work", "end_turn"],
-                                         [5, "/compact", "error"], [6, "after failure", "end_turn"]]:
+        for request_id, text, reason in [(3, "/compact", "end_turn"), (4, "work", "end_turn"),
+                                         (5, "/compact", "error"), (6, "after failure", "end_turn")]:
             reply, preceding = await self._request(front, request_id, "session/prompt", {
                 "sessionId": session_id, "prompt": [{"type": "text", "text": text}]})
             self.assertEqual(list(reply), ["messageId"])

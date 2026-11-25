@@ -1359,10 +1359,10 @@ class ModelLoadingTests(unittest.TestCase):
         hint = 'Hint: delete the leading ! and type /model to select a model.'
         # Repeating dummy sessions proves the hint is not process-global.
         for kind, messages, expected in [
-                [protocols.DUMMY, ['first', 'second', '/quit'], 1],
-                [protocols.DUMMY, ['another session', '/quit'], 1],
-                [protocols.OPENAI_CHAT, ['real provider', '/quit'], 0],
-                [protocols.DUMMY, ['/quit'], 0]]:
+                (protocols.DUMMY, ['first', 'second', '/quit'], 1),
+                (protocols.DUMMY, ['another session', '/quit'], 1),
+                (protocols.OPENAI_CHAT, ['real provider', '/quit'], 0),
+                (protocols.DUMMY, ['/quit'], 0)]:
             with self.subTest(kind=kind, messages=messages), tempfile.TemporaryDirectory() as tmpdir:
                 loki.CREDENTIALS = CredentialStore({
                     'LOKI_API_BASE': 'http://provider.invalid/v1',
@@ -1416,8 +1416,8 @@ class ModelLoadingTests(unittest.TestCase):
 
     def test_normal_input_seed_uses_provider_kind_not_model_name(self):
         for kind, model, expected in [
-                [protocols.DUMMY, 'custom-dummy-name', '!'],
-                [protocols.OPENAI_CHAT, 'dummy', '']]:
+                (protocols.DUMMY, 'custom-dummy-name', '!'),
+                (protocols.OPENAI_CHAT, 'dummy', '')]:
             with self.subTest(kind=kind, model=model):
                 loki.apply_runtime_config(connections.make_runtime_config(
                     'http://provider.invalid/v1', kind, model=model))
@@ -1446,14 +1446,15 @@ class ModelLoadingTests(unittest.TestCase):
                     terminal_frontend, 'restore_output_area_after_input'))
                 stack.enter_context(mock.patch.object(
                     modelsdev, 'run_model_picker_async',
-                    new=mock.AsyncMock(return_value=['provider', {}, {}])))
+                    new=mock.AsyncMock(return_value=('provider', {}, {}))))
                 stack.enter_context(mock.patch.object(
                     terminal_frontend, 'config_from_modelsdev_selection',
                     side_effect=[real_config, dummy_config]))
                 async with running_fixture_task(
                         terminal_frontend.async_main([], settings.Settings())) as task:
-                    self.assertEqual((await keyboard.next_read(task))[1], '!')
-                    for old_seed, new_seed in [['!', ''], ['', '!']]:
+                    _prompt, buffer_text, _cursor = await keyboard.next_read(task)
+                    self.assertEqual(buffer_text, '!')
+                    for old_seed, new_seed in [('!', ''), ('', '!')]:
                         if old_seed:
                             await keyboard.press(task, 'BACKSPACE')
                         await keyboard.press(task, 'TEXT', '/model')
@@ -1461,8 +1462,10 @@ class ModelLoadingTests(unittest.TestCase):
                         # The producer opens another prompt before the consumer
                         # takes modal ownership. Only its untouched default may
                         # refresh when the selected provider changes.
-                        self.assertEqual((await keyboard.next_read(task))[1], old_seed)
-                        self.assertEqual((await keyboard.next_read(task))[1], new_seed)
+                        _prompt, buffer_text, _cursor = await keyboard.next_read(task)
+                        self.assertEqual(buffer_text, old_seed)
+                        _prompt, buffer_text, _cursor = await keyboard.next_read(task)
+                        self.assertEqual(buffer_text, new_seed)
                     await keyboard.press(task, 'BACKSPACE')
                     await keyboard.press(task, 'TEXT', '/quit')
                     keyboard.feed('ENTER')
@@ -2965,7 +2968,7 @@ class HeadlessRequestOutcomeTests(unittest.IsolatedAsyncioTestCase):
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(diagnostics):
             status = await subagents.run_cli_async(
                 'Explore', 'inspect', thinking=model_requests.TurnThinkingSettings())
-        return [status, output.getvalue(), diagnostics.getvalue()]
+        return (status, output.getvalue(), diagnostics.getvalue())
 
     async def test_network_failure_has_failed_status_and_no_answer(self):
         status, output, diagnostics = await self.request(error=OSError('controlled unreachable provider'))
@@ -2981,11 +2984,11 @@ class HeadlessRequestOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('controlled provider protocol failure', diagnostics)
 
     async def test_empty_answer_is_successful(self):
-        self.assertEqual(await self.request(), [0, '', ''])
+        self.assertEqual(await self.request(), (0, '', ''))
 
     async def test_error_looking_answer_is_successful_output(self):
         text = 'Error: this is answer content, not request status'
-        self.assertEqual(await self.request(answer=text), [0, text + '\n', ''])
+        self.assertEqual(await self.request(answer=text), (0, text + '\n', ''))
 
     async def test_headless_frontend_propagates_the_request_exit_status(self):
         with mock.patch.object(terminal_frontend, 'build_config_from_env'), \
@@ -3307,12 +3310,12 @@ class StatusTextTests(unittest.TestCase):
 
     def test_todo_progress_bolds_only_unfinished_counts_and_not_the_label_or_comma(self):
         for statuses, bold in [
-                [[], False],
-                [["pending"], True],
-                [["in_progress"], True],
-                [["completed"], False],
-                [["completed", "in_progress", "pending"], True],
-                [["completed", "completed"], False]]:
+                ([], False),
+                (["pending"], True),
+                (["in_progress"], True),
+                (["completed"], False),
+                (["completed", "in_progress", "pending"], True),
+                (["completed", "completed"], False)]:
             with self.subTest(statuses=statuses):
                 todos = [{"content": f"Task {index}", "status": status, "priority": "high"}
                          for index, status in enumerate(statuses)]
@@ -3370,9 +3373,9 @@ class StatusTextTests(unittest.TestCase):
                 self.assertEqual(
                     rendered.replace("\033[1m", "").replace("\033[22m", ""), plain)
                 for label, value, bold, suffix in [
-                        ["turn: ", "running" if running else "idle", running, ","],
-                        ["/queue{txt:", str(messages), messages != 0, ","],
-                        [",img:", str(images), images != 0, "}"]]:
+                        ("turn: ", "running" if running else "idle", running, ","),
+                        ("/queue{txt:", str(messages), messages != 0, ","),
+                        (",img:", str(images), images != 0, "}")]:
                     expected = f"\033[1m{value}\033[22m" if bold else value
                     self.assertIn(f"{label}{expected}{suffix}", rendered)
                 self.assertEqual(rendered.count("\033[1m"),
@@ -3424,11 +3427,11 @@ class StatusTextTests(unittest.TestCase):
             status="exited", group_active=False,
             process=types.SimpleNamespace(returncode=0))
         for state, returncode, group_active, bold in [
-                ["starting", None, False, False], ["running", None, True, True],
-                ["running", 0, True, True], ["running", 0, False, False],
-                ["running", 42, False, False], ["stopping", None, True, False],
-                ["failed", None, False, False], ["exited", 0, False, False],
-                ["signaled", -15, False, False], ["timed_out", -15, False, False]]:
+                ("starting", None, False, False), ("running", None, True, True),
+                ("running", 0, True, True), ("running", 0, False, False),
+                ("running", 42, False, False), ("stopping", None, True, False),
+                ("failed", None, False, False), ("exited", 0, False, False),
+                ("signaled", -15, False, False), ("timed_out", -15, False, False)]:
             with self.subTest(state=state, returncode=returncode, group_active=group_active):
                 job = types.SimpleNamespace(
                     status=state, group_active=group_active,
@@ -5751,7 +5754,7 @@ class SubagentLaunchTests(unittest.TestCase):
             runtime = await credential_runtimes.CredentialRuntime.connect(owner, capability)
             self.assertIsNotNone(runtime)
             try:
-                yield [delegation, runtime]
+                yield (delegation, runtime)
             finally:
                 await runtime.close()
         finally:
@@ -5823,14 +5826,14 @@ class SubagentLaunchTests(unittest.TestCase):
 
     def test_subagent_launch_reuses_its_own_dispatcher(self):
         cases = [
-            ['linux', False, './loki.py', ['./loki.py']],
-            ['linux', False, './loki-acp', ['./loki-acp']],
-            ['darwin', False, './loki.py', ['./loki.py']],
-            ['freebsd14', False, './loki-acp', ['./loki-acp']],
-            ['win32', False, './loki.py', [sys.executable, './loki.py']],
-            ['win32', False, './loki-acp', [sys.executable, './loki-acp']],
-            ['win32', False, 'C:/built/loki-acp.exe', ['C:/built/loki-acp.exe']],
-            ['win32', True, 'C:/built/loki.exe', ['C:/built/loki.exe']],
+            ('linux', False, './loki.py', ['./loki.py']),
+            ('linux', False, './loki-acp', ['./loki-acp']),
+            ('darwin', False, './loki.py', ['./loki.py']),
+            ('freebsd14', False, './loki-acp', ['./loki-acp']),
+            ('win32', False, './loki.py', [sys.executable, './loki.py']),
+            ('win32', False, './loki-acp', [sys.executable, './loki-acp']),
+            ('win32', False, 'C:/built/loki-acp.exe', ['C:/built/loki-acp.exe']),
+            ('win32', True, 'C:/built/loki.exe', ['C:/built/loki.exe']),
         ]
         with mock.patch.object(sys, 'argv', sys.argv[:]):
             for depth in [0, 2]:
@@ -6128,7 +6131,7 @@ class SubagentLaunchTests(unittest.TestCase):
                     return "too late"
 
                 completed, result = await runtime.run(operation())
-                return [completed, result, ran]
+                return (completed, result, ran)
 
         completed, result, ran = asyncio.run(scenario())
         self.assertFalse(completed)
@@ -6148,7 +6151,7 @@ class SubagentLaunchTests(unittest.TestCase):
 
                 completed, result = await runtime.run(operation())
                 self.assertTrue(runtime.credential_client.closed)
-                return [completed, result]
+                return (completed, result)
 
         completed, result = asyncio.run(scenario())
         self.assertFalse(completed)

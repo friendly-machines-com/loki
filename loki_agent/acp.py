@@ -1083,7 +1083,7 @@ class Front:
         elif destinations != []:
             raise acps.TransportError("saved request destinations are invalid")
         display = list(connection_display_fields(descriptor))
-        display.extend(["Request destination", destination] for destination in destinations)
+        display.extend(("Request destination", destination) for destination in destinations)
         if working_directory:
             # The workspace is part of what the client approves: it is where
             # every tool reads and writes for this session.
@@ -1414,8 +1414,8 @@ class Front:
                 "form elicitation support, so its endpoint can be approved",
                 code=acps.INVALID_PARAMS,
             )
-        facts = [["Credential", reference.encode()]]
-        facts.extend(["Request destination", destination] for destination in destinations)
+        facts = [("Credential", reference.encode())]
+        facts.extend(("Request destination", destination) for destination in destinations)
         result = await self._request_client("elicitation/create", {
             "requestId": (
                 request_id if request_id is not None

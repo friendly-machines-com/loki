@@ -115,7 +115,7 @@ def launch(native, tokens, directory, actor_script, depth, *, package=None, job=
                 information = api.create_process_in_app_container(
                     sys.executable, ['-I', '-u', str(actor_script), '--owning-child', str(output), str(depth)],
                     package, information=information, current_directory=str(directory), inherited_handles=handles,
-                    standard_handles=[handles[0], handles[1], handles[1]],
+                    standard_handles=(handles[0], handles[1], handles[1]),
                     primary_token=token, object_security=private + 'S:(ML;;NW;;;LW)')
             finally:
                 for handle in handles:

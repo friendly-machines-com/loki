@@ -32,7 +32,7 @@ class FileIdentityTests(unittest.TestCase):
 
     def test_volume_and_all_128_file_id_bits_select_the_identity(self):
         identities = []
-        for volume, last in [[1, 0xaa], [2, 0xaa], [1, 0xbb]]:
+        for volume, last in [(1, 0xaa), (2, 0xaa), (1, 0xbb)]:
             def query(handle, kind, buffer, size):
                 self.assertEqual([handle, kind, size], [17, 18, 24])
                 information = ctypes.cast(buffer, ctypes.POINTER(windows_api.FileIdInformation)).contents
@@ -408,7 +408,7 @@ class CreationSecurityTests(unittest.TestCase):
                     self.assertEqual(events, events_by_failure.get(outcome, ['converted', 'create', 'free']))
 
     def test_directory_creation_applies_security_at_creation_and_does_not_repair_existing_objects(self):
-        for result, error in [[1, 0], [0, 183], [0, 5]]:
+        for result, error in [(1, 0), (0, 183), (0, 5)]:
             with self.subTest(result=result, error=error):
                 freed = []
 
@@ -577,13 +577,13 @@ class HomeDirectoryTests(unittest.TestCase):
     def test_omitted_home_defaults_keep_platform_selection_without_interpreting_names(self):
         """Removing generic expansion must not silently replace Windows' default policy."""
         cases = [
-            ['linux', {'HOME': 'base/link/../home'}, 'base/link/../home'],
-            ['win32', {'USERPROFILE': r'C:\chosen\profile', 'HOMEDRIVE': 'D:',
-                       'HOMEPATH': r'\fallback'}, r'C:\chosen\profile'],
-            ['win32', {'HOMEDRIVE': 'D:', 'HOMEPATH': r'\fallback'}, r'D:\fallback'],
-            ['win32', {'HOMEPATH': r'\fallback'}, r'\fallback'],
-            ['win32', {'USERPROFILE': ''}, ''],
-            ['win32', {}, '~'],
+            ('linux', {'HOME': 'base/link/../home'}, 'base/link/../home'),
+            ('win32', {'USERPROFILE': r'C:\chosen\profile', 'HOMEDRIVE': 'D:',
+                       'HOMEPATH': r'\fallback'}, r'C:\chosen\profile'),
+            ('win32', {'HOMEDRIVE': 'D:', 'HOMEPATH': r'\fallback'}, r'D:\fallback'),
+            ('win32', {'HOMEPATH': r'\fallback'}, r'\fallback'),
+            ('win32', {'USERPROFILE': ''}, ''),
+            ('win32', {}, '~'),
         ]
         with mock.patch.dict(os.environ, {'HOME': '/ambient'}, clear=True):
             for platform, values, expected in cases:
@@ -597,8 +597,8 @@ class PosixDefaultDirectoryTests(unittest.TestCase):
         with mock.patch.object(sys, 'platform', 'linux'), \
                 mock.patch.dict(os.environ, {'HOME': '/ambient-home'}, clear=True):
             home = os.path.expanduser('~')
-            for choose, suffix in [[paths.config_base_directory, '.config'],
-                                   [paths.state_base_directory, '.local/state']]:
+            for choose, suffix in [(paths.config_base_directory, '.config'),
+                                   (paths.state_base_directory, '.local/state')]:
                 for values in [{}, {'HOME': ''},
                                {'HOME': '', 'XDG_CONFIG_HOME': '', 'XDG_STATE_HOME': ''}]:
                     with self.subTest(chooser=choose.__name__, values=values):
@@ -628,8 +628,8 @@ class PosixDefaultDirectoryTests(unittest.TestCase):
                              home + os.sep + '.local/state')
 
     def test_xdg_override_is_exact_and_does_not_need_home(self):
-        for choose, key in [[paths.config_base_directory, 'XDG_CONFIG_HOME'],
-                            [paths.state_base_directory, 'XDG_STATE_HOME']]:
+        for choose, key in [(paths.config_base_directory, 'XDG_CONFIG_HOME'),
+                            (paths.state_base_directory, 'XDG_STATE_HOME')]:
             for raw in ['config', '~/config', './config/', 'base/link/../config//']:
                 with self.subTest(chooser=choose.__name__, raw=raw):
                     values = {key: raw}
@@ -893,7 +893,7 @@ class TokenCreationTests(unittest.TestCase):
         self.assertEqual(expected, b'\x02\x00\x08\x00\x00\x00\x00\x00')
 
     def test_default_setter_refuses_absent_or_null_acls(self):
-        for present, acl in [[False, 0xa00], [True, None]]:
+        for present, acl in [(False, 0xa00), (True, None)]:
             with self.subTest(present=present, acl=acl), self.default_calls(present=present, acl=acl) as events:
                 with self.assertRaises(windows_api.WindowsApiError):
                     windows_api.set_token_default_dacl(42, 'D:')
@@ -923,8 +923,8 @@ class WriteRestrictedTokenTests(unittest.TestCase):
 
         def restrict(source, flags, disabled_count, disabled, deleted_count, deleted,
                      count, entries, output):
-            filters.append([source, flags, disabled_count, disabled, deleted_count, deleted,
-                            [[entries[i].sid, entries[i].attributes] for i in range(count)]])
+            filters.append((source, flags, disabled_count, disabled, deleted_count, deleted,
+                            [(entries[i].sid, entries[i].attributes) for i in range(count)]))
             ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 999
             return failure != 'filter'
 
@@ -938,7 +938,7 @@ class WriteRestrictedTokenTests(unittest.TestCase):
         with mock.patch.object(windows_api, 'bind', side_effect=lambda lib, symbol, *args: functions[symbol]), \
                 mock.patch.object(windows_api, 'close_handle', side_effect=lambda handle: closed.append(handle.value)), \
                 mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
-            yield [converted, freed, closed, filters]
+            yield (converted, freed, closed, filters)
 
     def test_only_write_restrictions_are_added_to_the_supplied_token(self):
         with self.calls() as result:
@@ -948,28 +948,30 @@ class WriteRestrictedTokenTests(unittest.TestCase):
         self.assertEqual(converted, ['role', 'logon'])
         self.assertEqual(freed, [101, 100])
         self.assertEqual(closed, [])
-        self.assertEqual(filters, [[42, windows_api.WRITE_RESTRICTED, 0, None, 0, None, [[100, 0], [101, 0]]]])
+        self.assertEqual(filters, [(42, windows_api.WRITE_RESTRICTED, 0, None, 0, None, [(100, 0), (101, 0)])])
 
     def test_failed_conversion_frees_only_previously_acquired_sids(self):
         with self.calls('convert') as result:
             with self.assertRaises(windows_api.WindowsApiError):
                 windows_api.create_write_restricted_token(42, ['role', 'logon'])
-        self.assertEqual(result, [['role'], [100], [], []])
+        self.assertEqual(result, (['role'], [100], [], []))
 
     def test_failed_filter_output_is_not_treated_as_an_acquired_token(self):
         with self.calls('filter') as result:
             with self.assertRaises(windows_api.WindowsApiError):
                 windows_api.create_write_restricted_token(42, ['role'])
-        self.assertEqual(result[1:3], [[100], []])
+        _converted, freed, closed, _filters = result
+        self.assertEqual(freed, [100])
+        self.assertEqual(closed, [])
 
     def test_logon_identity_requires_one_kernel_reported_logon_group(self):
         flag = windows_api.SE_GROUP_LOGON_ID
-        for groups in [[], [['user', 7]], [['a', flag], ['b', flag]]]:
+        for groups in [[], [('user', 7)], [('a', flag), ('b', flag)]]:
             with self.subTest(groups=groups), \
                     mock.patch.object(windows_api, '_token_groups', return_value=groups):
                 with self.assertRaises(windows_api.WindowsApiError):
                     windows_api.token_logon_sid(42)
-        with mock.patch.object(windows_api, '_token_groups', return_value=[['user', 7], ['logon', flag | 7]]) as query:
+        with mock.patch.object(windows_api, '_token_groups', return_value=[('user', 7), ('logon', flag | 7)]) as query:
             self.assertEqual(windows_api.token_logon_sid(42), 'logon')
         query.assert_called_once_with(42, windows_api.TOKEN_GROUPS_CLASS)
 
@@ -987,14 +989,14 @@ class TokenAclHelpersTests(unittest.TestCase):
 
         def set_info(token, kind, pointer, size):
             acl = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0]
-            seen.append([token, kind, ctypes.string_at(acl, len(saved)), size])
+            seen.append((token, kind, ctypes.string_at(acl, len(saved)), size))
             return True
 
         with mock.patch.object(windows_api, 'bind', return_value=set_info):
             windows_api.set_token_default_dacl(42, saved)
             with self.assertRaises(ValueError):
                 windows_api.set_token_default_dacl(42, b'broken')
-        self.assertEqual(seen, [[42, windows_api.TOKEN_DEFAULT_DACL_CLASS, saved, ctypes.sizeof(ctypes.c_void_p)]])
+        self.assertEqual(seen, [(42, windows_api.TOKEN_DEFAULT_DACL_CLASS, saved, ctypes.sizeof(ctypes.c_void_p))])
 
     def test_acl_conversion_keeps_its_backing_storage_alive(self):
         saved = b'\x02\x00\x08\x00\x00\x00\x00\x00'
@@ -1034,7 +1036,7 @@ class TokenAclHelpersTests(unittest.TestCase):
         with mock.patch.object(windows_api, '_get_token_information', return_value=query), \
                 mock.patch.object(windows_api, 'sid_text', side_effect=lambda sid: str(sid)):
             for readback in [windows_api.token_restricting_sids, windows_api.token_capabilities]:
-                self.assertEqual(readback(42), [['101', 1], ['202', 0]])
+                self.assertEqual(readback(42), [('101', 1), ('202', 0)])
 
     def test_generic_call_keeps_command_cwd_group_and_suspension_separate(self):
         create = mock.Mock(return_value=True)
@@ -1083,7 +1085,7 @@ class OwningCreationTests(unittest.TestCase):
 
         def free(value):
             seen['freed'].append(value.value)
-            seen['cleanup'].append(['free', value.value])
+            seen['cleanup'].append(('free', value.value))
             live.discard(value.value)
             if fail == 'cleanup' and value.value == 0xdef:
                 raise KeyboardInterrupt()
@@ -1137,7 +1139,7 @@ class OwningCreationTests(unittest.TestCase):
                 'chosen-loki.exe', [], 'package', object_security='private', information=windows_api.ProcessInformation())
         self.assertEqual(seen['sid'], 'package')
         self.assertEqual(seen['freed'], [0xdef, 0xabc])
-        self.assertEqual(seen['cleanup'], [['free', 0xdef], 'delete', ['free', 0xabc]])
+        self.assertEqual(seen['cleanup'], [('free', 0xdef), 'delete', ('free', 0xabc)])
         self.assertEqual(len(seen['created']), 1)
 
     def test_existing_token_needs_no_empty_attribute_list(self):
@@ -1166,8 +1168,8 @@ class OwningCreationTests(unittest.TestCase):
             with self.subTest(package=package), self.native_calls(fail='cleanup') as seen, \
                     mock.patch.object(windows_api, 'wait_for_single_object', side_effect=[258, 0]) as wait, \
                     mock.patch.object(windows_api, 'get_exit_code_process', return_value=1), \
-                    mock.patch.object(windows_api, 'terminate_process', side_effect=lambda p: events.append(['terminate', p])), \
-                    mock.patch.object(windows_api, 'close_handle', side_effect=lambda h: events.append(['close', h])):
+                    mock.patch.object(windows_api, 'terminate_process', side_effect=lambda p: events.append(('terminate', p))), \
+                    mock.patch.object(windows_api, 'close_handle', side_effect=lambda h: events.append(('close', h))):
                 async def exercise():
                     owner = windows_runtime.ContainedProcess(windows_api.ProcessInformation())
                     try:
@@ -1182,11 +1184,11 @@ class OwningCreationTests(unittest.TestCase):
                     finally:
                         await windows_runtime.retire_local(owner)
                 asyncio.run(exercise())
-            self.assertEqual(events, [['terminate', 11], ['close', 22], ['close', 11]])
+            self.assertEqual(events, [('terminate', 11), ('close', 22), ('close', 11)])
             self.assertEqual(wait.call_args_list, [mock.call(11, 0), mock.call(11, 0)])
             self.assertEqual(seen['freed'], [0xdef] if package is None else [0xdef, 0xabc])
-            self.assertEqual(seen['cleanup'], [['free', 0xdef], 'delete']
-                             + ([] if package is None else [['free', 0xabc]]))
+            self.assertEqual(seen['cleanup'], [('free', 0xdef), 'delete']
+                             + ([] if package is None else [('free', 0xabc)]))
             self.assertTrue(seen['deleted'])
 
     def test_creation_failures_release_descriptors_and_attributes_without_retry(self):
@@ -1226,8 +1228,8 @@ class AppContainerLaunchTests(unittest.TestCase):
             return attribute_list is not None
 
         def update(attribute_list, flags, attribute, value, size, previous, returned):
-            seen['attributes'].append([flags, attribute, size])
-            pending_attributes.append([attribute, value, size])
+            seen['attributes'].append((flags, attribute, size))
+            pending_attributes.append((attribute, value, size))
             return True
 
         def delete(attribute_list):
@@ -1257,7 +1259,7 @@ class AppContainerLaunchTests(unittest.TestCase):
                     seen['package_sid_at_create'] = capabilities.AppContainerSid
                     seen['capability_count_at_create'] = capabilities.CapabilityCount
                     seen['capabilities_at_create'] = [
-                        [entries[index].sid, entries[index].attributes]
+                        (entries[index].sid, entries[index].attributes)
                         for index in range(capabilities.CapabilityCount)]
                 elif attribute == windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST:
                     handles = ctypes.cast(value, ctypes.POINTER(ctypes.c_void_p))
@@ -1266,7 +1268,7 @@ class AppContainerLaunchTests(unittest.TestCase):
                     seen['pseudoconsole_at_create'] = value.value
             initial = ctypes.cast(startup, ctypes.POINTER(windows_api.StartupInfoEx)).contents.StartupInfo
             seen['startup_flags'] = initial.dwFlags
-            seen['standard_handles'] = [initial.hStdInput, initial.hStdOutput, initial.hStdError]
+            seen['standard_handles'] = (initial.hStdInput, initial.hStdOutput, initial.hStdError)
             process = ctypes.cast(information, ctypes.POINTER(windows_api.ProcessInformation)).contents
             seen['output_address'] = ctypes.addressof(process)
             process.hProcess = 1
@@ -1311,13 +1313,13 @@ class AppContainerLaunchTests(unittest.TestCase):
             'S-1-15-2-1', windows_api.INTERNET_CLIENT_SERVER_SID, windows_api.PRIVATE_NETWORK_CLIENT_SERVER_SID])
         self.assertCountEqual(seen['freed'], [0xABCD, 0xACCD, 0xADCD])
         self.assertEqual(seen['capabilities_at_create'], [
-            [0xACCD, windows_api.SE_GROUP_ENABLED], [0xADCD, windows_api.SE_GROUP_ENABLED]])
+            (0xACCD, windows_api.SE_GROUP_ENABLED), (0xADCD, windows_api.SE_GROUP_ENABLED)])
         self.assertEqual(seen['capability_count_at_create'], 2)
         self.assertFalse(seen['inherit'])
         self.assertEqual(seen['counts'], [1, 1], 'the list is sized for exactly the attributes set')
-        self.assertEqual(seen['attributes'], [[
+        self.assertEqual(seen['attributes'], [(
             0, windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-            ctypes.sizeof(windows_api.SecurityCapabilities)]])
+            ctypes.sizeof(windows_api.SecurityCapabilities))])
 
         # Still separate native creations: collapsing these into an all-options
         # launch would lose the zero-capability default and exact list sizes.
@@ -1365,18 +1367,18 @@ class AppContainerLaunchTests(unittest.TestCase):
         with self.native_calls() as seen:
             windows_api.create_process_suspended(
                 'chosen loki.exe', ['--test', 'two words'], information=information,
-                pseudoconsole=0x1234, standard_handles=[None, None, None],
+                pseudoconsole=0x1234, standard_handles=(None, None, None),
                 environment={'A': 'B'}, current_directory='D:\\work\\ws')
         self.assertEqual(seen['output_address'], ctypes.addressof(information))
         self.assertEqual([information.hProcess, information.hThread], [1, 2])
         self.assertEqual(seen['creations'], ['chosen loki.exe'])
         self.assertEqual(seen['command_line'], '"chosen loki.exe" --test "two words"')
         self.assertEqual(seen['counts'], [1, 1])
-        self.assertEqual(seen['attributes'], [[0, windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                                               ctypes.sizeof(ctypes.c_void_p)]])
+        self.assertEqual(seen['attributes'], [(0, windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                                               ctypes.sizeof(ctypes.c_void_p))])
         self.assertEqual(seen['pseudoconsole_at_create'], 0x1234)
         self.assertEqual(seen['startup_flags'], windows_api.StartupInfoFlags.STARTF_USESTDHANDLES)
-        self.assertEqual(seen['standard_handles'], [None, None, None])
+        self.assertEqual(seen['standard_handles'], (None, None, None))
         self.assertEqual(seen['sids'], [])
         self.assertEqual(seen['freed'], [])
         self.assertFalse(seen['inherit'])
@@ -1447,7 +1449,7 @@ class FileAccessTests(unittest.TestCase):
         functions = {'CreateFileW': create, 'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
                      'LocalFree': free}
         with mock.patch.object(windows_api, 'bind', side_effect=lambda lib, symbol, *args: functions[symbol]), \
-                mock.patch.object(windows_api, 'close_handle', side_effect=lambda handle: events.append(['close', handle])), \
+                mock.patch.object(windows_api, 'close_handle', side_effect=lambda handle: events.append(('close', handle))), \
                 mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
             yield events
 
@@ -1492,7 +1494,7 @@ class FileAccessTests(unittest.TestCase):
         with self.private_creation('free') as events:
             with self.assertRaisesRegex(RuntimeError, 'descriptor release failed'):
                 self.create_private()
-        self.assertEqual(events, ['convert', 'create', 'free', ['close', 77]])
+        self.assertEqual(events, ['convert', 'create', 'free', ('close', 77)])
 
     def test_a_successful_open_returns_the_handle(self):
         with mock.patch.object(windows_api, "bind",
@@ -1524,8 +1526,8 @@ class FileAccessTests(unittest.TestCase):
         # not include and which the contained runtime therefore lacks.
         # ACL mutation deliberately requests READ_CONTROL/WRITE_DAC and denies
         # delete sharing. Both follow the supplied directory lookup unchanged.
-        for opener, access, share in [[windows_api.open_directory_handle, 0x80, 7],
-                                      [windows_api.open_directory_for_acl, 0x60080, 3]]:
+        for opener, access, share in [(windows_api.open_directory_handle, 0x80, 7),
+                                      (windows_api.open_directory_for_acl, 0x60080, 3)]:
             create = mock.Mock(return_value=77)
             with self.subTest(opener=opener.__name__), \
                     mock.patch.object(windows_api, 'bind', return_value=create):

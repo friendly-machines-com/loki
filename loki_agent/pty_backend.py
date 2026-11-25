@@ -269,7 +269,7 @@ if sys.platform == "win32":
                 handle.information = windows_api.ProcessInformation()
                 windows_api.create_process_suspended(
                     argv[0], argv[1:], information=handle.information,
-                    pseudoconsole=handle.hpc.value, standard_handles=[None, None, None],
+                    pseudoconsole=handle.hpc.value, standard_handles=(None, None, None),
                     environment=env, current_directory=cwd)
             # ConPTY has duplicated its child ends. Drop our copies before the
             # suspended child can run or cleanup can wait for its termination.

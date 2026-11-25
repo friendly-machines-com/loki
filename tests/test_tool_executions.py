@@ -52,11 +52,11 @@ assert sys.stdin.buffer.read(1) == b'g'
 result = {'read': open(state + os.sep + 'other-job.json').read(),
           'later': open(state + os.sep + 'later').read(), 'cwd': os.getcwd(), 'directories': []}
 for name, operation in [
-        ['write', lambda: open(state + os.sep + 'other-job.json', 'w').close()],
-        ['create', lambda: open(state + os.sep + 'created', 'w').close()],
-        ['unlink', lambda: os.unlink(state + os.sep + 'other-job.json')],
-        ['chmod', lambda: os.chmod(state + os.sep + 'other-job.json', 0o600)],
-        ['cwd-write', lambda: open('other-job.json', 'w').close()]]:
+        ('write', lambda: open(state + os.sep + 'other-job.json', 'w').close()),
+        ('create', lambda: open(state + os.sep + 'created', 'w').close()),
+        ('unlink', lambda: os.unlink(state + os.sep + 'other-job.json')),
+        ('chmod', lambda: os.chmod(state + os.sep + 'other-job.json', 0o600)),
+        ('cwd-write', lambda: open('other-job.json', 'w').close())]:
     try: operation()
     except OSError as error: result[name] = error.errno
     else: result[name] = 0
@@ -222,8 +222,8 @@ print(json.dumps(result), file=sys.stderr, flush=True)
     async def test_target_exec_and_cwd_errors_keep_the_parent_spawn_contract(self):
         missing = self.workspace + os.sep + 'missing'
         for command, cwd, filename in [
-                [[missing], self.workspace, missing],
-                [[sys.executable, '-c', 'raise SystemExit(0)'], missing, missing]]:
+                ([missing], self.workspace, missing),
+                ([sys.executable, '-c', 'raise SystemExit(0)'], missing, missing)]:
             with self.subTest(command=command, cwd=cwd):
                 with self.assertRaises(FileNotFoundError) as caught:
                     await self.spawn(*command, cwd=cwd, stdout=asyncio.subprocess.PIPE,
@@ -337,7 +337,7 @@ print(json.dumps(result), file=sys.stderr, flush=True)
             try:
                 output, errors, code = await asyncio.gather(
                     process.stdout.read(), process.stderr.read(), process.wait())
-                reports.append([code, output, errors])
+                reports.append((code, output, errors))
             finally:
                 await process.aclose()
         self.assertEqual(reports[0], reports[1])
@@ -351,7 +351,7 @@ class CreatorRevocationTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
                 response_headers, '_snapshot_location',
-                return_value=[directory, 'response-headers.json']):
+                return_value=(directory, 'response-headers.json')):
             async with contextlib.AsyncExitStack() as cleanup:
                 session = loki.Session()
                 cleanup.callback(session.response_headers.close)
@@ -423,12 +423,12 @@ class CreatorRevocationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(asyncio.all_tasks() - tasks_before)
 
     async def test_session_closure_during_creation_retires_the_unpublished_child(self):
-        for owning, via_hook in [[False, False], [True, False], [False, True]]:
+        for owning, via_hook in [(False, False), (True, False), (False, True)]:
             with self.subTest(owning=owning, via_hook=via_hook):
                 await self._assert_revoked_creation(owning=owning, broker_loss=False, via_hook=via_hook)
 
     async def test_broker_loss_during_creation_retires_the_unpublished_child(self):
-        for owning, via_hook in [[False, False], [True, False], [False, True]]:
+        for owning, via_hook in [(False, False), (True, False), (False, True)]:
             with self.subTest(owning=owning, via_hook=via_hook):
                 await self._assert_revoked_creation(owning=owning, broker_loss=True, via_hook=via_hook)
 

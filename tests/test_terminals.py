@@ -1142,7 +1142,7 @@ class PromptControllerTests(unittest.TestCase):
                 output_at_read.append(output.getvalue())
                 return terminals.KeyEvent("ENTER")
 
-        for seed, ignore_seed, expected in [['filter ', False, 'filter '], ['!', True, '']]:
+        for seed, ignore_seed, expected in [('filter ', False, 'filter '), ('!', True, '')]:
             with self.subTest(seed=seed):
                 output_at_read.clear()
                 output = TtyOutput()
@@ -1409,13 +1409,16 @@ class NormalInputSeedTests(unittest.IsolatedAsyncioTestCase):
         seed = '!'
         with PromptKeyboard().installed() as keyboard:
             async with terminals.InputSession(fd=0, initial_text_provider=lambda: seed) as session:
-                self.assertEqual((await keyboard.next_read(session._producer))[1:], ['!', 1])
+                _prompt, buffer_text, cursor = await keyboard.next_read(session._producer)
+                self.assertEqual((buffer_text, cursor), ('!', 1))
                 await keyboard.press(session._producer, 'TEXT', 'first')
                 seed = ''
-                self.assertEqual((await keyboard.press(session._producer, 'ENTER'))[1:], ['', 0])
+                _prompt, buffer_text, cursor = await keyboard.press(session._producer, 'ENTER')
+                self.assertEqual((buffer_text, cursor), ('', 0))
                 await keyboard.press(session._producer, 'TEXT', 'queued prose')
                 seed = '!'
-                self.assertEqual((await keyboard.press(session._producer, 'ENTER'))[1:], ['!', 1])
+                _prompt, buffer_text, cursor = await keyboard.press(session._producer, 'ENTER')
+                self.assertEqual((buffer_text, cursor), ('!', 1))
                 keyboard.feed('EOF')
                 await session._producer
                 self.assertEqual(session.user_messages.get_nowait(), '!first')
@@ -1438,9 +1441,11 @@ class NormalInputSeedTests(unittest.IsolatedAsyncioTestCase):
     async def test_ctrl_c_opens_a_fresh_seeded_prompt(self):
         with PromptKeyboard().installed() as keyboard:
             async with terminals.InputSession(fd=0, initial_text_provider=lambda: '!') as session:
-                self.assertEqual((await keyboard.next_read(session._producer))[1:], ['!', 1])
+                _prompt, buffer_text, cursor = await keyboard.next_read(session._producer)
+                self.assertEqual((buffer_text, cursor), ('!', 1))
                 await keyboard.press(session._producer, 'TEXT', 'discard this')
-                self.assertEqual((await keyboard.press(session._producer, 'CTRL_C'))[1:], ['!', 1])
+                _prompt, buffer_text, cursor = await keyboard.press(session._producer, 'CTRL_C')
+                self.assertEqual((buffer_text, cursor), ('!', 1))
                 self.assertTrue(keyboard.cancel_event.is_set())
                 await keyboard.press(session._producer, 'TEXT', 'pwd')
                 await keyboard.press(session._producer, 'ENTER')
@@ -1451,13 +1456,13 @@ class NormalInputSeedTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_modal_refreshes_only_untouched_defaults(self):
         cases = [
-            ['!', '', [], '', ''],
-            ['', '!', [], '!', ''],
-            ['!', '!', [], '!', ''],
-            ['!', '', [terminals.KeyEvent('BACKSPACE'), terminals.KeyEvent('TEXT', '!')], '!', '!'],
-            ['!', '!', [terminals.KeyEvent('BACKSPACE')], '', ''],
-            ['', '!', [terminals.KeyEvent('TEXT', 'x'), terminals.KeyEvent('BACKSPACE')], '', ''],
-            ['!', '', [terminals.KeyEvent('TEXT', 'pwd')], '!pwd', '!pwd'],
+            ('!', '', [], '', ''),
+            ('', '!', [], '!', ''),
+            ('!', '!', [], '!', ''),
+            ('!', '', [terminals.KeyEvent('BACKSPACE'), terminals.KeyEvent('TEXT', '!')], '!', '!'),
+            ('!', '!', [terminals.KeyEvent('BACKSPACE')], '', ''),
+            ('', '!', [terminals.KeyEvent('TEXT', 'x'), terminals.KeyEvent('BACKSPACE')], '', ''),
+            ('!', '', [terminals.KeyEvent('TEXT', 'pwd')], '!pwd', '!pwd'),
         ]
         for seed, next_seed, edits, rendered, submitted in cases:
             with self.subTest(seed=seed, next_seed=next_seed, edits=edits), \
@@ -1468,8 +1473,8 @@ class NormalInputSeedTests(unittest.IsolatedAsyncioTestCase):
                         await keyboard.press(session._producer, event.kind, event.text)
                     async with session.modal():
                         seed = next_seed
-                    self.assertEqual(
-                        (await keyboard.next_read(session._producer))[1:], [rendered, len(rendered)])
+                    _prompt, buffer_text, cursor = await keyboard.next_read(session._producer)
+                    self.assertEqual((buffer_text, cursor), (rendered, len(rendered)))
                     await keyboard.press(session._producer, 'ENTER')
                     self.assertEqual(session.user_messages.get_nowait(), submitted)
 
@@ -1486,10 +1491,10 @@ class InputDraftTests(unittest.IsolatedAsyncioTestCase):
                 async with session.modal():
                     history.append('arrived during modal')
                 self.assertEqual(await keyboard.next_read(session._producer), before)
-                self.assertEqual(
-                    (await keyboard.press(session._producer, 'CURSOR_DOWN'))[1:], ['my draft', 8])
-                self.assertEqual(
-                    (await keyboard.press(session._producer, 'CURSOR_UP'))[1], 'arrived during modal')
+                _prompt, buffer_text, cursor = await keyboard.press(session._producer, 'CURSOR_DOWN')
+                self.assertEqual((buffer_text, cursor), ('my draft', 8))
+                _prompt, buffer_text, _cursor = await keyboard.press(session._producer, 'CURSOR_UP')
+                self.assertEqual(buffer_text, 'arrived during modal')
                 await keyboard.press(session._producer, 'CURSOR_DOWN')
                 await keyboard.press(session._producer, 'ENTER')
                 self.assertEqual(session.user_messages.get_nowait(), 'my draft')
@@ -1516,10 +1521,10 @@ class InputDraftTests(unittest.IsolatedAsyncioTestCase):
                 await keyboard.press(session._producer, 'TEXT', 'pasted\n\u96ea')
                 async with session.modal():
                     pass
-                self.assertEqual(
-                    (await keyboard.next_read(session._producer))[1:], ['pasted\n\u96ea', 8])
-                self.assertEqual(
-                    (await keyboard.press(session._producer, 'TEXT', '!'))[1:], ['pasted\n\u96ea!', 9])
+                _prompt, buffer_text, cursor = await keyboard.next_read(session._producer)
+                self.assertEqual((buffer_text, cursor), ('pasted\n\u96ea', 8))
+                _prompt, buffer_text, cursor = await keyboard.press(session._producer, 'TEXT', '!')
+                self.assertEqual((buffer_text, cursor), ('pasted\n\u96ea!', 9))
 
     async def test_submitted_and_immediate_commands_do_not_return_as_drafts(self):
         commands = []
@@ -1535,10 +1540,12 @@ class InputDraftTests(unittest.IsolatedAsyncioTestCase):
                 await keyboard.next_read(session._producer)
                 for text in ['sent message', '/ps']:
                     await keyboard.press(session._producer, 'TEXT', text)
-                    self.assertEqual((await keyboard.press(session._producer, 'ENTER'))[1:], ['', 0])
+                    _prompt, buffer_text, cursor = await keyboard.press(session._producer, 'ENTER')
+                    self.assertEqual((buffer_text, cursor), ('', 0))
                     async with session.modal():
                         pass
-                    self.assertEqual((await keyboard.next_read(session._producer))[1:], ['', 0])
+                    _prompt, buffer_text, cursor = await keyboard.next_read(session._producer)
+                    self.assertEqual((buffer_text, cursor), ('', 0))
                 self.assertEqual(commands, ['/ps'])
                 self.assertEqual(session.user_messages.get_nowait(), 'sent message')
                 self.assertTrue(session.user_messages.empty())
@@ -1561,7 +1568,8 @@ class InputDraftTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(keyboard.reading)
                 self.assertTrue(session.user_messages.empty())
                 async with session:
-                    self.assertEqual((await keyboard.next_read(session._producer))[1:], ['', 0])
+                    _prompt, buffer_text, cursor = await keyboard.next_read(session._producer)
+                    self.assertEqual((buffer_text, cursor), ('', 0))
 
     async def test_failed_resume_ends_input_without_reviving_the_draft(self):
         with PromptKeyboard().installed() as keyboard:
@@ -1580,7 +1588,8 @@ class InputDraftTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(session.user_messages.get_nowait())
                 self.assertIn('input session error: redraw failed', errors.getvalue())
             async with session:
-                self.assertEqual((await keyboard.next_read(session._producer))[1:], ['', 0])
+                _prompt, buffer_text, cursor = await keyboard.next_read(session._producer)
+                self.assertEqual((buffer_text, cursor), ('', 0))
 
 
 class InputModalTests(unittest.TestCase):

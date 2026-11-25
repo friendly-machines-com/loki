@@ -123,8 +123,8 @@ class CompactionFormatTests(unittest.TestCase):
         target = formats.projection_target(formats.OPENAI_RESPONSES, provider_id="native",
                                            endpoint=event["endpoint"], model="model", openai_request_profile=profile)
         self.assertEqual(formats.items_to_openai_responses_parts([event], target)[1], event["items"])
-        for field, changed in [["endpoint", "https://elsewhere.test/responses"], ["provider_id", "gateway"],
-                               ["model", "other"], ["openai_request_profile", {"use_responses_lite": False}]]:
+        for field, changed in [("endpoint", "https://elsewhere.test/responses"), ("provider_id", "gateway"),
+                               ("model", "other"), ("openai_request_profile", {"use_responses_lite": False})]:
             with self.subTest(field=field), self.assertRaises(formats.ProjectionError):
                 formats.items_to_openai_responses_parts([event], {**target, field: changed})
         for project in [formats.items_to_openai_chat_messages, formats.items_to_anthropic_parts]:
@@ -634,7 +634,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
 
         @contextlib.asynccontextmanager
         async def retry(method, url, **kwargs):
-            attempts.append([kwargs["body"], kwargs["headers_in"]["Idempotency-Key"]])
+            attempts.append((kwargs["body"], kwargs["headers_in"]["Idempotency-Key"]))
             if len(attempts) == 1:
                 raise ConnectionResetError(errno.ECONNRESET, "synthetic pre-output reset")
             async with self.streaming(method, url, **kwargs) as response:
@@ -664,7 +664,7 @@ print(json.dumps(result))
 '''
         command = [sys.executable, "-c", program, str(retry_limit), str(delay)]
         definitions = [settings.HookSettings(phase, name, command, self.session.shell_cwd)
-                       for phase, name in [["pre_compact", "once"], ["turn_error", "retry"]]]
+                       for phase, name in [("pre_compact", "once"), ("turn_error", "retry")]]
         self.pipeline = tool_runtime.build_hook_pipeline(
             definitions, create_exec=loki._tool_process_creator(),
             stderr_reporter=lambda command, text: observed.extend(json.loads(line) for line in text.splitlines()))
@@ -689,7 +689,7 @@ print(json.dumps(result))
             compact = json.loads(kwargs["body"])["input"][-1].get("type") == "compaction_trigger"
             stage = "compact" if compact else "initial" if not self.sent else "continuation"
             counts[stage] += 1
-            attempts.append([stage, kwargs["body"], kwargs["headers_in"]["Idempotency-Key"]])
+            attempts.append((stage, kwargs["body"], kwargs["headers_in"]["Idempotency-Key"]))
             if stage == "initial" and counts[stage] == 1:
                 raise ConnectionResetError(errno.ECONNRESET, "initial node disappeared")
             if stage == "continuation" and counts[stage] == 1:
@@ -734,7 +734,7 @@ print(json.dumps(result))
 
                 @contextlib.asynccontextmanager
                 async def repaired(method, url, **kwargs):
-                    attempts.append([kwargs["body"], kwargs["headers_in"]["Idempotency-Key"]])
+                    attempts.append((kwargs["body"], kwargs["headers_in"]["Idempotency-Key"]))
                     self.idle_routing = len(attempts) == 1
                     self.assertEqual(kwargs["headers_in"].get(model_requests.CODEX_TURN_STATE_HEADER),
                                      None if self.idle_routing else "operation-state")
@@ -1385,7 +1385,7 @@ print(json.dumps(result))
     def tool_batch(self):
         return [{"type": "function_call", "call_id": call_id, "name": "TodoWrite",
                  "arguments": json.dumps({"todos": [{"content": content, "status": "pending", "priority": "high"}]})}
-                for call_id, content in [["step-one", "first effect"], ["step-two", "second effect"]]]
+                for call_id, content in [("step-one", "first effect"), ("step-two", "second effect")]]
 
     async def test_real_loop_coalesces_at_whole_batch_boundary_and_persists_continuation(self):
         self.idle_routing = False
@@ -1467,8 +1467,8 @@ print(json.dumps(result))
                 self.assertFalse(any(event["type"] == "context_replace" for event in self.session.transcript_items))
                 self.before = copy.deepcopy(self.session.transcript_items)
             async with self.streaming(method, url, **kwargs) as response:
-                ready, release = ([compact_ready, compact_release] if compact else
-                                  [sampling_ready, sampling_release] if first else [final_ready, final_release])
+                ready, release = ((compact_ready, compact_release) if compact else
+                                  (sampling_ready, sampling_release) if first else (final_ready, final_release))
                 ready.set()
                 await release.wait()
                 yield response
@@ -1721,8 +1721,8 @@ print(json.dumps(result))
                 self.assertEqual(self.session.transcript_items[-1]["type"], "tool_result")
                 self.before = copy.deepcopy(self.session.transcript_items)
             async with self.streaming(method, url, **kwargs) as response:
-                ready, release = ([compact_ready, compact_release] if compact else
-                                  [sampling_ready, sampling_release] if first else [final_ready, final_release])
+                ready, release = ((compact_ready, compact_release) if compact else
+                                  (sampling_ready, sampling_release) if first else (final_ready, final_release))
                 ready.set()
                 await release.wait()
                 yield response
@@ -1809,7 +1809,7 @@ print(json.dumps(result))
                 self.before = copy.deepcopy(self.session.transcript_items)
             async with self.streaming(method, url, **kwargs) as response:
                 if compact or first:
-                    ready, release = [compact_ready, compact_release] if compact else [sampling_ready, sampling_release]
+                    ready, release = (compact_ready, compact_release) if compact else (sampling_ready, sampling_release)
                     ready.set()
                     await release.wait()
                 yield response
@@ -1963,11 +1963,11 @@ print(json.dumps(result))
             owner = worker._prompt_task
             try:
                 await observe_fixture(ready.wait(), owner)
-                for identifier, text in [[2, "discard"], [3, "also discard"]]:
+                for identifier, text in [(2, "discard"), (3, "also discard")]:
                     await worker.handle(acps.request(identifier, "session/prompt", self.params(text)))
                 self.assertEqual(len([message for message in messages if "result" in message]), 3)
                 await worker.dispatch("session/cancel", {})
-                for identifier, text in [[4, "later"], [5, "last"]]:
+                for identifier, text in [(4, "later"), (5, "last")]:
                     await worker.handle(acps.request(identifier, "session/prompt", self.params(text)))
                 release.set()
                 await owner
@@ -2094,8 +2094,8 @@ class CompactionRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queue.message_count, 0)
 
     def test_v1_compaction_lifecycle_is_capability_gated_and_summary_free(self):
-        for kind, status in [["compaction_started", "in_progress"], ["compaction_completed", "completed"],
-                             ["compaction_failed", "failed"], ["compaction_cancelled", "cancelled"]]:
+        for kind, status in [("compaction_started", "in_progress"), ("compaction_completed", "completed"),
+                             ("compaction_failed", "failed"), ("compaction_cancelled", "cancelled")]:
             event = {"type": kind, "compaction_id": "local-id", "text": "readable status"}
             self.assertEqual(acp_events.map_event("session", event, {})[0]["update"]["sessionUpdate"], "agent_message_chunk")
             typed = acp_events.map_event("session", event, {}, compaction=True)[0]["update"]

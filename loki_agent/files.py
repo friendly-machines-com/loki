@@ -321,12 +321,10 @@ def _open_regular_file(file_path, mode='r', *, newline=None):
 
 
 def _stat_identity(facts):
-    identity = [facts.st_dev, facts.st_ino, facts.st_size, facts.st_mtime_ns]
-    if sys.platform != 'win32':
-        # POSIX ctime detects changes that a restored mtime misses. Windows'
-        # creation/metadata-time meanings differ across supported interpreters.
-        identity.append(facts.st_ctime_ns)
-    return identity
+    # POSIX ctime detects changes that a restored mtime misses. Windows'
+    # creation/metadata-time meanings differ across supported interpreters.
+    ctime_ns = None if sys.platform == 'win32' else facts.st_ctime_ns
+    return facts.st_dev, facts.st_ino, facts.st_size, facts.st_mtime_ns, ctime_ns
 
 
 def _file_observation(file_path: str, expected_stat=None) -> FileObservation:

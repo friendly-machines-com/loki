@@ -196,12 +196,12 @@ class AskDialogTests(unittest.IsolatedAsyncioTestCase):
 class AskDraftTests(unittest.IsolatedAsyncioTestCase):
     async def test_ask_preserves_the_separate_normal_draft_and_cursor(self):
         cases = [
-            ['2', {'action': 'answered', 'answer': 'Remote'}, False],
-            ['via VPN', {'action': 'answered', 'answer': 'via VPN'}, False],
-            ['d', {'action': 'declined'}, False],
-            ['', {'action': 'cancelled'}, False],
-            [None, {'action': 'cancelled'}, False],
-            ['1,2', {'action': 'answered', 'answer': ['Local', 'Remote']}, True],
+            ('2', {'action': 'answered', 'answer': 'Remote'}, False),
+            ('via VPN', {'action': 'answered', 'answer': 'via VPN'}, False),
+            ('d', {'action': 'declined'}, False),
+            ('', {'action': 'cancelled'}, False),
+            (None, {'action': 'cancelled'}, False),
+            ('1,2', {'action': 'answered', 'answer': ['Local', 'Remote']}, True),
         ]
         draft = 'Keep this\n\u96ea draft'
         for reply, expected, multi_select in cases:
@@ -216,8 +216,8 @@ class AskDraftTests(unittest.IsolatedAsyncioTestCase):
                     async with running_fixture_task(terminal_frontend.run_ask_dialog_async(
                             session, keyboard.cancel_event, 'Which storage?', options(),
                             multi_select=multi_select)) as question:
-                        answer_frame = await keyboard.next_read(question)
-                        self.assertEqual(answer_frame[1:], ['', 0])
+                        _prompt, buffer_text, cursor = await keyboard.next_read(question)
+                        self.assertEqual((buffer_text, cursor), ('', 0))
                         if reply is None:
                             keyboard.feed('CTRL_C')
                         else:
@@ -243,10 +243,11 @@ class AskDraftTests(unittest.IsolatedAsyncioTestCase):
                 for _ in range(2):
                     async with running_fixture_task(terminal_frontend.run_ask_dialog_async(
                             session, keyboard.cancel_event, 'Which storage?', options())) as question:
-                        self.assertEqual((await keyboard.next_read(question))[1:], ['', 0])
+                        _prompt, buffer_text, cursor = await keyboard.next_read(question)
+                        self.assertEqual((buffer_text, cursor), ('', 0))
                         await keyboard.press(question, 'TEXT', '99')
-                        self.assertEqual(
-                            (await keyboard.press(question, 'ENTER'))[1:], ['', 0])
+                        _prompt, buffer_text, cursor = await keyboard.press(question, 'ENTER')
+                        self.assertEqual((buffer_text, cursor), ('', 0))
                         await keyboard.press(question, 'TEXT', '1')
                         keyboard.feed('ENTER')
                         self.assertEqual(await question, {'action': 'answered', 'answer': 'Local'})

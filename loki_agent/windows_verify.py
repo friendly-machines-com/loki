@@ -94,14 +94,15 @@ def verify_container(workspace: str, grants: list[Grant], *, ledger=None) -> lis
             else "configuration must grant read access only"))
     except windows_api.WindowsApiError as error:
         checks.append(Check("config", "fail", str(error)))
-    for tree, name in [[paths.credential_directory(), "credentials"]]:
-        try:
-            sddl = windows_api.dacl_sddl(tree)
-            allowed = package_allow(sddl, package)
-            header, _aces = dacl_parts(sddl)
-        except windows_api.WindowsApiError as error:
-            checks.append(Check(name, "fail", str(error)))
-            continue
+    tree = paths.credential_directory()
+    name = "credentials"
+    try:
+        sddl = windows_api.dacl_sddl(tree)
+        allowed = package_allow(sddl, package)
+        header, _aces = dacl_parts(sddl)
+    except windows_api.WindowsApiError as error:
+        checks.append(Check(name, "fail", str(error)))
+    else:
         if allowed:
             checks.append(Check(
                 name, "fail", f"package SID is granted {allowed:#x}"))
@@ -208,22 +209,22 @@ _CREDENTIAL_DIRECTORY_PROBES = (
 # File mutation checks shared by private credentials and readable configuration.
 # Opening and closing without using the handle does not mutate the object.
 _FILE_MUTATION_PROBES = [
-    ["not writable", windows_api.AccessMask.GENERIC_WRITE,
-     "cannot be opened for write"],
-    ["data not writable", windows_api.AccessMask.FILE_WRITE_DATA,
-     "cannot be opened to change its contents"],
-    ["attributes not writable", windows_api.AccessMask.FILE_WRITE_ATTRIBUTES,
-     "cannot be opened to change its attributes"],
-    ["extended attributes not writable", windows_api.AccessMask.FILE_WRITE_EA,
-     "cannot be opened to change its extended attributes"],
-    ["not appendable", windows_api.AccessMask.FILE_APPEND_DATA,
-     "cannot be opened for append"],
-    ["not deletable", windows_api.AccessMask.DELETE,
-     "cannot be opened to delete it"],
-    ["DACL not rewritable", windows_api.AccessMask.WRITE_DAC,
-     "cannot be opened to rewrite its DACL"],
-    ["owner not rewritable", windows_api.AccessMask.WRITE_OWNER,
-     "cannot be opened to change its owner"],
+    ("not writable", windows_api.AccessMask.GENERIC_WRITE,
+     "cannot be opened for write"),
+    ("data not writable", windows_api.AccessMask.FILE_WRITE_DATA,
+     "cannot be opened to change its contents"),
+    ("attributes not writable", windows_api.AccessMask.FILE_WRITE_ATTRIBUTES,
+     "cannot be opened to change its attributes"),
+    ("extended attributes not writable", windows_api.AccessMask.FILE_WRITE_EA,
+     "cannot be opened to change its extended attributes"),
+    ("not appendable", windows_api.AccessMask.FILE_APPEND_DATA,
+     "cannot be opened for append"),
+    ("not deletable", windows_api.AccessMask.DELETE,
+     "cannot be opened to delete it"),
+    ("DACL not rewritable", windows_api.AccessMask.WRITE_DAC,
+     "cannot be opened to rewrite its DACL"),
+    ("owner not rewritable", windows_api.AccessMask.WRITE_OWNER,
+     "cannot be opened to change its owner"),
 ]
 
 # Both files the storage uses, not just the JSON: the lock is a different

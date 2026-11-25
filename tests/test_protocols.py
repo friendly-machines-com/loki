@@ -566,8 +566,8 @@ class NativeIdentityTests(unittest.TestCase):
 class ContractOwnershipTests(unittest.TestCase):
     def test_returned_modes_cannot_modify_active_contract(self):
         for url, model, rejected in [
-                ["https://api.anthropic.com/v1/messages", "claude-opus-4-7", "manual"],
-                ["https://api.z.ai/api/paas/v4/chat/completions", "glm-5.3", "off"]]:
+                ("https://api.anthropic.com/v1/messages", "claude-opus-4-7", "manual"),
+                ("https://api.z.ai/api/paas/v4/chat/completions", "glm-5.3", "off")]:
             provider = protocols.make_provider(url)
             published = provider.thinking_modes(model)
             published.append(rejected)

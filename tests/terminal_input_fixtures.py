@@ -69,7 +69,7 @@ class PromptKeyboard:
                 self.prompt = prompt
 
             def render(self, buffer):
-                keyboard.frames.append([self.prompt, buffer.text(), buffer.cursor])
+                keyboard.frames.append((self.prompt, buffer.text(), buffer.cursor))
 
         with (
             mock.patch.object(terminals, 'AsyncKeyReader', return_value=self),

@@ -274,7 +274,7 @@ class ProbeContainmentTests(unittest.TestCase):
 
     def test_tool_state_is_readable_but_every_mutation_direction_is_denied(self):
         role = windows_state.tool_role_sid(PACKAGE)
-        with mock.patch.object(windows_api, 'token_restricting_sids', return_value=[[role, 7]]):
+        with mock.patch.object(windows_api, 'token_restricting_sids', return_value=[(role, 7)]):
             self.happy()
             self.deny(STATE, windows_api.AccessMask.GENERIC_WRITE)
             self.assertTrue(all(check.status == 'pass' for check in self.checks().values()))
@@ -640,12 +640,15 @@ class VerifyContainerTests(unittest.TestCase):
                 self.descriptors[CONFIG] = f"D:PAI{ace}"
                 self.assertEqual(self.check(GRANTED, self.READ)["config"].status, "fail")
 
-    def test_an_allow_ace_on_a_private_tree_fails(self):
-        for tree, label in [[CREDENTIALS, "credentials"]]:
-            with self.subTest(tree=tree):
-                self.descriptors[tree] = f"D:PAI(A;OICI;FRFX;;;{PACKAGE})"
-                self.assertEqual(self.check(GRANTED, self.READ)[label].status, "fail")
-                self.descriptors.pop(tree)
+    def test_an_allow_ace_on_the_credentials_directory_fails(self):
+        self.descriptors[CREDENTIALS] = f"D:PAI(A;OICI;FRFX;;;{PACKAGE})"
+        self.assertEqual(self.check(GRANTED, self.READ)["credentials"].status, "fail")
+
+    def test_invalid_credentials_dacl_does_not_skip_state_checks(self):
+        self.descriptors[CREDENTIALS] = "invalid descriptor"
+        checks = self.check(GRANTED, self.READ)
+        self.assertEqual(checks["credentials"].status, "fail")
+        self.assertEqual(checks["state"].status, "pass")
 
     def test_credentials_must_block_inheritance_from_readable_configuration(self):
         self.descriptors[CREDENTIALS] = f"D:AI(A;OICI;FA;;;{OTHER})"

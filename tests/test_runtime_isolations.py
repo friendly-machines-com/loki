@@ -229,17 +229,17 @@ class LinuxIsolationTests(unittest.TestCase):
                 runtime_isolations, '_drop_namespace_capabilities',
                 side_effect=runtime_isolations.RuntimeIsolationError('capabilities') if failure == 'capabilities' else None))
             stack.enter_context(mock.patch.object(runtime_isolations.os, 'close', side_effect=closed.append))
-            yield [mount, closed]
+            yield (mount, closed)
 
     def test_mount_target_is_bound_to_the_checked_directory_handle(self):
-        with self.directory_startup() as [mount, closed]:
+        with self.directory_startup() as (mount, closed):
             self.assertTrue(runtime_isolations.isolate_credential_directory(80))
             self.assertEqual(mount.call_args.args[1], '/proc/self/fd/81')
             self.assertCountEqual(closed, [80, 81])
 
     def test_startup_directory_handles_close_on_every_failure(self):
         for failure in ['name', 'namespace', 'reopen', 'identity', 'mount', 'cwd', 'capabilities']:
-            with self.subTest(failure=failure), self.directory_startup(failure) as [mount, closed]:
+            with self.subTest(failure=failure), self.directory_startup(failure) as (mount, closed):
                 with self.assertRaises(runtime_isolations.RuntimeIsolationError):
                     runtime_isolations.isolate_credential_directory(80)
                 self.assertCountEqual(closed, [80] if failure in ['name', 'namespace', 'reopen'] else [80, 81])
@@ -413,8 +413,8 @@ if mode.startswith('bind-'):
                       ctypes.c_ulong,ctypes.c_void_p]
     mount.restype = ctypes.c_int
     for source,destination,flags in [
-            [None,b'/',isolation._MS_REC | isolation._MS_PRIVATE],
-            [os.fsencode(base),os.fsencode(view),4096]]:
+            (None,b'/',isolation._MS_REC | isolation._MS_PRIVATE),
+            (os.fsencode(base),os.fsencode(view),4096)]:
         if mount(source,destination,None,flags,None) != 0:
             raise OSError(ctypes.get_errno(), 'fixture bind mount failed')
     target = paths.credential_directory({'XDG_CONFIG_HOME': view})
@@ -1421,8 +1421,8 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
         from process_lifecycle_fixtures import process_lifecycle
         from loki_agent import host_ipc
 
-        for kind, repeat in [['terminal', False], ['worker', False],
-                             ['terminal', True], ['worker', True]]:
+        for kind, repeat in [('terminal', False), ('worker', False),
+                             ('terminal', True), ('worker', True)]:
             with self.subTest(kind=kind, repeated_cancellation=repeat):
                 async with process_lifecycle('loki' if kind == 'terminal' else 'loki-acp') as fixture:
                     entered, release = asyncio.Event(), asyncio.Event()

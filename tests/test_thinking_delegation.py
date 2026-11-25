@@ -169,7 +169,7 @@ class ThinkingDelegationTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase
         opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
         session_id = opened['sessionId']
         for request_id, config_id, value in [
-                [3, 'reasoning_effort', 'effort:high'], [4, 'reasoning_traces', 'on']]:
+                (3, 'reasoning_effort', 'effort:high'), (4, 'reasoning_traces', 'on')]:
             configured, _ = await self._request(front, request_id, 'session/set_config_option', {
                 'sessionId': session_id, 'configId': config_id, 'value': value})
             self.assertEqual(next(option['currentValue'] for option in configured['configOptions']

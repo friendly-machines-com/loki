@@ -75,7 +75,7 @@ class DriverProcessTests(unittest.TestCase):
         # Each file announces admission before waiting for the other. Serial
         # execution cannot satisfy this barrier; a deadline would additionally
         # impose an unrelated startup-speed requirement on healthy parallel runs.
-        for name, other in [["a", "b"], ["b", "a"]]:
+        for name, other in [("a", "b"), ("b", "a")]:
             self.write(f"test_{name}.py", f"""
                 import pathlib, sys, time, unittest
                 root = pathlib.Path({str(self.root)!r})

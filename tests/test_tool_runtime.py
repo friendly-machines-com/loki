@@ -48,13 +48,13 @@ ARRAY_SCHEMA = {
 
 class ExplicitToolResultTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_status_is_independent_of_content(self):
-        for ok, content in [[True, 'Error: quoted successful data'],
-                            [True, 'Failed is a word in the answer'],
-                            [False, 'No interactive user is available'],
-                            [True, [formats.text_block('Image result'), {
+        for ok, content in [(True, 'Error: quoted successful data'),
+                            (True, 'Failed is a word in the answer'),
+                            (False, 'No interactive user is available'),
+                            (True, [formats.text_block('Image result'), {
                                 'type': 'image', 'source': {
-                                    'type': 'base64', 'media_type': 'image/png', 'data': 'AAAA'}}]],
-                            [False, [formats.text_block('Explicit failure')]]]:
+                                    'type': 'base64', 'media_type': 'image/png', 'data': 'AAAA'}}]),
+                            (False, [formats.text_block('Explicit failure')])]:
             async def operation():
                 return tool_runtime.tool_result(ok, content)
 
@@ -454,7 +454,7 @@ class ExternalHookTests(unittest.TestCase):
                     await resources.cleanup()
                     host_process.release_group(resources.process)
 
-        for output, status, failed in [['{}', 0, False], ['[]', 0, True], ['{}', 3, True]]:
+        for output, status, failed in [('{}', 0, False), ('[]', 0, True), ('{}', 3, True)]:
             with self.subTest(output=output, status=status):
                 asyncio.run(scenario(output, status, failed))
 
@@ -934,11 +934,11 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
         ]
         for path in paths:
             for name, arguments in [
-                ["Read", {"file_path": path}],
-                ["Write", {"file_path": path, "content": "literal content"}],
-                ["Edit", {"file_path": path, "old_string": "old", "new_string": "new"}],
-                ["Glob", {"path": path, "pattern": "*"}],
-                ["Grep", {"path": path, "pattern": "notes"}],
+                ("Read", {"file_path": path}),
+                ("Write", {"file_path": path, "content": "literal content"}),
+                ("Edit", {"file_path": path, "old_string": "old", "new_string": "new"}),
+                ("Glob", {"path": path, "pattern": "*"}),
+                ("Grep", {"path": path, "pattern": "notes"}),
             ]:
                 with self.subTest(tool=name, path=path):
                     call = formats.tool_call_item("call_path", name, arguments)
@@ -1276,11 +1276,11 @@ class TurnEndHookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = os.path.join(directory, "settings.ini")
             for text, message in [
-                    [f"[hook.turn_end.x]\ncommand.0 = true\ncwd = {directory}\n"
-                     "tools.0 = Bash\n", "does not support tools"],
-                    [f"[hook.pre_tool_call.x]\ncommand.0 = true\ncwd = {directory}\n"
+                    (f"[hook.turn_end.x]\ncommand.0 = true\ncwd = {directory}\n"
+                     "tools.0 = Bash\n", "does not support tools"),
+                    (f"[hook.pre_tool_call.x]\ncommand.0 = true\ncwd = {directory}\n"
                      f"[hook.turn_end.x]\ncommand.0 = true\ncwd = {directory}\n",
-                     "duplicate hook id"]]:
+                     "duplicate hook id")]:
                 with open(config_path, "w", encoding="utf-8") as stream:
                     stream.write(text)
                 with self.assertRaisesRegex(settings.HookConfigurationError, message):

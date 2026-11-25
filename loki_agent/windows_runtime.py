@@ -572,12 +572,19 @@ def prepare_contained(process, executable, arguments, environment, workspace, in
             handle = duplicate_standard_handle(None, fd)
             duplicated_stdio.callback(api.close_handle, handle)
             duplicates.append(handle)
-        standard_handles = [*stdio, duplicates[-1]] if stdio is not None else duplicates
+        inherited_handles = [*inherited_handles, *duplicates]
+        if stdio is None:
+            stdin_handle, stdout_handle, stderr_handle = duplicates
+        else:
+            stdin_handle, stdout_handle = stdio
+            stderr_handle, = duplicates
+            inherited_handles.extend([stdin_handle, stdout_handle])
+        standard_handles = (stdin_handle, stdout_handle, stderr_handle)
         process.information = api.ProcessInformation()
         process.information = api.create_process_in_app_container(
             executable, arguments, package, information=process.information,
             current_directory=current_directory,
-            inherited_handles=[*inherited_handles, *duplicates, *(stdio if stdio is not None else [])],
+            inherited_handles=inherited_handles,
             environment=child_environment, standard_handles=standard_handles,
             object_security=private, capability_sids=sorted(_NETWORK_CAPABILITIES))
         process.pid = process.information.dwProcessId

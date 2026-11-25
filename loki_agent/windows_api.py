@@ -1047,7 +1047,7 @@ def _token_groups(token, kind, name='TokenGroups'):
         raise WindowsApiError(f'{name} returned a short group buffer')
     entries = [_SidAttributes.from_buffer(storage, _TokenGroups.first.offset + i * ctypes.sizeof(_SidAttributes))
                for i in range(count)]
-    return sorted([sid_text(entry.sid), entry.attributes] for entry in entries)
+    return sorted((sid_text(entry.sid), entry.attributes) for entry in entries)
 
 
 def token_restricting_sids(token):

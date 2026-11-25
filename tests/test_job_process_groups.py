@@ -94,7 +94,7 @@ class _Group:
 
             def accept(reader, writer):
                 self.writers.append(writer)
-                self.accepted.put_nowait([reader, writer])
+                self.accepted.put_nowait((reader, writer))
 
             server = await asyncio.start_unix_server(accept, self.path)
             self.server = await scope.enter_async_context(server)
@@ -137,8 +137,8 @@ class _Group:
                 reader, writer = await observe_fixture(self.accepted.get(), *owners)
                 line = await observe_fixture(reader.readline(), *owners)
                 name, pid, pgid = line.decode().split()
-                self.connections[name] = [reader, writer]
-                self.facts[name] = [int(pid), int(pgid)]
+                self.connections[name] = (reader, writer)
+                self.facts[name] = (int(pid), int(pgid))
             if set(self.connections) != {'leader', 'child0', 'child1'}:
                 raise AssertionError(f'missing group members: {self.facts}')
             for pid, pgid in self.facts.values():

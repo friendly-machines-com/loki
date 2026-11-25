@@ -78,9 +78,9 @@ class ImageReadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_other_supported_signatures_are_returned_as_images(self):
         # Local validation deliberately checks signatures, not pixel decoding.
-        for payload, mime in [[b"\xff\xd8\xffjpeg", "image/jpeg"],
-                              [b"GIF89agif", "image/gif"],
-                              [b"RIFF\x04\x00\x00\x00WEBP", "image/webp"]]:
+        for payload, mime in [(b"\xff\xd8\xffjpeg", "image/jpeg"),
+                              (b"GIF89agif", "image/gif"),
+                              (b"RIFF\x04\x00\x00\x00WEBP", "image/webp")]:
             with self.subTest(mime=mime):
                 path = self.make_file(payload, suffix="")
                 _, result, _ = await self.execute(path, offset=9999, limit=1)
@@ -93,9 +93,9 @@ class ImageReadTests(unittest.IsolatedAsyncioTestCase):
         invalid = self.make_file(b"not an image")
         missing = self.make_file()
         os.unlink(missing)
-        for path, diagnostic in [[invalid, "unsupported image data"],
-                                 [missing, "File not found"],
-                                 [self.directory, "directory"]]:
+        for path, diagnostic in [(invalid, "unsupported image data"),
+                                 (missing, "File not found"),
+                                 (self.directory, "directory")]:
             with self.subTest(diagnostic=diagnostic):
                 _, result, _ = await self.execute(path)
                 self.assertFalse(result["ok"], result)
@@ -144,9 +144,9 @@ class ImageReadTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("changed on disk", result["content"])
 
     async def test_real_read_continuation_sends_image_bytes_across_provider_request_paths(self):
-        cases = [[protocols.OPENAI_CHAT, None], [protocols.ANTHROPIC_MESSAGES, None],
-                 [protocols.OPENAI_RESPONSES, None], [protocols.OPENAI_RESPONSES, False],
-                 [protocols.OPENAI_RESPONSES, True]]
+        cases = [(protocols.OPENAI_CHAT, None), (protocols.ANTHROPIC_MESSAGES, None),
+                 (protocols.OPENAI_RESPONSES, None), (protocols.OPENAI_RESPONSES, False),
+                 (protocols.OPENAI_RESPONSES, True)]
         for protocol, lite in cases:
             with self.subTest(protocol=protocol, subscription_lite=lite):
                 path = self.make_file()

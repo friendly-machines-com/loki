@@ -31,12 +31,12 @@ class FileObservationTests(unittest.TestCase):
     def test_read_preserves_bounded_utf8_newlines_and_full_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             for name, payload, expected in [
-                    ['text', b'known\r\ncontent', '1\tknown\n2\tcontent'],
-                    ['binary', b'\xff\x00binary', 'binary (8 bytes)'],
-                    ['incomplete', b'\xc3', 'binary (1 bytes)'],
-                    ['empty', b'', 'is empty'],
-                    ['image.png', PNG_BYTES, f'is an image (image/png, {len(PNG_BYTES)} bytes)'],
-                    ['capped', b'visible\r\n' + b'x' * 65526 + b'\xff', '1\tvisible']]:
+                    ('text', b'known\r\ncontent', '1\tknown\n2\tcontent'),
+                    ('binary', b'\xff\x00binary', 'binary (8 bytes)'),
+                    ('incomplete', b'\xc3', 'binary (1 bytes)'),
+                    ('empty', b'', 'is empty'),
+                    ('image.png', PNG_BYTES, f'is an image (image/png, {len(PNG_BYTES)} bytes)'),
+                    ('capped', b'visible\r\n' + b'x' * 65526 + b'\xff', '1\tvisible')]:
                 path = os.path.join(directory, name)
                 with open(path, 'wb') as stream:
                     stream.write(payload)
@@ -132,8 +132,8 @@ class FilePathTests(unittest.TestCase):
         self.addCleanup(other.response_headers.close)
         with mock.patch.object(loki, '_DEFAULT_SESSION', other):
             for tool, arguments in [
-                    ['Write', {'file_path': target, 'content': 'wrong'}],
-                    ['Edit', {'file_path': target, 'old_string': 'reviewed', 'new_string': 'wrong'}]]:
+                    ('Write', {'file_path': target, 'content': 'wrong'}),
+                    ('Edit', {'file_path': target, 'old_string': 'reviewed', 'new_string': 'wrong'})]:
                 with self.subTest(tool=tool):
                     result = asyncio.run(loki.dispatch_tool_async(tool, arguments))
                     self.assertFalse(result['ok'], result)
@@ -344,17 +344,17 @@ class FilePathTests(unittest.TestCase):
         os.unlink(target)
         os.mkfifo(target)
         for failure, operation in [
-                [OSError, lambda: loki.run_read(target)],
-                [ValueError, lambda: loki.run_write(target, 'wrong')],
-                [OSError, lambda: loki.run_edit(target, 'reviewed', 'wrong')]]:
+                (OSError, lambda: loki.run_read(target)),
+                (ValueError, lambda: loki.run_write(target, 'wrong')),
+                (OSError, lambda: loki.run_edit(target, 'reviewed', 'wrong'))]:
             with self.subTest(direct_operation=operation), \
                     self.assertRaisesRegex(failure, 'file is not a regular file'):
                 operation()
             self.assertTrue(stat.S_ISFIFO(os.stat(target).st_mode))
         calls = [
-            ['Read', {'file_path': target}],
-            ['Write', {'file_path': target, 'content': 'wrong'}],
-            ['Edit', {'file_path': target, 'old_string': 'reviewed', 'new_string': 'wrong'}],
+            ('Read', {'file_path': target}),
+            ('Write', {'file_path': target, 'content': 'wrong'}),
+            ('Edit', {'file_path': target, 'old_string': 'reviewed', 'new_string': 'wrong'}),
         ]
         for name, arguments in calls:
             with self.subTest(tool=name):

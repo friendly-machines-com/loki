@@ -67,7 +67,7 @@ class StreamingPreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await savefiles.preview(Fragments(pieces()), chunk_size=4096), 'target after metadata')
 
     async def test_late_role_cannot_publish_a_preview_before_classification(self):
-        for role, expected in [['user', 'a' * 77 + '...'], ['assistant', '']]:
+        for role, expected in [('user', 'a' * 77 + '...'), ('assistant', '')]:
             def pieces():
                 yield '{"events":[{"type":"message","content":[{"type":"text","text":"'
                 for _ in range(128):
@@ -109,7 +109,7 @@ class StreamingPreviewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_partial_and_malformed_input_returns_only_a_recognizable_prefix(self):
         start = '{"events":[{"type":"message","role":"user","content":[{"type":"text","text":"'
-        for tail, expected in [['hello', 'hello'], ['hello\\uD8', 'hello'], ['hello\\q', 'hello']]:
+        for tail, expected in [('hello', 'hello'), ('hello\\uD8', 'hello'), ('hello\\q', 'hello')]:
             for size in [1, 7]:
                 with self.subTest(tail=tail, size=size):
                     self.assertEqual(await savefiles.preview(io.StringIO(start + tail), chunk_size=size), expected)

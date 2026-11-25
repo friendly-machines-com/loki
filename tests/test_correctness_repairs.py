@@ -761,7 +761,7 @@ class JobOwnershipContractTests(unittest.IsolatedAsyncioTestCase):
 
                 async def create(*command, **kwargs):
                     kwargs['before_resume']()
-                    calls.append([list(command), kwargs['owning'], kwargs['cwd']])
+                    calls.append((list(command), kwargs['owning'], kwargs['cwd']))
                     return Child()
 
                 with mock.patch.object(job_runtime.host_process, 'create_exec', side_effect=create), \
@@ -973,8 +973,8 @@ class JobOwnershipContractTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(owned.cwd, owned_cwd)
                         self.assertEqual(ordinary.cwd, ordinary_cwd)
                         self.assertNotEqual(owned.id, ordinary.id)
-                        for job, marker in [[owned, 'owned-ready:'],
-                                            [ordinary, 'ordinary-ready:']]:
+                        for job, marker in [(owned, 'owned-ready:'),
+                                            (ordinary, 'ordinary-ready:')]:
                             await self._output_until(manager, job, marker + job.cwd)
                         self.assertEqual(manager._active_subagents, 1)
                         listing = loki.run_ps()

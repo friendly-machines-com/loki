@@ -129,7 +129,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
                               async_cleanup=self.addAsyncCleanup)
         script = (
             "import os,sys\n"
-            "for fd, text in [[1, sys.argv[1]], [2, sys.argv[2]]]:\n"
+            "for fd, text in [(1, sys.argv[1]), (2, sys.argv[2])]:\n"
             "    data = text.encode('ascii')\n"
             "    os.write(fd, b'original longer output' * 32)\n"
             "    os.lseek(fd, 0, os.SEEK_SET)\n"
@@ -161,7 +161,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
                     json.dump({'id': 'forged', 'status': 'running', 'pid': 0, 'exit_code': 0}, stream)
                 self.assertIn(f'{job.id}. status=exited pid={job.pid} exit=7 ', manager.list_jobs())
                 self.assertIn('\nexit_code: 7\n', manager.job_status(job.id))
-                completed.append([job, stdout, stderr])
+                completed.append((job, stdout, stderr))
                 # A later launch gets its own endpoints. Rewriting those must
                 # not redirect the earlier job's captures.
                 for other, expected_output, expected_errors in completed:
@@ -397,7 +397,7 @@ class WindowsRelativeDirectoryTests(unittest.TestCase):
     def test_relative_directory_handle_refuses_reparse_points_and_closes_on_error(self):
         from loki_agent import _private_files_windows as backend
 
-        for attributes, succeeds in [[0x10, True], [0x410, False]]:
+        for attributes, succeeds in [(0x10, True), (0x410, False)]:
             with self.subTest(attributes=attributes), mock.patch.object(
                     windows_api, 'nt_create_file', return_value=77) as create, mock.patch.object(
                     windows_api, 'by_handle_file_information',

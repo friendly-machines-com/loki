@@ -120,7 +120,7 @@ class PresentationTests(unittest.TestCase):
             capture.write(b'visible')
             capture.flush()
             with mock.patch.object(process_outputs.os, 'fstat', return_value=types.SimpleNamespace(st_size=64)):
-                for tail, limit in [[False, 32], [True, 32], [True, 4]]:
+                for tail, limit in [(False, 32), (True, 32), (True, 4)]:
                     with self.subTest(tail=tail, limit=limit):
                         with self.assertRaisesRegex(OSError, 'output ended before the preview'):
                             process_outputs.preview(capture, limit, tail=tail)
@@ -203,7 +203,7 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("stdout-secret", json.dumps(acp_events.map_event("session", event, {})))
 
     def test_saved_presentation_data_is_validated(self):
-        for field, value in [["stdout", []], ["shell", 1], ["tail", "true"], ["header", None]]:
+        for field, value in [("stdout", []), ("shell", 1), ("tail", "true"), ("header", None)]:
             with self.subTest(field=field):
                 events = transcript(process_event())
                 events[-1]["process_output"][field] = value
@@ -236,13 +236,13 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_capture_preserves_original_model_text(self):
         job = types.SimpleNamespace(exit_code=7)
         for arguments, budget in [
-                [{}, tool_contracts.BASH_DEFAULT_TIMEOUT_MS],
-                [{"timeout": None}, None],
-                [{"timeout": 0}, 0],
-                [{"timeout": 1234}, 1234]]:
+                ({}, tool_contracts.BASH_DEFAULT_TIMEOUT_MS),
+                ({"timeout": None}, None),
+                ({"timeout": 0}, 0),
+                ({"timeout": 1234}, 1234)]:
             with self.subTest(arguments=arguments), mock.patch.object(
                     self.manager, "run_foreground", new=mock.AsyncMock(
-                        return_value=[job, "completed", "stdout-secret", "stderr-message"])) as run:
+                        return_value=(job, "completed", "stdout-secret", "stderr-message"))) as run:
                 result = await self.execute(**arguments)
                 self.assertEqual(run.await_args.args[2], budget)
                 self.assertEqual(result["content"],
@@ -279,15 +279,15 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         job = types.SimpleNamespace(exit_code=0)
         for caller in [self.manager.run_shell, loki.run_bash_async]:
             for arguments, budget in [
-                    [{}, tool_contracts.BASH_DEFAULT_TIMEOUT_MS],
-                    [{"timeout": None}, None],
-                    [{"timeout": 0}, 0],
-                    [{"timeout": 1234}, 1234],
-                    [{"timeout": tool_contracts.BASH_MAX_TIMEOUT_MS + 1},
-                     tool_contracts.BASH_MAX_TIMEOUT_MS]]:
+                    ({}, tool_contracts.BASH_DEFAULT_TIMEOUT_MS),
+                    ({"timeout": None}, None),
+                    ({"timeout": 0}, 0),
+                    ({"timeout": 1234}, 1234),
+                    ({"timeout": tool_contracts.BASH_MAX_TIMEOUT_MS + 1},
+                     tool_contracts.BASH_MAX_TIMEOUT_MS)]:
                 with self.subTest(caller=caller, arguments=arguments), mock.patch.object(
                         self.manager, "run_foreground", new=mock.AsyncMock(
-                            return_value=[job, "completed", "out", "err"])) as run:
+                            return_value=(job, "completed", "out", "err"))) as run:
                     await caller("example", **arguments)
                     self.assertEqual(run.await_args.args[2], budget)
 
@@ -385,7 +385,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
     async def _interrupted_capture(self, status):
         job = types.SimpleNamespace(exit_code=-15)
         with mock.patch.object(self.manager, "run_foreground", new=mock.AsyncMock(
-                return_value=[job, status, "partial-stdout", "partial-stderr"])):
+                return_value=(job, status, "partial-stdout", "partial-stderr"))):
             result = await self.execute(timeout=100)
         self.assertFalse(result["ok"])
         output = process_outputs.ProcessOutput.from_dict(result["process_output"])
@@ -430,7 +430,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         pipeline.add_post("test.note", lambda _invocation, _outcome: tool_runtime.PostHookDecision(note="Important hook note"))
         job = types.SimpleNamespace(exit_code=0)
         with mock.patch.object(self.manager, "run_foreground", new=mock.AsyncMock(
-                return_value=[job, "completed", "stdout-secret", "stderr-message"])):
+                return_value=(job, "completed", "stdout-secret", "stderr-message"))):
             result = await self.execute(pipeline=pipeline)
         self.assertTrue(result["content"].startswith("Important hook note\n\n"))
         hidden = process_outputs.presentation_text(result["content"], result["process_output"])
@@ -471,7 +471,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
     async def test_programmatic_shell_calls_keep_the_complete_text_projection(self):
         job = types.SimpleNamespace(exit_code=0)
         with mock.patch.object(self.manager, "run_foreground", new=mock.AsyncMock(
-                return_value=[job, "completed", "stdout-secret", "stderr-message"])):
+                return_value=(job, "completed", "stdout-secret", "stderr-message"))):
             output = await loki.run_bash_async("manual-command")
         self.assertIsInstance(output, str)
         self.assertIn("stdout-secret", output)
@@ -553,12 +553,12 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         long_stdout = 'stdout start ' + 'o' * 200 + ' stdout end'
         long_stderr = 'stderr start ' + 'e' * 200 + ' stderr end'
         cases = [
-            ['short stdout', 'short stderr', False, False],
-            ['', 'stderr only', False, False],
-            ['', '', False, False],
-            ['x' * 100, 'short stderr', False, False],
-            [long_stdout, 'short stderr', True, False],
-            [long_stdout, long_stderr, True, True],
+            ('short stdout', 'short stderr', False, False),
+            ('', 'stderr only', False, False),
+            ('', '', False, False),
+            ('x' * 100, 'short stderr', False, False),
+            (long_stdout, 'short stderr', True, False),
+            (long_stdout, long_stderr, True, True),
         ]
         commands = [f"!printf '%s' {quote(out)}; printf '%s' {quote(err)} >&2" for out, err, _, _ in cases]
 
@@ -572,7 +572,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             out_view = out_view.removeprefix('\n[stdout]\n')
             self.assertLessEqual(len(out_view) + len(err_view), limit)
             for path, full, shown, cut in [
-                    [job.stdout_path, out, out_view, out_cut], [job.stderr_path, err, err_view, err_cut]]:
+                    (job.stdout_path, out, out_view, out_cut), (job.stderr_path, err, err_view, err_cut)]:
                 with open(path, encoding='utf-8') as saved:
                     self.assertEqual(saved.read(), full)
                 if cut:
@@ -654,7 +654,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         items = [formats.message_item("user", "run it")]
         job = types.SimpleNamespace(exit_code=0)
         with mock.patch.object(self.manager, "run_foreground", new=mock.AsyncMock(
-                return_value=[job, "completed", "stdout-secret", "stderr-message"])):
+                return_value=(job, "completed", "stdout-secret", "stderr-message"))):
             self.assertEqual(await loki.run_tool_loop_async(
                 items, chat_fn=chat, on_event=events.append, hook_pipeline=tool_runtime.ToolHookPipeline()), "done")
         result = next(item for item in items if item["type"] == "tool_result")

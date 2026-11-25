@@ -765,9 +765,9 @@ class AnthropicConnectionTests(unittest.IsolatedAsyncioTestCase):
         ]
         no_override = CredentialInventory({}, refs)
         for provider_id, settings, expected in [
-                [subscription, {}, True],
-                [subscription, {"LOKI_STREAM": "0"}, False],
-                ["anthropic", {}, False]]:
+                (subscription, {}, True),
+                (subscription, {"LOKI_STREAM": "0"}, False),
+                ("anthropic", {}, False)]:
             with self.subTest(provider_id=provider_id, settings=settings):
                 provider = catalog[provider_id]
                 config = connections.config_from_modelsdev_selection(
@@ -1054,11 +1054,11 @@ class AnthropicLoginCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.storage.store_openai_login(authentications.OpenAITokenSet("a", "r"))
         original = self.storage.load_document()
         for provider, key, invalid_record, healthy_status in [
-                ["anthropic", credential_storages.ANTHROPIC_CREDENTIAL_KEY, None,
-                 "OpenAI ChatGPT subscription: logged in"],
-                ["openai", credential_storages.OPENAI_CREDENTIAL_KEY,
+                ("anthropic", credential_storages.ANTHROPIC_CREDENTIAL_KEY, None,
+                 "OpenAI ChatGPT subscription: logged in"),
+                ("openai", credential_storages.OPENAI_CREDENTIAL_KEY,
                  {"type": credential_storages.OPENAI_RECORD_TYPE, "state": []},
-                 "Anthropic subscription: logged in"]]:
+                 "Anthropic subscription: logged in")]:
             with self.subTest(provider=provider):
                 document = dict(original, credentials=dict(original["credentials"]))
                 document["credentials"][key] = invalid_record

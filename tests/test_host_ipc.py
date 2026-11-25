@@ -256,7 +256,7 @@ class PrivatePipePairTests(unittest.TestCase):
 
     def test_owner_channel_inheritance_failure_closes_both_unpublished_ends(self):
         failure = OSError('cannot clear owner write inheritance')
-        with mock.patch.object(host_ipc, 'private_pipe', return_value=[201, 202]), \
+        with mock.patch.object(host_ipc, 'private_pipe', return_value=(201, 202)), \
                 mock.patch.object(host_ipc.windows_api, 'clear_handle_inheritance', side_effect=failure), \
                 mock.patch.object(host_ipc.windows_api, 'close_handle') as close:
             with self.assertRaises(OSError) as caught:

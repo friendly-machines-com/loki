@@ -79,8 +79,8 @@ def mountpoint_present(path):
     with open('/proc/self/mountinfo') as stream:
         for line in stream.read().splitlines():
             name = line.split()[4]
-            for encoded, decoded in [['\\040', ' '], ['\\011', '\t'],
-                                     ['\\012', '\n'], ['\\134', '\\']]:
+            for encoded, decoded in [('\\040', ' '), ('\\011', '\t'),
+                                     ('\\012', '\n'), ('\\134', '\\')]:
                 name = name.replace(encoded, decoded)
             if name == str(path):
                 return True
@@ -152,12 +152,12 @@ def credential_cover_probe(manifest_path):
         output = control.makefile('w', buffering=1)
         try:
             operations = [
-                ['cover-empty', lambda: os.listdir(cover_target)],
-                ['cover-open-token', lambda: (cover_target / 'tokens.json').open('rb').close()],
+                ('cover-empty', lambda: os.listdir(cover_target)),
+                ('cover-open-token', lambda: (cover_target / 'tokens.json').open('rb').close()),
                 # ~/.config is not a mountpoint, and rename checks operands
                 # only (fs/namei.c), so this succeeds: names in a writable
                 # parent belong to whoever can write that parent.
-                ['rename-config', lambda: configuration.rename(moved)],
+                ('rename-config', lambda: configuration.rename(moved)),
             ]
             results = []
             for name, action in operations:
@@ -268,21 +268,21 @@ def state_actions(manifest):
     state = Path(manifest['state'])
     workspace = Path(manifest['workspace'])
     operations = [
-        ['state-read', lambda: (state / 'read').read_bytes()],
-        ['state-create', lambda: (state / 'created').write_bytes(b'bad')],
-        ['state-append', lambda: append(state / 'append')],
-        ['state-truncate', lambda: (state / 'truncate').write_bytes(b'bad')],
-        ['state-unlink', lambda: (state / 'unlink').unlink()],
-        ['state-rename', lambda: (state / 'rename').rename(state / 'renamed')],
-        ['state-replace', lambda: os.replace(state / 'replacement-temp', state / 'replace')],
-        ['state-mkdir', lambda: (state / 'created-directory').mkdir()],
-        ['state-rmdir', lambda: (state / 'empty-directory').rmdir()],
-        ['state-chmod', lambda: (state / 'chmod').chmod(0o600)],
-        ['state-root-rename', lambda: state.rename(state.with_name('moved-state'))],
-        ['state-symlink-write', lambda: (workspace / 'state-alias' / 'via-link').write_bytes(b'bad')],
-        ['state-proc-root-write', lambda: Path('/proc/self/root' + str(state), 'via-proc').write_bytes(b'bad')],
-        ['workspace-write', lambda: (workspace / 'allowed').write_bytes(b'allowed')],
-        ['new-owner-file-read', lambda: (state / 'published-later').read_bytes()],
+        ('state-read', lambda: (state / 'read').read_bytes()),
+        ('state-create', lambda: (state / 'created').write_bytes(b'bad')),
+        ('state-append', lambda: append(state / 'append')),
+        ('state-truncate', lambda: (state / 'truncate').write_bytes(b'bad')),
+        ('state-unlink', lambda: (state / 'unlink').unlink()),
+        ('state-rename', lambda: (state / 'rename').rename(state / 'renamed')),
+        ('state-replace', lambda: os.replace(state / 'replacement-temp', state / 'replace')),
+        ('state-mkdir', lambda: (state / 'created-directory').mkdir()),
+        ('state-rmdir', lambda: (state / 'empty-directory').rmdir()),
+        ('state-chmod', lambda: (state / 'chmod').chmod(0o600)),
+        ('state-root-rename', lambda: state.rename(state.with_name('moved-state'))),
+        ('state-symlink-write', lambda: (workspace / 'state-alias' / 'via-link').write_bytes(b'bad')),
+        ('state-proc-root-write', lambda: Path('/proc/self/root' + str(state), 'via-proc').write_bytes(b'bad')),
+        ('workspace-write', lambda: (workspace / 'allowed').write_bytes(b'allowed')),
+        ('new-owner-file-read', lambda: (state / 'published-later').read_bytes()),
     ]
     results = [access_result(name, action) for name, action in operations]
     directory = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
@@ -416,7 +416,7 @@ class StateViewProbes(unittest.TestCase):
         cover_target.mkdir(parents=True)
         ready = asyncio.get_running_loop().create_future()
         server = await asyncio.start_unix_server(
-            lambda reader, writer: ready.set_result([reader, writer]),
+            lambda reader, writer: ready.set_result((reader, writer)),
             path=str(root / 'control.sock'))
         manifest = {'home': str(home), 'configuration': str(configuration),
                     'credentials': str(cover_target), 'control': str(root / 'control.sock')}
@@ -484,7 +484,7 @@ class StateViewProbes(unittest.TestCase):
         (workspace / 'state-alias').symlink_to(state, target_is_directory=True)
         ready = asyncio.get_running_loop().create_future()
         server = await asyncio.start_unix_server(
-            lambda reader, writer: ready.set_result([reader, writer]), path=str(workspace / 'control'))
+            lambda reader, writer: ready.set_result((reader, writer)), path=str(workspace / 'control'))
         manifest = {'state': str(state), 'workspace': str(workspace),
                     'control': str(workspace / 'control'), 'submount': submount,
                     'nested_source': str(nested_source), 'deployment': deployment, 'home': str(home)}

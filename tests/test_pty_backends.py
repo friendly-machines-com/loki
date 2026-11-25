@@ -90,7 +90,7 @@ class WindowsPtyTests(unittest.TestCase):
         self.addCleanup(pipe_patcher.stop)
         self.closed = []
         self.api['private_pipe'].side_effect = [
-            ['input-read', 'input-write'], ['output-read', 'output-write']]
+            ('input-read', 'input-write'), ('output-read', 'output-write')]
         self.hpc = ctypes.c_void_p(33)
         self.api['pseudoconsole_create'].return_value = self.hpc
         self.api['create_process_suspended'].side_effect = self.create
@@ -100,8 +100,8 @@ class WindowsPtyTests(unittest.TestCase):
         self.api['get_exit_code_process'].return_value = 0
 
     def create(self, executable, arguments, *, information, **options):
-        self.assertEqual([executable, arguments], ['/installed/loki', ['--help']])
-        self.assertEqual(options, {'pseudoconsole': 33, 'standard_handles': [None, None, None],
+        self.assertEqual((executable, arguments), ('/installed/loki', ['--help']))
+        self.assertEqual(options, {'pseudoconsole': 33, 'standard_handles': (None, None, None),
                                    'environment': {}, 'current_directory': '/workspace'})
         self.assertFalse(information.hProcess)
         self.assertFalse(information.hThread)
@@ -182,7 +182,7 @@ class WindowsPtyTests(unittest.TestCase):
 
     def _assert_failed_spawn(self, stage, expected, *, acquired=False):
         failure = OSError('injected setup failure')
-        pipes = [['input-read', 'input-write'], ['output-read', 'output-write']]
+        pipes = [('input-read', 'input-write'), ('output-read', 'output-write')]
         if stage == 'first-pipe':
             pipes[0] = failure
         elif stage == 'second-pipe':

@@ -121,7 +121,7 @@ class ProcessProtocol(asyncio.SubprocessProtocol):
 
     def connection_made(self, transport):
         self._transport = transport
-        for fd, name in [[1, 'stdout'], [2, 'stderr']]:
+        for fd, name in [(1, 'stdout'), (2, 'stderr')]:
             pipe = transport.get_pipe_transport(fd)
             if pipe is None:
                 continue

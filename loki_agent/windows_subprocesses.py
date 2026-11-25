@@ -414,7 +414,7 @@ class LocalProcessTransport(ContainedWorkerTransport):
                 for fd, value in enumerate([stdin, stdout, stderr]):
                     if value == PIPE:
                         first, second = host_ipc.overlapped_pipe(duplex=fd == 0, overlapped=(fd != 0, fd == 0))
-                        child, parent = [first, second] if fd == 0 else [second, first]
+                        child, parent = (first, second) if fd == 0 else (second, first)
                         parent_pipes[fd] = host_ipc.PipeHandle(parent)
                         cleanup.callback(api.close_handle, child)
                         api.set_handle_information(child, api.HandleFlags.HANDLE_FLAG_INHERIT,
@@ -423,10 +423,11 @@ class LocalProcessTransport(ContainedWorkerTransport):
                         child = windows_runtime.duplicate_standard_handle(value, fd)
                         cleanup.callback(api.close_handle, child)
                     children.append(child)
+                stdin_handle, stdout_handle, stderr_handle = children
                 native = kwargs['native']
                 windows_runtime.prepare_local(
                     native, args, kwargs['environment'], kwargs['cwd'],
-                    [*kwargs['inherited_handles'], *children], children,
+                    [*kwargs['inherited_handles'], *children], (stdin_handle, stdout_handle, stderr_handle),
                     owning=kwargs['owning'], creationflags=kwargs['creationflags'])
             self._proc = native
             self._proc.stdin = parent_pipes.get(0)

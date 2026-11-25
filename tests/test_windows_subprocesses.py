@@ -376,6 +376,7 @@ class WorkerCleanupTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(prepare.call_args.kwargs['owning'], owning)
                 self.assertEqual(prepare.call_args.args[1], ['/chosen/image.exe', '--subagent'])
                 self.assertEqual(prepare.call_args.args[3], '/trusted')
+                self.assertEqual(prepare.call_args.args[5], (11, 14, 17))
                 if failure is not None or revoke:
                     resume.assert_not_called()
                 else:

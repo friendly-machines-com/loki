@@ -538,9 +538,9 @@ class InheritanceTests(unittest.TestCase):
         calls['LocalFree'].assert_not_called()
 
     def test_null_descriptor_is_not_queried_applied_or_freed(self):
-        for setter, target in [[api.set_handle_dacl, object()],
-                               [api.set_named_dacl, '/work'],
-                               [containers.set_dacl_sddl, '/work']]:
+        for setter, target in [(api.set_handle_dacl, object()),
+                               (api.set_named_dacl, '/work'),
+                               (containers.set_dacl_sddl, '/work')]:
             with self.subTest(setter=setter.__name__), self._dacl_calls(descriptor=None) as calls:
                 with self.assertRaisesRegex(api.WindowsApiError, 'null'):
                     setter(target, 'D:P(A;;FR;;;SY)')

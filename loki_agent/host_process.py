@@ -95,8 +95,8 @@ async def create_posix_process(*command, on_cancel=None, after_spawn=None,
         # not the fd itself: the importing library still owns the parent's fd.
         # Explicitly supplied child stdio must remain untouched.
         for fd, selected, stream in [
-                [0, stdin, sys.stdin], [1, stdout, sys.stdout],
-                [2, stderr, sys.stderr]]:
+                (0, stdin, sys.stdin), (1, stdout, sys.stdout),
+                (2, stderr, sys.stderr)]:
             if selected is None and stream is None:
                 try:
                     os.set_inheritable(fd, False)

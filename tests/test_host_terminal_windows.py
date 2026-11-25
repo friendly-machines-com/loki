@@ -425,7 +425,7 @@ class DuplicateThreadHandleTests(unittest.TestCase):
         seen = []
 
         def duplicate(source, thread, target, output, access, inherit, flags):
-            seen.append([source, thread, target, access, inherit, flags])
+            seen.append((source, thread, target, access, inherit, flags))
             ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 77
             return True
 
@@ -435,7 +435,7 @@ class DuplicateThreadHandleTests(unittest.TestCase):
         with mock.patch.object(handle_reader.windows_api, 'current_process_handle', return_value=10), \
                 mock.patch.object(handle_reader.windows_api, 'bind', side_effect=bind):
             self.assertEqual(handle_reader._DuplicateCurrentThread(), 77)
-        self.assertEqual(seen, [[10, -2, 10, handle_reader.windows_api.ThreadAccess.THREAD_TERMINATE, False, 0]])
+        self.assertEqual(seen, [(10, -2, 10, handle_reader.windows_api.ThreadAccess.THREAD_TERMINATE, False, 0)])
 
     def test_failed_duplication_does_not_publish_an_unusable_handle(self):
         def bind(library, name, *signature):

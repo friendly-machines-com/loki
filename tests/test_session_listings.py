@@ -39,13 +39,13 @@ class SessionSummaryTests(unittest.IsolatedAsyncioTestCase):
         def opening(path):
             self.assertIs(path, entry.path)
             try:
-                yield [SimpleNamespace(buffer=stream), SimpleNamespace(st_mtime=modified)]
+                yield (SimpleNamespace(buffer=stream), SimpleNamespace(st_mtime=modified))
             finally:
                 stream.close()
 
         with mock.patch.object(savefiles, 'chat_log_entries', return_value=[entry]), \
                 mock.patch.object(savefiles, 'open_chat_log', side_effect=opening) as opened:
-            yield [entry, opened]
+            yield (entry, opened)
 
     def wire(self, middle, *, before=False):
         first = json.dumps(formats.message_item('user', 'historical request'))
@@ -131,7 +131,7 @@ class SessionSummaryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_query_is_explicit_full_text_not_just_the_label(self):
         wire = self.wire(256 * 1024)
-        for query, expected in [['', 1], ['historical cwd', 1], ['xxxxxxxx raw', 1], ['not-in-the-log', 0]]:
+        for query, expected in [('', 1), ('historical cwd', 1), ('xxxxxxxx raw', 1), ('not-in-the-log', 0)]:
             source = MeasuredBytes(wire)
             with self.subTest(query=query), self.source(source):
                 rows = await savefiles.list_saved_sessions('opaque', query=query)

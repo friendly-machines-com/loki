@@ -171,13 +171,13 @@ def _scope_violations(tree, source, filename, outer_bindings, outer_assignments)
     for node in nodes:
         if isinstance(node, ast.Import | ast.ImportFrom | ast.Assign | ast.AnnAssign
                       | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            events.append([node.end_lineno, node.end_col_offset, 1, node])
+            events.append((node.end_lineno, node.end_col_offset, 1, node))
         if isinstance(node, ast.Call | ast.BinOp | ast.AugAssign | ast.List | ast.Tuple):
-            events.append([node.lineno, node.col_offset, 0, node])
+            events.append((node.lineno, node.col_offset, 0, node))
     # Check uses before applying an enclosing assignment. Captured alias kinds
     # and literal text belong to that source position; a later reassignment
     # must not erase an earlier call or change already-captured emitted source.
-    for _line, _column, binding, node in sorted(events, key=lambda event: event[:3]):
+    for _line, _column, binding, node in sorted(events, key=lambda event: (event[0], event[1], event[2])):
         if binding:
             if isinstance(node, ast.Import):
                 for item in node.names:

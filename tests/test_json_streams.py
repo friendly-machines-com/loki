@@ -141,7 +141,7 @@ class JSONStreamTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_capture_limit_is_on_decoded_characters(self):
         for wire in ['"abcd"', '"\\u0061bcd"', '"\U0001f600bcd"']:
-            for limit, expected in [[3, None], [4, json.loads(wire)]]:
+            for limit, expected in [(3, None), (4, json.loads(wire))]:
                 with self.subTest(wire=wire, limit=limit):
                     reader = json_streams.Reader(io.StringIO(wire), chunk_size=1)
                     self.assertEqual(await reader.read_string(limit), expected)

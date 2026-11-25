@@ -93,12 +93,12 @@ class ReasoningAccumulatorTests(unittest.TestCase):
     def test_chat_combined_chunk_and_late_aliases(self):
         events = []
         acc = protocols.OpenAIChatStreamAccumulator(
-            lambda text: events.append(["answer", text]),
-            lambda key, kind, text: events.append(["thought", text]))
+            lambda text: events.append(("answer", text)),
+            lambda key, kind, text: events.append(("thought", text)))
         feed(acc, {"choices": [{"delta": {"reasoning": "visible", "content": "answer"}}]})
         feed(acc, {"choices": [{"delta": {"reasoning_content": "alias", "reasoning_details": [
             {"type": "reasoning.text", "text": "detail"}]}}]})
-        self.assertEqual(events, [["thought", "visible"], ["answer", "answer"]])
+        self.assertEqual(events, [("thought", "visible"), ("answer", "answer")])
         self.assertEqual(acc.reasoning_field, "reasoning")
 
     def test_indexed_fragments_need_not_repeat_type(self):

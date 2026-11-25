@@ -652,11 +652,11 @@ class PtyUiTests(unittest.TestCase):
                 handle.write(b"\x7ffirst prompt\r")
                 _read_until(handle, output, "blocked prefix")
                 for command, expected in [
-                        ["/cd after-cd", "/queue{txt:1,img:0}"],
-                        ["/quit", "/queue{txt:2,img:0}"],
-                        ["/ps", "No running, starting, or failed jobs."],
-                        ["/queue texts", "[id 3] /quit"],
-                        ["/queue txt", "[id 3] /quit"]]:
+                        ("/cd after-cd", "/queue{txt:1,img:0}"),
+                        ("/quit", "/queue{txt:2,img:0}"),
+                        ("/ps", "No running, starting, or failed jobs."),
+                        ("/queue texts", "[id 3] /quit"),
+                        ("/queue txt", "[id 3] /quit")]:
                     start = len(output)
                     handle.write(b"\x7f" + command.encode() + b"\r")
                     _read_until(handle, output, expected, start=start)

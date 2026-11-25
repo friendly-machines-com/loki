@@ -57,7 +57,7 @@ class ThinkingSurfaceTests(unittest.IsolatedAsyncioTestCase):
             "adaptive, or between-tools")
 
     async def test_manual_picker_collects_allowance_atomically_and_cancels_without_change(self):
-        for replies, expected in [[['1', '2', '2048'], 2048], [['1', '2', ''], None]]:
+        for replies, expected in [(['1', '2', '2048'], 2048), (['1', '2', ''], None)]:
             modal = mock.Mock(prompt=mock.AsyncMock(side_effect=replies))
 
             @contextlib.asynccontextmanager

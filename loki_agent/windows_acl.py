@@ -105,7 +105,8 @@ def ace_fields(sddl: str):
     """
     _header, aces = dacl_parts(sddl)
     for ace in aces:
-        yield list(ace[1:-1].split(';'))
+        kind, flags, rights, obj, inherited, sid = ace[1:-1].split(';')
+        yield kind, flags, rights, obj, inherited, sid
 
 
 def flag_codes(flags: str) -> set[str]:

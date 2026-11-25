@@ -51,8 +51,8 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_boolean_ini_spellings(self):
         for text, expected in [
-                ["true", True], ["YES", True], ["on", True], ["1", True],
-                ["false", False], ["no", False], ["off", False], ["0", False]]:
+                ("true", True), ("YES", True), ("on", True), ("1", True),
+                ("false", False), ("no", False), ("off", False), ("0", False)]:
             with self.subTest(text=text):
                 self.file.write_text(f"[terminal]\nshow_bash_stdout = {text}\n", encoding="utf-8")
                 self.assertIs((await self.load()).terminal.show_bash_stdout, expected)
@@ -261,14 +261,14 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         # The default everywhere is no execution deadline: hooks legitimately
         # perform work whose completion has no guaranteed wall time, and a
         # configured timeout_ms is the user's deliberate budget.
-        rows = [["pre_tool_call", None, "deny"], ["pre_tool_gate", None, "deny"],
-                ["post_tool_call", None, "continue"], ["turn_end", None, None],
-                ["turn_error", None, None]]
+        rows = [("pre_tool_call", None, "deny"), ("pre_tool_gate", None, "deny"),
+                ("post_tool_call", None, "continue"), ("turn_end", None, None),
+                ("turn_error", None, None)]
         self.file.write_text("".join(
             f"[hook.{phase}.{phase}]\ncommand.0 = selected-command\ncwd = chosen\n"
             for phase, _, _ in rows), encoding="utf-8")
         value = await self.load(strict=True)
-        self.assertEqual([[hook.phase, hook.timeout_ms, hook.on_error]
+        self.assertEqual([(hook.phase, hook.timeout_ms, hook.on_error)
                           for hook in value.hooks], rows)
 
     async def test_malformed_known_hook_options_are_not_ignored(self):

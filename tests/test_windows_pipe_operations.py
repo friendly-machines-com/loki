@@ -58,14 +58,14 @@ class OverlappedPipeTests(unittest.IsolatedAsyncioTestCase):
                      'GetOverlappedResult': result, 'CancelIoEx': cancel}
         with mock.patch.object(api, 'bind', side_effect=lambda library, name, *types: functions[name]), \
                 mock.patch.object(ctypes, 'get_last_error', side_effect=lambda: state['error'], create=True):
-            yield [state, submitted, cancelled, released]
+            yield (state, submitted, cancelled, released)
 
     async def test_read_uses_the_existing_overlapped_layout_and_exact_completion(self):
         with self.calls():
             self.assertEqual(await api.read_pipe(77, 6), b'reply\n')
 
     async def test_write_completes_every_short_transfer(self):
-        with self.calls(short=True) as [state, _submitted, _cancelled, _released]:
+        with self.calls(short=True) as (state, _submitted, _cancelled, _released):
             await api.write_pipe(77, b'abcdef')
             self.assertEqual(state['written'], b'abcdef')
 

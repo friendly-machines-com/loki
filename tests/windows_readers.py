@@ -159,7 +159,7 @@ def probe(native, limits_type, sid, workspace, output, actor_script):
         information = api.create_process_in_app_container(
             sys.executable, ['-I', '-u', str(actor_script), '--private-reader-child', str(report_path)],
             native.sid(sid), information=information, current_directory=str(workspace),
-            standard_handles=[None, None, None], pseudoconsole=console.value)
+            standard_handles=(None, None, None), pseudoconsole=console.value)
         # Null stdio suppresses inherited redirected parent handles; otherwise
         # the child's fd 0 can be a log/NUL handle instead of ConPTY's console.
         for value in [input_read, output_write]:

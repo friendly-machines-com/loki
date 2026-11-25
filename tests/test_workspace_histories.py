@@ -179,8 +179,8 @@ class WorkspaceHistoryProcessTests(unittest.TestCase):
                 self.assertNotIn('workspace_cwd', blob['session_state'])
                 with os.scandir(tools) as entries:
                     self.assertNotIn('.loki', {entry.name for entry in entries})
-                for arguments, stdin in [[['--resume'], '1\n' + change],
-                                         [['-r', logs[0].name], change]]:
+                for arguments, stdin in [(['--resume'], '1\n' + change),
+                                         (['-r', logs[0].name], change)]:
                     result = subprocess.run([*command, *arguments], cwd=launch_cwd, env=env,
                                             input=stdin, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

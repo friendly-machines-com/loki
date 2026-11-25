@@ -385,11 +385,11 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
 
     async def test_shipped_script_backoff_cap_limit_and_fixed_delay(self):
         for arguments, expected in [
-                [[], [5, 10, 20, 40, 80, 160, 320, 640, 1280, 1800, 1800]],
-                [["--max-retries", "3"], [5, 10, 20, None]],
-                [["--max-delay", "60", "--max-retries", "7"],
-                 [5, 10, 20, 40, 60, 60, 60, None]],
-                [["--multiplier", "1"], [5, 5, 5, 5]]]:
+                ([], [5, 10, 20, 40, 80, 160, 320, 640, 1280, 1800, 1800]),
+                (["--max-retries", "3"], [5, 10, 20, None]),
+                (["--max-delay", "60", "--max-retries", "7"],
+                 [5, 10, 20, 40, 60, 60, 60, None]),
+                (["--multiplier", "1"], [5, 5, 5, 5])]:
             pipeline = self.policy(arguments)
             self.assertIsNone(pipeline.turn_error_hooks[0].config.timeout_ms)
             for count, delay in enumerate(expected):
@@ -412,9 +412,9 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
             code="server_is_overloaded", retryable=False))
         fields = recoveries.failure_fields(failure)
         for arguments, expected in [
-                [[], [600, 1200, 1800, 1800]],
-                [["--overload-initial-delay", "120", "--max-delay", "600"],
-                 [120, 240, 480, 600]]]:
+                ([], [600, 1200, 1800, 1800]),
+                (["--overload-initial-delay", "120", "--max-delay", "600"],
+                 [120, 240, 480, 600])]:
             pipeline = self.policy(arguments)
             for count in [0, 1, 2, 3, 10_000]:
                 decision = await pipeline.recover_turn({
@@ -664,14 +664,14 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
 
     async def test_token_caps_are_incomplete_in_each_owning_adapter(self):
         turns = [
-            [formats.openai_chat_response_to_items({"choices": [{
+            (formats.openai_chat_response_to_items({"choices": [{
                 "message": {"role": "assistant", "content": "partial"}, "finish_reason": "length",
-            }]}), "length"],
-            [formats.anthropic_response_to_items({
+            }]}), "length"),
+            (formats.anthropic_response_to_items({
                 "id": "a", "type": "message", "role": "assistant", "model": "test",
                 "stop_reason": "max_tokens", "content": [{"type": "text", "text": "partial"}],
-            }), "max_tokens"],
-            [formats.openai_responses_response_to_items(response("partial", "incomplete")), "max_output_tokens"],
+            }), "max_tokens"),
+            (formats.openai_responses_response_to_items(response("partial", "incomplete")), "max_output_tokens"),
         ]
         observed = []
         policy = self.pipeline.recover_turn
@@ -719,7 +719,7 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
 
         with mock.patch.object(self.pipeline, "recover_turn", new=policy), \
                 mock.patch.object(loki, "execute_tool_call_async", new=mock.AsyncMock(
-                    return_value=[{"ok": True, "content": "ran"}, None])) as execute:
+                    return_value=({"ok": True, "content": "ran"}, None))) as execute:
             await self.run_loop(chat)
             execute.assert_awaited_once()
             await self.run_loop(mock.AsyncMock(side_effect=[OSError("DNS"), answer()]))
@@ -899,7 +899,7 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
             await self.run_loop(mock.AsyncMock(return_value=formats.DecodedTurn([], {"stop_reason": "refusal"})))
             call = formats.tool_call_item("bad-tool", "Bash", {"command": "work"})
             with mock.patch.object(loki, "execute_tool_call_async", new=mock.AsyncMock(
-                    return_value=[{"ok": False, "content": "tool failed"}, None])):
+                    return_value=({"ok": False, "content": "tool failed"}, None))):
                 await self.run_loop(mock.AsyncMock(side_effect=[formats.DecodedTurn([call]), answer()]))
         policy.assert_not_awaited()
 

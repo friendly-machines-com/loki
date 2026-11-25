@@ -537,12 +537,12 @@ def startup_commands(workspace, mode, executable, system_root):
     """Fixed witnesses whose progress does not depend on the probe script."""
     cases = []
     for name, status, options in [
-            ['cmd-exit', 71, None],
-            ['python-no-site-exit', 72, ['-I', '-u', '-S']],
-            ['python-site-exit', 72, ['-I', '-u']],
-            ['python-file', 73, ['-I', '-u']],
-            ['python-stderr-raw', 75, ['-I', '-u']],
-            ['python-stderr-text', 77, ['-I', '-u']]]:
+            ('cmd-exit', 71, None),
+            ('python-no-site-exit', 72, ['-I', '-u', '-S']),
+            ('python-site-exit', 72, ['-I', '-u']),
+            ('python-file', 73, ['-I', '-u']),
+            ('python-stderr-raw', 75, ['-I', '-u']),
+            ('python-stderr-text', 77, ['-I', '-u'])]:
         payload = ((f'startup-{mode}-{name}-{uuid.uuid4().hex}').encode('ascii')
                    if name in ['python-file', 'python-stderr-raw', 'python-stderr-text'] else None)
         marker = None
@@ -647,10 +647,10 @@ class StateTokenProbe:
             # SIDs as restricting SIDs in this exact call (measured at
             # 9fa1886), and WRITE_RESTRICTED is the flag the tool token needs.
             for variant, restriction, flags in [
-                    ['unchanged', None, 0],
-                    ['restrict-everyone', everyone, 0],
-                    ['restrict-foreign', foreign, 0],
-                    ['restrict-writes', role_sid, WRITE_RESTRICTED]]:
+                    ('unchanged', None, 0),
+                    ('restrict-everyone', everyone, 0),
+                    ('restrict-foreign', foreign, 0),
+                    ('restrict-writes', role_sid, WRITE_RESTRICTED)]:
                 row = {'probe': 'state-token-filter', 'phase': 'result',
                        'context': context, 'variant': variant, 'flags': flags,
                        'restricting_sid': (self.n.sid(restriction)
@@ -680,12 +680,12 @@ class StateTokenProbe:
 
     def compare_launches(self, primary, duplicate, role_sid, manifest_path, context, streams):
         """Compare token lineage and filter flags without executing child code."""
-        for origin, source in [['primary', primary], ['duplicate', duplicate]]:
+        for origin, source in [('primary', primary), ('duplicate', duplicate)]:
             print(json.dumps({'probe': 'state-token-launch', 'phase': 'source',
                               'context': context, 'source': origin,
                               'token': self.api.snapshot(source)}), flush=True)
-            for variant, flags in [['unchanged', None], ['restrict-all', 0],
-                                   ['restrict-writes', WRITE_RESTRICTED]]:
+            for variant, flags in [('unchanged', None), ('restrict-all', 0),
+                                   ('restrict-writes', WRITE_RESTRICTED)]:
                 row = {'probe': 'state-token-launch', 'context': context,
                        'source': origin, 'variant': variant, 'flags': flags,
                        'phase': 'filter' if flags is not None else 'inspect'}
@@ -740,7 +740,7 @@ class StateTokenProbe:
             startup.attributes = C.cast(attributes, HANDLE)
             child = ProcessInfos()
             command = C.create_unicode_buffer(subprocess.list2cmdline(arguments))
-            old_inheritance = [[handle, os.get_handle_inheritable(handle)] for handle in handles]
+            old_inheritance = [(handle, os.get_handle_inheritable(handle)) for handle in handles]
             creation_error = None
             try:
                 for handle in handles:
@@ -995,30 +995,30 @@ def state_access_report(probe, manifest, role):
     observe('configuration-write', lambda: overwrite_file(manifest['configuration']), 'access-denied')
     observe('workspace-write', lambda: (workspace / (role + '-workspace')).write_bytes(b'ok'), 'allowed')
     for name, action in [
-            ['state-create', lambda: (state / 'created').write_bytes(b'bad')],
-            ['state-append', lambda: append_file(state / 'append')],
-            ['state-truncate', lambda: (state / 'truncate').write_bytes(b'bad')],
-            ['state-delete', lambda: (state / 'delete').unlink()],
-            ['state-rename', lambda: (state / 'rename').rename(state / 'renamed')],
-            ['state-replace', lambda: os.replace(state / 'replacement', state / 'replace')],
-            ['state-mkdir', lambda: (state / 'created-directory').mkdir()],
-            ['state-rmdir', lambda: (state / 'empty-directory').rmdir()],
-            ['state-native-write', lambda: open_right(state / 'read', FILE_WRITE_DATA)],
-            ['state-native-append', lambda: open_right(state / 'read', FILE_APPEND_DATA)],
-            ['protected-child-rename', lambda: rename_directory(workspace / ('protected-' + role))],
+            ('state-create', lambda: (state / 'created').write_bytes(b'bad')),
+            ('state-append', lambda: append_file(state / 'append')),
+            ('state-truncate', lambda: (state / 'truncate').write_bytes(b'bad')),
+            ('state-delete', lambda: (state / 'delete').unlink()),
+            ('state-rename', lambda: (state / 'rename').rename(state / 'renamed')),
+            ('state-replace', lambda: os.replace(state / 'replacement', state / 'replace')),
+            ('state-mkdir', lambda: (state / 'created-directory').mkdir()),
+            ('state-rmdir', lambda: (state / 'empty-directory').rmdir()),
+            ('state-native-write', lambda: open_right(state / 'read', FILE_WRITE_DATA)),
+            ('state-native-append', lambda: open_right(state / 'read', FILE_APPEND_DATA)),
+            ('protected-child-rename', lambda: rename_directory(workspace / ('protected-' + role))),
     ]:
         observe(name, action, writing)
     for name, action in [
-            ['state-write-dacl', lambda: open_right(state, WRITE_DAC, True)],
-            ['state-write-owner', lambda: open_right(state, WRITE_OWNER, True)],
-            ['state-delete-child', lambda: open_right(state, 0x40, True)],
-            ['state-regrant-dacl', lambda: native.acl(
+            ('state-write-dacl', lambda: open_right(state, WRITE_DAC, True)),
+            ('state-write-owner', lambda: open_right(state, WRITE_OWNER, True)),
+            ('state-delete-child', lambda: open_right(state, 0x40, True)),
+            ('state-regrant-dacl', lambda: native.acl(
                 state, private_dacl(manifest['owner']) +
-                '(A;OICI;0x%X;;;%s)' % (FILE_MODIFY, manifest['package']))],
-            ['whole-state-rename', lambda: rename_directory(Path(manifest['state']))],
+                '(A;OICI;0x%X;;;%s)' % (FILE_MODIFY, manifest['package']))),
+            ('whole-state-rename', lambda: rename_directory(Path(manifest['state']))),
     ]:
         observe(name, action, 'characterized' if role == 'control' else 'access-denied')
-    for name, path in [['setup', manifest['setup']], ['credentials', manifest['credentials']]]:
+    for name, path in [('setup', manifest['setup']), ('credentials', manifest['credentials'])]:
         observe(name + '-read', lambda path=path: read_file(path), 'access-denied')
         observe(name + '-write', lambda path=path: overwrite_file(path), 'access-denied')
     if role != 'control':
@@ -1250,7 +1250,7 @@ def state_writer_child(manifest_path):
                     state_progress('writer-signal-after', role=role)
 
                 report['children'].append(probe.launch(
-                    token, manifest_path, role, [stdin, stdout, stderr],
+                    token, manifest_path, role, (stdin, stdout, stderr),
                     observe=publish if role == 'filtered' else None))
             finally:
                 if token != source:
@@ -1925,7 +1925,7 @@ def task_witness(request_path):
         request = json.load(stream)
     with open(request['manifest']) as stream:
         manifest = json.load(stream)
-    return [manifest, Path(request['report']), request['lease']]
+    return (manifest, Path(request['report']), request['lease'])
 
 
 def verify_task_route(report_path, owner, native=None, api=None, *, cleanup):
@@ -4180,7 +4180,7 @@ class StateTokenProbeTests(unittest.TestCase):
                         # not manufacture an execution result for a pending child.
                         record['forced_code'] = spec['expected_exit']
                         retired.append(index)
-                        events.append(['retire', token])
+                        events.append(('retire', token))
 
                 def resume(thread):
                     record = next(record for record in attempts if record['child'].thread == thread)
@@ -4231,7 +4231,7 @@ class StateTokenProbeTests(unittest.TestCase):
                 native.wait.side_effect = wait
                 native.exit_code.side_effect = exit_code
                 api.snapshot.side_effect = snapshot
-                api.close.side_effect = lambda token: events.append(['token-close', token])
+                api.close.side_effect = lambda token: events.append(('token-close', token))
                 probe.filtered = mock.Mock(side_effect=filtered)
                 probe.created_process = created
                 with mock.patch.dict(os.environ, {'SystemRoot': str(root / 'Windows')}), \
@@ -4283,8 +4283,8 @@ class StateTokenProbeTests(unittest.TestCase):
                 self.assertEqual(sorted(call.args[0] for call in api.close.call_args_list), sorted(tokens))
                 for record in attempts:
                     if record['token'] != 17 and record['index'] in retired:
-                        self.assertLess(events.index(['retire', record['token']]),
-                                        events.index(['token-close', record['token']]))
+                        self.assertLess(events.index(('retire', record['token'])),
+                                        events.index(('token-close', record['token'])))
                 if fault == 'pending':
                     self.assertNotIn(900 + pending_index, [row['child_pid'] for row in exits])
 
@@ -4328,14 +4328,14 @@ class StateTokenProbeTests(unittest.TestCase):
             'child-publication-observed', 'child-live-state-read-before', 'child-live-state-read-after',
             'child-operations-before']
         for failure, last_phase, owns_token in [
-                ['manifest', 'child-manifest-read-before', False],
-                ['native-init', 'child-native-init-before', False],
-                ['probe-init', 'child-probe-init-before', False],
-                ['token-open', 'child-token-open-before', False],
-                ['snapshot', 'child-token-snapshot-before', True],
-                ['ready-write', 'child-ready-write-before', True],
-                ['live-read', 'child-live-state-read-before', True],
-                ['operations', 'child-operations-before', True]]:
+                ('manifest', 'child-manifest-read-before', False),
+                ('native-init', 'child-native-init-before', False),
+                ('probe-init', 'child-probe-init-before', False),
+                ('token-open', 'child-token-open-before', False),
+                ('snapshot', 'child-token-snapshot-before', True),
+                ('ready-write', 'child-ready-write-before', True),
+                ('live-read', 'child-live-state-read-before', True),
+                ('operations', 'child-operations-before', True)]:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 workspace, state = root / 'workspace', root / 'state'
@@ -4483,9 +4483,9 @@ class StateTokenProbeTests(unittest.TestCase):
 
     def test_launch_cleanup_has_exactly_one_process_handle_owner(self):
         for suspended_only, failure, resume_count in [
-                [False, None, 1], [False, None, 2], [True, None, 1],
-                [False, 'create', 1], [True, 'create', 1],
-                [True, 'inspection', 1], [True, 'cleanup', 1], [False, 'resume', 0xffffffff]]:
+                (False, None, 1), (False, None, 2), (True, None, 1),
+                (False, 'create', 1), (True, 'create', 1),
+                (True, 'inspection', 1), (True, 'cleanup', 1), (False, 'resume', 0xffffffff)]:
             with self.subTest(suspended_only=suspended_only, failure=failure, resume_count=resume_count):
                 native = mock.Mock()
                 closed = []
@@ -4842,10 +4842,10 @@ class StateTokenProbeTests(unittest.TestCase):
                         else:
                             self.assertEqual(row['token'], source)
                     self.assertEqual([
-                        [[getattr(argument, 'value', argument) for argument in call.args], call.kwargs]
+                        ([getattr(argument, 'value', argument) for argument in call.args], call.kwargs)
                         for call in probe.filtered.call_args_list], [
-                            [[17, None], {'flags': 0}], [[17, 91], {'flags': 0}],
-                            [[17, 92], {'flags': 0}], [[17, 23], {'flags': 0x8}]])
+                            ([17, None], {'flags': 0}), ([17, 91], {'flags': 0}),
+                            ([17, 92], {'flags': 0}), ([17, 23], {'flags': 0x8})])
                     successful = [handle for index, handle in enumerate(handles)
                                   if index not in rejected]
                     self.assertEqual(probe.api.snapshot.call_args_list,

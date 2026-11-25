@@ -76,7 +76,7 @@ class AdvertisementTests(unittest.TestCase):
             direct = os.path.join(config, 'skills', 'pack:inner')
             nested = os.path.join(config, 'skills', 'pack', 'inner')
             kept = os.path.join(config, 'skills', 'kept')
-            for directory, body in [[direct, 'direct'], [nested, 'nested'], [kept, 'kept body']]:
+            for directory, body in [(direct, 'direct'), (nested, 'nested'), (kept, 'kept body')]:
                 os.makedirs(directory)
                 with open(os.path.join(directory, 'SKILL.md'), 'w', encoding='utf-8') as stream:
                     stream.write(body)

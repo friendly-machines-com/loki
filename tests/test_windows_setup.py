@@ -322,8 +322,8 @@ class NativeObjectPolicyTests(unittest.TestCase):
     @contextlib.contextmanager
     def layout(self, state):
         with contextlib.ExitStack() as cleanup:
-            for name, path in [['loki_config_dir', self.upper], ['loki_state_dir', state],
-                               ['credential_directory', self.credentials]]:
+            for name, path in [('loki_config_dir', self.upper), ('loki_state_dir', state),
+                               ('credential_directory', self.credentials)]:
                 cleanup.enter_context(mock.patch.object(windows_state.paths, name, return_value=path))
             yield
 
@@ -449,10 +449,10 @@ class GrantHandleTests(unittest.TestCase):
 
     def test_inherited_excess_denials_and_incomplete_inheritance_still_refuse_edits(self):
         for flags, rights, extra in [
-                ['OICIID', '0x1301BF', ''], ['CIID', 'FRFX', ''],
-                ['OICIIOID', 'FRFX', ''], ['OICINPID', 'FRFX', ''],
-                ['OICIID', 'FRFX', f'(D;;FR;;;{PACKAGE_SID})'],
-                ['OICIID', 'FRFX', f'(A;OICIID;0x1301BF;;;{windows_state.tool_role_sid(PACKAGE_SID)})']]:
+                ('OICIID', '0x1301BF', ''), ('CIID', 'FRFX', ''),
+                ('OICIIOID', 'FRFX', ''), ('OICINPID', 'FRFX', ''),
+                ('OICIID', 'FRFX', f'(D;;FR;;;{PACKAGE_SID})'),
+                ('OICIID', 'FRFX', f'(A;OICIID;0x1301BF;;;{windows_state.tool_role_sid(PACKAGE_SID)})')]:
             with self.subTest(flags=flags, rights=rights, extra=extra):
                 current = self.EXISTING + f'(A;{flags};{rights};;;{PACKAGE_SID})' + extra
                 with mock.patch.object(windows_api, 'handle_dacl_sddl', return_value=current), \

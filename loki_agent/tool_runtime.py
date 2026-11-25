@@ -884,7 +884,7 @@ async def _run_hook_command(command, payload, cwd, timeout_ms, *, create_exec,
                 task.result()
             if len(done) != len(exchange_tasks):
                 raise HookExecutionError(f"hook timed out after {timeout_ms}ms")
-            return [stdout_task.result(), stderr_task.result(), exit_task.result()]
+            return stdout_task.result(), stderr_task.result(), exit_task.result()
         finally:
             async def retire():
                 for task in tasks:

@@ -17,10 +17,11 @@ class FakePrctl:
         self.calls = []
         self.restype = None
 
-    def __call__(self, *args):
-        self.calls.append(list(
-            value.value if hasattr(value, "value") else value
-            for value in args))
+    def __call__(self, option, arg2, arg3, arg4, arg5):
+        def raw(value):
+            return getattr(value, "value", value)
+
+        self.calls.append((raw(option), raw(arg2), raw(arg3), raw(arg4), raw(arg5)))
         return next(self.results)
 
 
@@ -60,9 +61,9 @@ class ProcessProtectionTests(unittest.TestCase):
                                 process_protections.ProcessProtectionError,
                                 error):
                             process_protections.protect_credential_process()
-                expected = [[4, 0, 0, 0, 0]]  # SET_DUMPABLE must clear it.
+                expected = [(4, 0, 0, 0, 0)]  # SET_DUMPABLE must clear it.
                 if len(results) == 2:
-                    expected.append([3, 0, 0, 0, 0])  # GET_DUMPABLE
+                    expected.append((3, 0, 0, 0, 0))  # GET_DUMPABLE
                 self.assertEqual(prctl.calls, expected)
 
     def test_windows_current_objects_and_future_default_have_independent_owners(self):

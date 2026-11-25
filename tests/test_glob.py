@@ -370,7 +370,7 @@ class SearchPreviewTests(unittest.IsolatedAsyncioTestCase):
         glob = await self.search('Glob', {'pattern': '*.txt'})
         self.assertIn('num_files: 1\ntruncated: false\n', glob)
         self.assertEqual(glob.split('\n[filenames]\n', 1)[1], source)
-        for mode, expected in [['files_with_matches', source], ['count', f'{source}:2']]:
+        for mode, expected in [('files_with_matches', source), ('count', f'{source}:2')]:
             with self.subTest(mode=mode):
                 args = {'pattern': 'needle', 'path': source, 'output_mode': mode, 'head_limit': 1}
                 page = await self.search('Grep', args)

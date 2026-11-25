@@ -73,15 +73,15 @@ class HookConfigurationError(SettingsError):
 # has no guaranteed wall time, so a configured ``timeout_ms`` is the user's
 # deliberate abandonment budget, never an automatic default.
 _HOOK_PHASES = {
-    "pre_tool_call": [None, "deny"],
-    "pre_tool_gate": [None, "deny"],
+    "pre_tool_call": (None, "deny"),
+    "pre_tool_gate": (None, "deny"),
     # Manual compaction policy is a fail-closed allow/deny gate, not a context
     # producer. Only trusted user configuration can install it; runtime input
     # and saved/provider JSON never create hooks or relax its error default.
-    "pre_compact": [None, "deny"],
-    "post_tool_call": [None, "continue"],
-    "turn_end": [None, None],
-    "turn_error": [None, None],
+    "pre_compact": (None, "deny"),
+    "post_tool_call": (None, "continue"),
+    "turn_end": (None, None),
+    "turn_error": (None, None),
 }
 
 

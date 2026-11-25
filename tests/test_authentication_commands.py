@@ -575,7 +575,7 @@ raise SystemExit(status)
             connected = asyncio.get_running_loop().create_future()
 
             def accept(reader, writer):
-                connected.set_result([reader, writer])
+                connected.set_result((reader, writer))
 
             address = os.path.join(workspace, 'control.sock')
             # The Bash child cannot proceed until the outside process has
