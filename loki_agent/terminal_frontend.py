@@ -372,6 +372,8 @@ def _immediate_queue(argument: str):
 def _emit_immediate_output(command, text, *, is_error=False):
     """Display a monitor answer now, isolated from either adjacent delta.
 
+    Compaction's bracketed notices omit the command header, but still need
+    the same output-area restoration and isolation from streaming text.
     No awaits or turn-running check: even a delayed read answers during a
     running turn. Do not feed or finish assistant_markdown here. A failed
     command uses stderr for both text and style; stdout's color controls
@@ -387,8 +389,9 @@ def _emit_immediate_output(command, text, *, is_error=False):
     try:
         if styled:
             terminal.set_background_color(ERROR_COLOR, file=file)
-        terminal.write_text(command.strip(), file=file)
-        print(":", file=file)
+        if command is not None:
+            terminal.write_text(command.strip(), file=file)
+            print(":", file=file)
         terminal.write_text(text, multiline=True, file=file)
     finally:
         if styled:
@@ -744,13 +747,17 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
     elif kind == "compaction_started":
         _terminal_activity.set_compaction_running(True)
     elif kind in ["compaction_completed", "compaction_failed", "compaction_cancelled"]:
-        if event.get("compaction_id") is not None:
+        started = event.get("compaction_id") is not None
+        if started:
             # A queued request can be cancelled while an older attempt is
             # still unwinding. Only the executor's outcome ends the bold state.
             _terminal_activity.set_compaction_running(False)
-        failed = kind == "compaction_failed"
-        text = compactions.failure_text(event["error"]) if failed else event["text"]
-        _emit_immediate_output("/compact", text, is_error=failed)
+        if kind == "compaction_completed" and started:
+            _emit_immediate_output(None, "[Context compacted]")
+        else:
+            failed = kind == "compaction_failed"
+            text = compactions.failure_text(event["error"]) if failed else event["text"]
+            _emit_immediate_output("/compact", text, is_error=failed)
         _redraw_status()
     elif kind == "tool_result":
         # The canonical result event.  ``tool_error`` carries only the failure
@@ -1606,7 +1613,7 @@ async def async_main(args, configuration: settings.Settings) -> int:
             if first:
                 session.user_messages.put_nowait(terminals.CONTROL_WAKE)
             _echo_immediate(text)
-            _emit_immediate_output(text, "Compaction requested." if first else "Compaction already requested.")
+            _emit_immediate_output(None, "[Compaction requested]" if first else "[Compaction already requested]")
             return True
 
         async def idle_compaction():

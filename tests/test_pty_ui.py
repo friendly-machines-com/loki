@@ -281,7 +281,7 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
                     _read_until(handle, collected, 'No todos for this session.')
                 elif queued_input == '/compact':
                     _read_until(handle, collected,
-                                'Compaction already requested.' if compact_seen else 'Compaction requested.',
+                                '[Compaction already requested]' if compact_seen else '[Compaction requested]',
                                 start=receipt_start)
                     compact_seen = True
                 else:
@@ -590,8 +590,9 @@ class PtyUiTests(unittest.TestCase):
         output, before_release = run_loki_pty_reply(
             stream=True, stream_chunks=["COMPACT_START", "COMPACT_END"],
             stream_prefix="COMPACT_START", queued_inputs=["/compact", "/compact"])
-        self.assertIn(b"Compaction requested.", before_release)
-        self.assertIn(b"Compaction already requested.", before_release)
+        self.assertIn(b"[Compaction requested]", before_release)
+        self.assertIn(b"[Compaction already requested]", before_release)
+        self.assertNotIn(b"/compact:", before_release)
         self.assertIn(b"/queue{txt:0,img:0}", before_release)
         self.assertNotIn(b"COMPACT_END", before_release)
         self.assertNotIn(b"Context compaction failed:", before_release)

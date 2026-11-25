@@ -1126,7 +1126,8 @@ print(json.dumps(result))
             self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
         self.assertFalse(terminal_frontend._terminal_activity.turn_running)
         self.assertEqual(len(self.sent), 1)
-        self.assertIn("Nothing to compact", output.getvalue())
+        self.assertIn("/compact:\nNothing to compact.\n", output.getvalue())
+        self.assertNotIn("[Context compacted]", output.getvalue())
         self.assertNotIn('"text": "/compact"', json.dumps(self.session.transcript_items))
         self.assertIn("/compact", terminal_frontend.status_text())
 
@@ -1145,7 +1146,9 @@ print(json.dumps(result))
                 mock.patch.object(terminal_frontend, "new_chat_log_path", return_value=self.session.chat_log_path), \
                 contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
-        self.assertIn("Compaction requested.", stdout.getvalue())
+        self.assertIn("\n[Compaction requested]\n", stdout.getvalue())
+        self.assertNotIn("/compact:\n", stdout.getvalue())
+        self.assertNotIn("[Context compacted]", stdout.getvalue())
         self.assertNotIn("Compacting context.", stdout.getvalue() + stderr.getvalue())
         self.assertNotIn("Context compaction failed:", stdout.getvalue())
         self.assertIn("/compact:\nContext compaction failed: TimeoutError", stderr.getvalue())
@@ -1176,9 +1179,10 @@ print(json.dumps(result))
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
         self.assertEqual(attempts, [1, 2])
-        self.assertEqual(output.getvalue().count("Compaction requested."), 2)
-        self.assertEqual(output.getvalue().count("Context compaction cancelled."), 1)
-        self.assertEqual(output.getvalue().count("/compact:\nContext compacted.\n"), 1)
+        self.assertEqual(output.getvalue().count("\n[Compaction requested]\n"), 2)
+        self.assertEqual(output.getvalue().count("/compact:\nContext compaction cancelled.\n"), 1)
+        self.assertEqual(output.getvalue().count("\n[Context compacted]\n"), 1)
+        self.assertEqual(output.getvalue().count("/compact:\n"), 1)
 
     async def test_tui_reports_a_pending_compaction_when_the_turn_aborts(self):
         from test_loki_tool_loop import ScriptedInputSession
@@ -1197,7 +1201,7 @@ print(json.dumps(result))
                 mock.patch.object(terminal_frontend, "new_chat_log_path", return_value=self.session.chat_log_path), \
                 contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
-        self.assertIn("Compaction requested.", output.getvalue())
+        self.assertIn("\n[Compaction requested]\n", output.getvalue())
         self.assertIn("The turn ended before context compaction could run.", errors.getvalue())
 
     async def _tui_running_control(self, failure=False, *, compaction_retries=0):
@@ -1242,7 +1246,8 @@ print(json.dumps(result))
         self.assertEqual(self.pipeline.finish_turn.await_count, 1)
         self.assertEqual(self.pipeline.finish_turn.call_args.args[0]["reason"], "error" if failure else "completed")
         self.assertIs(self.session.transcript_items, self.before_archive)
-        self.assertIn("Compaction already requested", output.getvalue())
+        self.assertIn("\n[Compaction already requested]\n", output.getvalue())
+        self.assertNotIn("/compact:\n", output.getvalue())
         self.assertNotIn('"text": "/compact"', json.dumps(self.session.transcript_items))
         self.assertFalse(terminal_frontend._terminal_activity.turn_running)
         self.assertFalse(terminal_frontend._terminal_activity.compaction_running)
@@ -1254,9 +1259,8 @@ print(json.dumps(result))
             self.assertEqual(errors.getvalue().count("Context compaction failed: "), 1)
             self.assertIn("did not return exactly one checkpoint", errors.getvalue())
         else:
-            self.assertEqual(output.getvalue().count(
-                "/compact:\nContext compacted. Earlier messages remain in the transcript.\n"), 1)
-            self.assertNotIn("Context compacted.", errors.getvalue())
+            self.assertEqual(output.getvalue().count("\n[Context compacted]\n"), 1)
+            self.assertNotIn("[Context compacted]", errors.getvalue())
             self.assertEqual(sum(event["type"] == "context_replace" for event in saved), 1)
             self.assertEqual(formats.item_text(formats.active_events(saved)[-1]), "ordinary answer")
 
