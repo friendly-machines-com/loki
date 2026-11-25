@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import copy
+from functools import partial
 import io
 import json
 import os
@@ -248,6 +249,31 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
                                  "status: completed\nexit_code: 7\n[stdout]\nstdout-secret\n[stderr]\nstderr-message")
                 self.assertEqual(result["process_output"]["stdout"], "stdout-secret")
                 self.assertEqual(result["process_output"]["stderr"], "stderr-message")
+
+    async def test_bash_shows_the_beginning_and_reports_omissions_without_cutting_the_log(self):
+        first = b'first line\n'
+        last = b'final line\n'
+        stderr = b'warning\n'
+        for suffix in [b'', last, b'not shown\n' * 128 + last]:
+            stdout = first + suffix
+            with (self.subTest(stdout_size=len(stdout)),
+                  mock.patch.object(job_runtime.executables, 'BASH', sys.executable),
+                  mock.patch.object(self.manager, 'run_foreground',
+                                    partial(self.manager.run_foreground, output_chars=len(first)))):
+                result = await self.execute(
+                    f'import sys; sys.stdout.buffer.write({stdout!r}); sys.stderr.buffer.write({stderr!r})')
+            self.assertTrue(result['ok'], result)
+            self.assertIn(f'[stdout]\n{first.decode()}', result['content'])
+            self.assertNotIn(last.decode(), result['content'])
+            self.assertEqual(result['process_output']['stderr'], stderr.decode())
+            self.assertEqual(result['content'].count('[output truncated]'), int(bool(suffix)))
+            job = list(self.manager.jobs.values())[-1]
+            with open(job.stdout_path, 'rb') as stream:
+                self.assertEqual(stream.read(), stdout)
+            if suffix:
+                status = self.manager.job_status(job.id, tail_chars=len(last))
+                self.assertIn(last.decode(), status)
+                self.assertNotIn(first.decode(), status)
 
     async def test_programmatic_foreground_entries_distinguish_omission_from_null(self):
         job = types.SimpleNamespace(exit_code=0)

@@ -833,8 +833,7 @@ class JobManager:
                              output_chars=tool_contracts.BASH_MAX_OUTPUT_CHARS, **options):
         async with self._foreground(command, display_command, timeout_ms, **options) as result:
             job, status, stdout, stderr = result
-            return (job, status, process_outputs.preview(stdout, output_chars, tail=True),
-                    process_outputs.preview(stderr, output_chars, tail=True))
+            return job, status, process_outputs.preview(stdout, output_chars), process_outputs.preview(stderr, output_chars)
 
     async def run_shell(self, command: str,
                         timeout: int | None = tool_contracts.BASH_DEFAULT_TIMEOUT_MS,
